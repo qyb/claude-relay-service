@@ -1389,6 +1389,18 @@ const authenticateAdmin = async (req, res, next) => {
       })
     }
 
+    // 🔒 安全修复：验证会话必须字段（防止伪造会话绕过认证）
+    if (!adminSession.username || !adminSession.loginTime) {
+      logger.security(
+        `🔒 Corrupted admin session from ${req.ip || 'unknown'} - missing required fields (username: ${!!adminSession.username}, loginTime: ${!!adminSession.loginTime})`
+      )
+      await redis.deleteSession(token) // 清理无效/伪造的会话
+      return res.status(401).json({
+        error: 'Invalid session',
+        message: 'Session data corrupted or incomplete'
+      })
+    }
+
     // 检查会话活跃性（可选：检查最后活动时间）
     const now = new Date()
     const lastActivity = new Date(adminSession.lastActivity || adminSession.loginTime)
@@ -1744,9 +1756,13 @@ const requestLogger = (req, res, next) => {
   const referer = req.get('Referer') || 'none'
 
   // 记录请求开始
+  const isDebugRoute = req.originalUrl.includes('event_logging')
   if (req.originalUrl !== '/health') {
-    // 避免健康检查日志过多
-    logger.info(`▶️ [${requestId}] ${req.method} ${req.originalUrl} | IP: ${clientIP}`)
+    if (isDebugRoute) {
+      logger.debug(`▶️ [${requestId}] ${req.method} ${req.originalUrl} | IP: ${clientIP}`)
+    } else {
+      logger.info(`▶️ [${requestId}] ${req.method} ${req.originalUrl} | IP: ${clientIP}`)
+    }
   }
 
   res.on('finish', () => {
@@ -1778,7 +1794,14 @@ const requestLogger = (req, res, next) => {
         logMetadata
       )
     } else if (req.originalUrl !== '/health') {
-      logger.request(req.method, req.originalUrl, res.statusCode, duration, logMetadata)
+      if (isDebugRoute) {
+        logger.debug(
+          `🟢 ${req.method} ${req.originalUrl} - ${res.statusCode} (${duration}ms)`,
+          logMetadata
+        )
+      } else {
+        logger.request(req.method, req.originalUrl, res.statusCode, duration, logMetadata)
+      }
     }
 
     // API Key相关日志
@@ -2020,7 +2043,7 @@ const globalRateLimit = async (req, res, next) =>
 
 // 📊 请求大小限制中间件
 const requestSizeLimit = (req, res, next) => {
-  const MAX_SIZE_MB = parseInt(process.env.REQUEST_MAX_SIZE_MB || '60', 10)
+  const MAX_SIZE_MB = parseInt(process.env.REQUEST_MAX_SIZE_MB || '100', 10)
   const maxSize = MAX_SIZE_MB * 1024 * 1024
   const contentLength = parseInt(req.headers['content-length'] || '0')
 
@@ -2029,7 +2052,7 @@ const requestSizeLimit = (req, res, next) => {
     return res.status(413).json({
       error: 'Payload Too Large',
       message: 'Request body size exceeds limit',
-      limit: '10MB'
+      limit: `${MAX_SIZE_MB}MB`
     })
   }
 
