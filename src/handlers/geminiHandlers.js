@@ -19,6 +19,14 @@ const { parseSSELine } = require('../utils/sseParser')
 const axios = require('axios')
 const ProxyHelper = require('../utils/proxyHelper')
 
+function buildGeminiSchedulerOptions(req, baseOptions = {}) {
+  const options = { ...baseOptions }
+  if (req?._geminiRoute) {
+    options.oauthProvider = 'gemini-cli'
+  }
+  return options
+}
+
 // ============================================================================
 // 工具函数
 // ============================================================================
@@ -911,7 +919,8 @@ function handleSimpleEndpoint(apiMethod) {
       const schedulerResult = await unifiedGeminiScheduler.selectAccountForApiKey(
         req.apiKey,
         sessionHash,
-        requestedModel
+        requestedModel,
+        buildGeminiSchedulerOptions(req)
       )
       const { accountId, accountType } = schedulerResult
 
@@ -992,7 +1001,8 @@ async function handleLoadCodeAssist(req, res) {
     const schedulerResult = await unifiedGeminiScheduler.selectAccountForApiKey(
       req.apiKey,
       sessionHash,
-      requestedModel
+      requestedModel,
+      buildGeminiSchedulerOptions(req)
     )
     const { accountId, accountType } = schedulerResult
 
@@ -1096,7 +1106,8 @@ async function handleOnboardUser(req, res) {
     const schedulerResult = await unifiedGeminiScheduler.selectAccountForApiKey(
       req.apiKey,
       sessionHash,
-      requestedModel
+      requestedModel,
+      buildGeminiSchedulerOptions(req)
     )
     const { accountId, accountType } = schedulerResult
 
@@ -1211,7 +1222,8 @@ async function handleRetrieveUserQuota(req, res) {
     const schedulerResult = await unifiedGeminiScheduler.selectAccountForApiKey(
       req.apiKey,
       sessionHash,
-      requestedModel
+      requestedModel,
+      buildGeminiSchedulerOptions(req)
     )
     const { accountId, accountType } = schedulerResult
 
@@ -1323,7 +1335,7 @@ async function handleCountTokens(req, res) {
       req.apiKey,
       sessionHash,
       model,
-      { allowApiAccounts: true }
+      buildGeminiSchedulerOptions(req, { allowApiAccounts: true })
     )
     const { accountId, accountType } = schedulerResult
     const isApiAccount = accountType === 'gemini-api'
@@ -1467,7 +1479,8 @@ async function handleGenerateContent(req, res) {
     const schedulerResult = await unifiedGeminiScheduler.selectAccountForApiKey(
       req.apiKey,
       sessionHash,
-      model
+      model,
+      buildGeminiSchedulerOptions(req)
     )
     const { accountId, accountType } = schedulerResult
 
@@ -1691,7 +1704,8 @@ async function handleStreamGenerateContent(req, res) {
     const schedulerResult = await unifiedGeminiScheduler.selectAccountForApiKey(
       req.apiKey,
       sessionHash,
-      model
+      model,
+      buildGeminiSchedulerOptions(req)
     )
     const { accountId, accountType } = schedulerResult
 
@@ -2089,7 +2103,7 @@ async function handleStandardGenerateContent(req, res) {
       req.apiKey,
       sessionHash,
       model,
-      { allowApiAccounts: true }
+      buildGeminiSchedulerOptions(req, { allowApiAccounts: true })
     )
     ;({ accountId } = schedulerResult)
     const { accountType } = schedulerResult
@@ -2361,7 +2375,7 @@ async function handleStandardStreamGenerateContent(req, res) {
       req.apiKey,
       sessionHash,
       model,
-      { allowApiAccounts: true }
+      buildGeminiSchedulerOptions(req, { allowApiAccounts: true })
     )
     ;({ accountId } = schedulerResult)
     const { accountType } = schedulerResult
