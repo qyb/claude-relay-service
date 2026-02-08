@@ -1597,9 +1597,13 @@ async function handleGenerateContent(req, res) {
           )
 
     // 记录使用统计
-    if (response?.response?.usageMetadata) {
+    // 兼容两种返回结构：
+    // 1. 普通 OAuth: { usageMetadata: {...} }
+    // 2. Antigravity: { response: { usageMetadata: {...} } } 或 { usageMetadata: {...} }
+    const usage = response?.response?.usageMetadata || response?.usageMetadata
+
+    if (usage) {
       try {
-        const usage = response.response.usageMetadata
         await apiKeyService.recordUsage(
           req.apiKey.id,
           usage.promptTokenCount || 0,
@@ -1627,6 +1631,8 @@ async function handleGenerateContent(req, res) {
       } catch (error) {
         logger.error('Failed to record Gemini usage:', error)
       }
+    } else {
+      logger.warn('⚠️ No usage metadata found in response')
     }
 
     res.json(version === 'v1beta' ? response.response : response)
@@ -1863,6 +1869,33 @@ async function handleStreamGenerateContent(req, res) {
 
     heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL)
 
+    const processUsageLines = () => {
+      const lines = streamBuffer.split('\n')
+      streamBuffer = lines.pop() || ''
+
+      for (const line of lines) {
+        if (!line.trim() || !line.includes('usageMetadata')) {
+          continue
+        }
+
+        try {
+          const parsed = parseSSELine(line)
+          if (parsed.type === 'data') {
+            // 兼容两种结构：
+            // 1. 嵌套结构: { response: { usageMetadata: {...} } }
+            // 2. 扁平结构: { usageMetadata: {...} }
+            const usage = parsed.data.response?.usageMetadata || parsed.data?.usageMetadata
+            if (usage) {
+              totalUsage = usage
+              logger.debug('📊 Captured Gemini usage data:', totalUsage)
+            }
+          }
+        } catch (parseError) {
+          logger.warn('⚠️ Failed to parse usage line:', parseError.message)
+        }
+      }
+    }
+
     streamResponse.on('data', (chunk) => {
       try {
         lastDataTime = Date.now()
@@ -1872,37 +1905,14 @@ async function handleStreamGenerateContent(req, res) {
           res.write(chunk)
         }
 
-        // 异步提取 usage 数据
-        setImmediate(() => {
-          try {
-            const chunkStr = chunk.toString()
-            if (!chunkStr.trim() || !chunkStr.includes('usageMetadata')) {
-              return
-            }
-
-            streamBuffer += chunkStr
-            const lines = streamBuffer.split('\n')
-            streamBuffer = lines.pop() || ''
-
-            for (const line of lines) {
-              if (!line.trim() || !line.includes('usageMetadata')) {
-                continue
-              }
-
-              try {
-                const parsed = parseSSELine(line)
-                if (parsed.type === 'data' && parsed.data.response?.usageMetadata) {
-                  totalUsage = parsed.data.response.usageMetadata
-                  logger.debug('📊 Captured Gemini usage data:', totalUsage)
-                }
-              } catch (parseError) {
-                logger.warn('⚠️ Failed to parse usage line:', parseError.message)
-              }
-            }
-          } catch (error) {
-            logger.warn('⚠️ Error extracting usage data:', error.message)
-          }
-        })
+        // 同步提取 usage 数据：每个 chunk 都参与 buffer 累积，
+        // 避免 usageMetadata 跨 chunk 分片时丢失
+        try {
+          streamBuffer += chunk.toString()
+          processUsageLines()
+        } catch (error) {
+          logger.warn('⚠️ Error extracting usage data:', error.message)
+        }
       } catch (error) {
         logger.error('Error processing stream chunk:', error)
       }
@@ -1911,6 +1921,17 @@ async function handleStreamGenerateContent(req, res) {
     streamResponse.on('end', () => {
       logger.info('Stream completed successfully')
 
+      // flush streamBuffer 中残留的最后一行
+      if (streamBuffer.trim()) {
+        streamBuffer += '\n'
+        try {
+          processUsageLines()
+        } catch (flushError) {
+          // 忽略 flush 期间的异常
+        }
+        streamBuffer = ''
+      }
+
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer)
         heartbeatTimer = null
@@ -1918,7 +1939,7 @@ async function handleStreamGenerateContent(req, res) {
 
       res.end()
 
-      // 异步记录使用统计
+      // 此时所有解析都已同步完成（data 事件同步解析 + end 事件 flush），可以直接检查
       if (!usageReported && totalUsage.totalTokenCount > 0) {
         Promise.all([
           apiKeyService.recordUsage(
@@ -1951,6 +1972,10 @@ async function handleStreamGenerateContent(req, res) {
           .catch((error) => {
             logger.error('Failed to record Gemini usage:', error)
           })
+      } else if (totalUsage.totalTokenCount === 0) {
+        logger.warn(
+          `⚠️ Stream completed without usage data - totalTokenCount: ${totalUsage.totalTokenCount}`
+        )
       }
     })
 
@@ -2255,9 +2280,13 @@ async function handleStandardGenerateContent(req, res) {
     }
 
     // 记录使用统计
-    if (response?.response?.usageMetadata) {
+    // 兼容两种返回结构：
+    // 1. 普通 OAuth/API: { usageMetadata: {...} }
+    // 2. Antigravity: { response: { usageMetadata: {...} } } 或 { usageMetadata: {...} }
+    const usage = response?.response?.usageMetadata || response?.usageMetadata
+
+    if (usage) {
       try {
-        const usage = response.response.usageMetadata
         await apiKeyService.recordUsage(
           req.apiKey.id,
           usage.promptTokenCount || 0,
@@ -2273,6 +2302,8 @@ async function handleStandardGenerateContent(req, res) {
       } catch (error) {
         logger.error('Failed to record Gemini usage:', error)
       }
+    } else {
+      logger.warn('⚠️ No usage metadata found in response')
     }
 
     res.json(response.response || response)
@@ -2627,27 +2658,6 @@ async function handleStandardStreamGenerateContent(req, res) {
       if (!res.destroyed) {
         res.write(outputChunk)
       }
-
-      setImmediate(() => {
-        try {
-          const usageSource =
-            processedPayload && processedPayload !== '[DONE]' ? processedPayload : dataPayload
-
-          if (!usageSource || !usageSource.includes('usageMetadata')) {
-            return
-          }
-
-          const usageObj = JSON.parse(usageSource)
-          const usage = usageObj.usageMetadata || usageObj.response?.usageMetadata || usageObj.usage
-
-          if (usage && typeof usage === 'object') {
-            totalUsage = usage
-            logger.debug('📊 Captured Gemini usage data (async):', totalUsage)
-          }
-        } catch (error) {
-          // 提取用量失败时忽略
-        }
-      })
     }
 
     streamResponse.on('data', (chunk) => {
@@ -2685,30 +2695,33 @@ async function handleStandardStreamGenerateContent(req, res) {
 
       res.end()
 
-      if (totalUsage.totalTokenCount > 0) {
-        apiKeyService
-          .recordUsage(
-            req.apiKey.id,
-            totalUsage.promptTokenCount || 0,
-            totalUsage.candidatesTokenCount || 0,
-            0,
-            0,
-            model,
-            accountId
-          )
-          .then(() => {
-            logger.info(
-              `📊 Recorded Gemini stream usage - Input: ${totalUsage.promptTokenCount}, Output: ${totalUsage.candidatesTokenCount}, Total: ${totalUsage.totalTokenCount}`
+      // 使用 setImmediate 延迟使用记录，确保所有同步解析都已完成
+      setImmediate(() => {
+        if (totalUsage.totalTokenCount > 0) {
+          apiKeyService
+            .recordUsage(
+              req.apiKey.id,
+              totalUsage.promptTokenCount || 0,
+              totalUsage.candidatesTokenCount || 0,
+              0,
+              0,
+              model,
+              accountId
             )
-          })
-          .catch((error) => {
-            logger.error('Failed to record Gemini usage:', error)
-          })
-      } else {
-        logger.warn(
-          `⚠️ Stream completed without usage data - totalTokenCount: ${totalUsage.totalTokenCount}`
-        )
-      }
+            .then(() => {
+              logger.info(
+                `📊 Recorded Gemini stream usage - Input: ${totalUsage.promptTokenCount}, Output: ${totalUsage.candidatesTokenCount}, Total: ${totalUsage.totalTokenCount}`
+              )
+            })
+            .catch((error) => {
+              logger.error('Failed to record Gemini usage:', error)
+            })
+        } else {
+          logger.warn(
+            `⚠️ Stream completed without usage data - totalTokenCount: ${totalUsage.totalTokenCount}`
+          )
+        }
+      })
     })
 
     streamResponse.on('error', (error) => {
