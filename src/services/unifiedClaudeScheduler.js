@@ -184,9 +184,32 @@ class UnifiedClaudeScheduler {
     apiKeyData,
     sessionHash = null,
     requestedModel = null,
-    forcedAccount = null
+    forcedAccount = null,
+    options = {}
   ) {
     try {
+      const {
+        allowOfficial = true,
+        allowConsole = true,
+        allowBedrock = true,
+        allowCcr = true
+      } = options || {}
+
+      // 🔒 如果有强制绑定的账户（全局会话绑定），仅 claude-official 类型受影响
+      if (forcedAccount && forcedAccount.accountId && forcedAccount.accountType) {
+        if (
+          (forcedAccount.accountType === 'claude-official' && !allowOfficial) ||
+          (forcedAccount.accountType === 'claude-console' && !allowConsole) ||
+          (forcedAccount.accountType === 'bedrock' && !allowBedrock) ||
+          (forcedAccount.accountType === 'ccr' && !allowCcr)
+        ) {
+          logger.info(
+            `🔗 Forced session binding ignored due to route policy: ${forcedAccount.accountType}`
+          )
+          forcedAccount = null
+        }
+      }
+
       // 🔒 如果有强制绑定的账户（全局会话绑定），仅 claude-official 类型受影响
       if (forcedAccount && forcedAccount.accountId && forcedAccount.accountType) {
         // ⚠️ 只有 claude-official 类型账户受全局会话绑定限制
@@ -244,6 +267,11 @@ class UnifiedClaudeScheduler {
 
       // 如果是 CCR 前缀，只在 CCR 账户池中选择
       if (vendor === 'ccr') {
+        if (!allowCcr) {
+          const error = new Error('CCR routing is not allowed for this route')
+          error.code = 'CCR_NOT_ALLOWED'
+          throw error
+        }
         logger.info(`🎯 CCR vendor prefix detected, routing to CCR accounts only`)
         return await this._selectCcrAccount(apiKeyData, sessionHash, effectiveModel)
       }
@@ -259,11 +287,21 @@ class UnifiedClaudeScheduler {
             groupId,
             sessionHash,
             effectiveModel,
-            vendor === 'ccr'
+            {
+              allowOfficial,
+              allowConsole,
+              allowCcr: vendor === 'ccr' && allowCcr
+            }
           )
         }
 
         // 普通专属账户
+        if (!allowOfficial) {
+          logger.info(
+            `🚫 Claude official accounts are disabled for this route, skipping bound Claude account ${apiKeyData.claudeAccountId}`
+          )
+          // 不返回，继续走后续调度
+        } else {
         const boundAccount = await redis.getClaudeAccount(apiKeyData.claudeAccountId)
         if (boundAccount && boundAccount.isActive === 'true' && boundAccount.status !== 'error') {
           // 检查是否临时不可用
@@ -308,10 +346,16 @@ class UnifiedClaudeScheduler {
             `⚠️ Bound Claude OAuth account ${apiKeyData.claudeAccountId} is not available (isActive: ${boundAccount?.isActive}, status: ${boundAccount?.status}), falling back to pool`
           )
         }
+        }
       }
 
       // 2. 检查Claude Console账户绑定
       if (apiKeyData.claudeConsoleAccountId) {
+        if (!allowConsole) {
+          logger.info(
+            `🚫 Claude Console accounts are disabled for this route, skipping bound Console account ${apiKeyData.claudeConsoleAccountId}`
+          )
+        } else {
         const boundConsoleAccount = await claudeConsoleAccountService.getAccount(
           apiKeyData.claudeConsoleAccountId
         )
@@ -344,10 +388,16 @@ class UnifiedClaudeScheduler {
             `⚠️ Bound Claude Console account ${apiKeyData.claudeConsoleAccountId} is not available (isActive: ${boundConsoleAccount?.isActive}, status: ${boundConsoleAccount?.status}, schedulable: ${boundConsoleAccount?.schedulable}), falling back to pool`
           )
         }
+        }
       }
 
       // 3. 检查Bedrock账户绑定
       if (apiKeyData.bedrockAccountId) {
+        if (!allowBedrock) {
+          logger.info(
+            `🚫 Bedrock accounts are disabled for this route, skipping bound Bedrock account ${apiKeyData.bedrockAccountId}`
+          )
+        } else {
         const boundBedrockAccountResult = await bedrockAccountService.getAccount(
           apiKeyData.bedrockAccountId
         )
@@ -379,6 +429,7 @@ class UnifiedClaudeScheduler {
             `⚠️ Bound Bedrock account ${apiKeyData.bedrockAccountId} is not available (isActive: ${boundBedrockAccountResult?.data?.isActive}, schedulable: ${boundBedrockAccountResult?.data?.schedulable}), falling back to pool`
           )
         }
+        }
       }
 
       // CCR 账户不支持绑定（仅通过 ccr, 前缀进行 CCR 路由）
@@ -387,6 +438,18 @@ class UnifiedClaudeScheduler {
       if (sessionHash) {
         const mappedAccount = await this._getSessionMapping(sessionHash)
         if (mappedAccount) {
+          const isAllowedByRoute =
+            (mappedAccount.accountType === 'claude-official' && allowOfficial) ||
+            (mappedAccount.accountType === 'claude-console' && allowConsole) ||
+            (mappedAccount.accountType === 'bedrock' && allowBedrock) ||
+            (mappedAccount.accountType === 'ccr' && allowCcr)
+
+          if (!isAllowedByRoute) {
+            logger.info(
+              `ℹ️ Skipping sticky session mapping due to route policy: ${mappedAccount.accountType} for session ${sessionHash}`
+            )
+            await this._deleteSessionMapping(sessionHash)
+          } else {
           // 当本次请求不是 CCR 前缀时，不允许使用指向 CCR 的粘性会话映射
           if (vendor !== 'ccr' && mappedAccount.accountType === 'ccr') {
             logger.info(
@@ -414,6 +477,7 @@ class UnifiedClaudeScheduler {
               await this._deleteSessionMapping(sessionHash)
             }
           }
+          }
         }
       }
 
@@ -421,7 +485,8 @@ class UnifiedClaudeScheduler {
       const availableAccounts = await this._getAllAvailableAccounts(
         apiKeyData,
         effectiveModel,
-        false // 仅前缀才走 CCR：默认池不包含 CCR 账户
+        false, // 仅前缀才走 CCR：默认池不包含 CCR 账户
+        { allowOfficial, allowConsole, allowBedrock }
       )
 
       if (availableAccounts.length === 0) {
@@ -468,7 +533,13 @@ class UnifiedClaudeScheduler {
   }
 
   // 📋 获取所有可用账户（合并官方和Console）
-  async _getAllAvailableAccounts(apiKeyData, requestedModel = null, includeCcr = false) {
+  async _getAllAvailableAccounts(
+    apiKeyData,
+    requestedModel = null,
+    includeCcr = false,
+    options = {}
+  ) {
+    const { allowOfficial = true, allowConsole = true, allowBedrock = true } = options || {}
     const availableAccounts = []
     const isOpusRequest =
       requestedModel && typeof requestedModel === 'string'
@@ -478,6 +549,11 @@ class UnifiedClaudeScheduler {
     // 如果API Key绑定了专属账户，优先返回
     // 1. 检查Claude OAuth账户绑定
     if (apiKeyData.claudeAccountId) {
+      if (!allowOfficial) {
+        logger.info(
+          `🚫 Claude official accounts are disabled for this route, skipping bound Claude account ${apiKeyData.claudeAccountId}`
+        )
+      } else {
       const boundAccount = await redis.getClaudeAccount(apiKeyData.claudeAccountId)
       if (
         boundAccount &&
@@ -519,10 +595,16 @@ class UnifiedClaudeScheduler {
           `⚠️ Bound Claude OAuth account ${apiKeyData.claudeAccountId} is not available (isActive: ${boundAccount?.isActive}, status: ${boundAccount?.status})`
         )
       }
+      }
     }
 
     // 2. 检查Claude Console账户绑定
     if (apiKeyData.claudeConsoleAccountId) {
+      if (!allowConsole) {
+        logger.info(
+          `🚫 Claude Console accounts are disabled for this route, skipping bound Console account ${apiKeyData.claudeConsoleAccountId}`
+        )
+      } else {
       const boundConsoleAccount = await claudeConsoleAccountService.getAccount(
         apiKeyData.claudeConsoleAccountId
       )
@@ -569,10 +651,16 @@ class UnifiedClaudeScheduler {
           `⚠️ Bound Claude Console account ${apiKeyData.claudeConsoleAccountId} is not available (isActive: ${boundConsoleAccount?.isActive}, status: ${boundConsoleAccount?.status}, schedulable: ${boundConsoleAccount?.schedulable})`
         )
       }
+      }
     }
 
     // 3. 检查Bedrock账户绑定
     if (apiKeyData.bedrockAccountId) {
+      if (!allowBedrock) {
+        logger.info(
+          `🚫 Bedrock accounts are disabled for this route, skipping bound Bedrock account ${apiKeyData.bedrockAccountId}`
+        )
+      } else {
       const boundBedrockAccountResult = await bedrockAccountService.getAccount(
         apiKeyData.bedrockAccountId
       )
@@ -598,67 +686,71 @@ class UnifiedClaudeScheduler {
           `⚠️ Bound Bedrock account ${apiKeyData.bedrockAccountId} is not available (isActive: ${boundBedrockAccountResult?.data?.isActive}, schedulable: ${boundBedrockAccountResult?.data?.schedulable})`
         )
       }
+      }
     }
 
     // 获取官方Claude账户（共享池）
-    const claudeAccounts = await redis.getAllClaudeAccounts()
-    for (const account of claudeAccounts) {
-      if (
-        account.isActive === 'true' &&
-        account.status !== 'error' &&
-        account.status !== 'blocked' &&
-        account.status !== 'temp_error' &&
-        (account.accountType === 'shared' || !account.accountType) && // 兼容旧数据
-        this._isSchedulable(account.schedulable)
-      ) {
-        // 检查是否可调度
+    if (allowOfficial) {
+      const claudeAccounts = await redis.getAllClaudeAccounts()
+      for (const account of claudeAccounts) {
+        if (
+          account.isActive === 'true' &&
+          account.status !== 'error' &&
+          account.status !== 'blocked' &&
+          account.status !== 'temp_error' &&
+          (account.accountType === 'shared' || !account.accountType) && // 兼容旧数据
+          this._isSchedulable(account.schedulable)
+        ) {
+          // 检查是否可调度
 
-        // 检查模型支持
-        if (!this._isModelSupportedByAccount(account, 'claude-official', requestedModel)) {
-          continue
-        }
+          // 检查模型支持
+          if (!this._isModelSupportedByAccount(account, 'claude-official', requestedModel)) {
+            continue
+          }
 
-        // 检查是否临时不可用
-        const isTempUnavailable = await this.isAccountTemporarilyUnavailable(
-          account.id,
-          'claude-official'
-        )
-        if (isTempUnavailable) {
-          logger.debug(
-            `⏭️ Skipping Claude Official account ${account.name} - temporarily unavailable`
+          // 检查是否临时不可用
+          const isTempUnavailable = await this.isAccountTemporarilyUnavailable(
+            account.id,
+            'claude-official'
           )
-          continue
-        }
-
-        // 检查是否被限流
-        const isRateLimited = await claudeAccountService.isAccountRateLimited(account.id)
-        if (isRateLimited) {
-          continue
-        }
-
-        if (isOpusRequest) {
-          const isOpusRateLimited = await claudeAccountService.isAccountOpusRateLimited(account.id)
-          if (isOpusRateLimited) {
-            logger.info(
-              `🚫 Skipping account ${account.name} (${account.id}) due to active Opus limit`
+          if (isTempUnavailable) {
+            logger.debug(
+              `⏭️ Skipping Claude Official account ${account.name} - temporarily unavailable`
             )
             continue
           }
-        }
 
-        availableAccounts.push({
-          ...account,
-          accountId: account.id,
-          accountType: 'claude-official',
-          priority: parseInt(account.priority) || 50, // 默认优先级50
-          lastUsedAt: account.lastUsedAt || '0'
-        })
+          // 检查是否被限流
+          const isRateLimited = await claudeAccountService.isAccountRateLimited(account.id)
+          if (isRateLimited) {
+            continue
+          }
+
+          if (isOpusRequest) {
+            const isOpusRateLimited = await claudeAccountService.isAccountOpusRateLimited(account.id)
+            if (isOpusRateLimited) {
+              logger.info(
+                `🚫 Skipping account ${account.name} (${account.id}) due to active Opus limit`
+              )
+              continue
+            }
+          }
+
+          availableAccounts.push({
+            ...account,
+            accountId: account.id,
+            accountType: 'claude-official',
+            priority: parseInt(account.priority) || 50, // 默认优先级50
+            lastUsedAt: account.lastUsedAt || '0'
+          })
+        }
       }
     }
 
     // 获取Claude Console账户
-    const consoleAccounts = await claudeConsoleAccountService.getAllAccounts()
-    logger.info(`📋 Found ${consoleAccounts.length} total Claude Console accounts`)
+    if (allowConsole) {
+      const consoleAccounts = await claudeConsoleAccountService.getAllAccounts()
+      logger.info(`📋 Found ${consoleAccounts.length} total Claude Console accounts`)
 
     // 🔢 统计Console账户并发排除情况
     let consoleAccountsEligibleCount = 0 // 符合基本条件的账户数
@@ -811,14 +903,16 @@ class UnifiedClaudeScheduler {
         }
       }
     }
+    }
 
     // 获取Bedrock账户（共享池）
-    const bedrockAccountsResult = await bedrockAccountService.getAllAccounts()
-    if (bedrockAccountsResult.success) {
-      const bedrockAccounts = bedrockAccountsResult.data
-      logger.info(`📋 Found ${bedrockAccounts.length} total Bedrock accounts`)
+    if (allowBedrock) {
+      const bedrockAccountsResult = await bedrockAccountService.getAllAccounts()
+      if (bedrockAccountsResult.success) {
+        const bedrockAccounts = bedrockAccountsResult.data
+        logger.info(`📋 Found ${bedrockAccounts.length} total Bedrock accounts`)
 
-      for (const account of bedrockAccounts) {
+        for (const account of bedrockAccounts) {
         logger.info(
           `🔍 Checking Bedrock account: ${account.name} - isActive: ${account.isActive}, accountType: ${account.accountType}, schedulable: ${account.schedulable}`
         )
@@ -852,6 +946,7 @@ class UnifiedClaudeScheduler {
           logger.info(
             `❌ Bedrock account ${account.name} not eligible - isActive: ${account.isActive}, accountType: ${account.accountType}, schedulable: ${account.schedulable}`
           )
+        }
         }
       }
     }
@@ -1440,9 +1535,10 @@ class UnifiedClaudeScheduler {
     groupId,
     sessionHash = null,
     requestedModel = null,
-    allowCcr = false
+    options = {}
   ) {
     try {
+      const { allowOfficial = true, allowConsole = true, allowCcr = false } = options || {}
       // 获取分组信息
       const group = await accountGroupService.getGroup(groupId)
       if (!group) {
@@ -1502,22 +1598,26 @@ class UnifiedClaudeScheduler {
         // 根据平台类型获取账户
         if (group.platform === 'claude') {
           // 先尝试官方账户
-          account = await redis.getClaudeAccount(memberId)
-          if (account?.id) {
-            accountType = 'claude-official'
-          } else {
+          if (allowOfficial) {
+            account = await redis.getClaudeAccount(memberId)
+            if (account?.id) {
+              accountType = 'claude-official'
+            }
+          }
+
+          if (!account && allowConsole) {
             // 尝试Console账户
             account = await claudeConsoleAccountService.getAccount(memberId)
             if (account) {
               accountType = 'claude-console'
-            } else {
-              // 尝试CCR账户（仅允许在 allowCcr 为 true 时）
-              if (allowCcr) {
-                account = await ccrAccountService.getAccount(memberId)
-                if (account) {
-                  accountType = 'ccr'
-                }
-              }
+            }
+          }
+
+          if (!account && allowCcr) {
+            // 尝试CCR账户（仅允许在 allowCcr 为 true 时）
+            account = await ccrAccountService.getAccount(memberId)
+            if (account) {
+              accountType = 'ccr'
             }
           }
         } else if (group.platform === 'gemini') {

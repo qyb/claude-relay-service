@@ -519,7 +519,9 @@ const authenticateApiKey = async (req, res, next) => {
       const normalizedPath = (req.originalUrl || req.path || '').toLowerCase()
       const isClaudeMessagesEndpoint =
         normalizedPath.includes('/v1/messages') &&
-        (normalizedPath.startsWith('/api') || normalizedPath.startsWith('/claude'))
+        (normalizedPath.startsWith('/api') ||
+          normalizedPath.startsWith('/claude') ||
+          normalizedPath.startsWith('/cc'))
 
       if (isClaudeMessagesEndpoint) {
         try {

@@ -283,6 +283,7 @@ class Application {
       this.app.use('/api', apiRoutes)
       this.app.use('/api', unifiedRoutes) // 统一智能路由（支持 /v1/chat/completions 等）
       this.app.use('/claude', apiRoutes) // /claude 路由别名，与 /api 功能相同
+      this.app.use('/cc', apiRoutes) // /cc 路由仅用于 Claude 官方账号
       // Anthropic (Claude Code) 路由：按路径强制分流到 Gemini OAuth 账户
       // - /antigravity/api/v1/messages -> Antigravity OAuth
       // - /gemini-cli/api/v1/messages -> Gemini CLI OAuth

@@ -27,6 +27,25 @@ const {
 } = require('../services/anthropicGeminiBridgeService')
 const router = express.Router()
 
+function getClaudeRoutePolicy(req) {
+  const baseUrl = (req.baseUrl || '').toLowerCase()
+  if (baseUrl === '/cc') {
+    return {
+      allowOfficial: true,
+      allowConsole: false,
+      allowBedrock: false,
+      allowCcr: false
+    }
+  }
+
+  return {
+    allowOfficial: false,
+    allowConsole: true,
+    allowBedrock: true,
+    allowCcr: true
+  }
+}
+
 function queueRateLimitUpdate(rateLimitInfo, usageSummary, model, context = '') {
   if (!rateLimitInfo) {
     return Promise.resolve({ totalTokens: 0, totalCost: 0 })
@@ -326,12 +345,14 @@ async function handleMessagesRequest(req, res) {
       const requestedModel = req.body.model
       let accountId
       let accountType
+      const routePolicy = getClaudeRoutePolicy(req)
       try {
         const selection = await unifiedClaudeScheduler.selectAccountForApiKey(
           req.apiKey,
           sessionHash,
           requestedModel,
-          forcedAccount
+          forcedAccount,
+          routePolicy
         )
         ;({ accountId, accountType } = selection)
       } catch (error) {
@@ -342,6 +363,14 @@ async function handleMessagesRequest(req, res) {
             error: {
               type: 'session_binding_error',
               message: errorMessage
+            }
+          })
+        }
+        if (error.code === 'CCR_NOT_ALLOWED') {
+          return res.status(403).json({
+            error: {
+              type: 'permission_error',
+              message: 'CCR is not allowed on this route'
             }
           })
         }
@@ -890,12 +919,14 @@ async function handleMessagesRequest(req, res) {
       const requestedModel = req.body.model
       let accountId
       let accountType
+      const routePolicy = getClaudeRoutePolicy(req)
       try {
         const selection = await unifiedClaudeScheduler.selectAccountForApiKey(
           req.apiKey,
           sessionHash,
           requestedModel,
-          forcedAccountNonStream
+          forcedAccountNonStream,
+          routePolicy
         )
         ;({ accountId, accountType } = selection)
       } catch (error) {
@@ -905,6 +936,14 @@ async function handleMessagesRequest(req, res) {
             error: {
               type: 'session_binding_error',
               message: errorMessage
+            }
+          })
+        }
+        if (error.code === 'CCR_NOT_ALLOWED') {
+          return res.status(403).json({
+            error: {
+              type: 'permission_error',
+              message: 'CCR is not allowed on this route'
             }
           })
         }
@@ -1528,10 +1567,13 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
   let attempt = 0
 
   const processRequest = async () => {
+    const routePolicy = getClaudeRoutePolicy(req)
     const { accountId, accountType } = await unifiedClaudeScheduler.selectAccountForApiKey(
       req.apiKey,
       sessionHash,
-      requestedModel
+      requestedModel,
+      null,
+      routePolicy
     )
 
     if (accountType === 'ccr') {
@@ -1686,6 +1728,15 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
           res.end()
         }
         return
+      }
+
+      if (error.code === 'CCR_NOT_ALLOWED') {
+        return res.status(403).json({
+          error: {
+            type: 'permission_error',
+            message: 'CCR is not allowed on this route'
+          }
+        })
       }
 
       if (error.httpStatus) {
