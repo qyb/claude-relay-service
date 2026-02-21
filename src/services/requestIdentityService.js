@@ -22,6 +22,24 @@ const STAINLESS_HEADER_KEYS = [
   'x-stainless-runtime',
   'x-stainless-runtime-version'
 ]
+const CACHED_STAINLESS_HEADER_KEYS = [
+  'x-stainless-lang',
+  'x-stainless-package-version',
+  'x-stainless-os',
+  'x-stainless-arch',
+  'x-stainless-runtime',
+  'x-stainless-runtime-version'
+]
+const USER_AGENT_CACHE_KEY = 'user-agent'
+const DEFAULT_FINGERPRINT = {
+  'user-agent': 'claude-cli/2.1.22 (external, cli)',
+  'x-stainless-lang': 'js',
+  'x-stainless-package-version': '0.70.0',
+  'x-stainless-os': 'Linux',
+  'x-stainless-arch': 'x64',
+  'x-stainless-runtime': 'node',
+  'x-stainless-runtime-version': 'v24.3.0'
+}
 
 // 小写 key 到正确大小写格式的映射（用于返回给上游时）
 const STAINLESS_HEADER_CASE_MAP = {
@@ -36,6 +54,65 @@ const STAINLESS_HEADER_CASE_MAP = {
 }
 const MIN_FINGERPRINT_FIELDS = 4
 const REDIS_KEY_PREFIX = 'fmt_claude_req:stainless_headers:'
+
+// ============================================================================
+// User-Agent 版本号解析和比较
+// ============================================================================
+
+/**
+ * 解析 User-Agent 版本号
+ * 例如：claude-cli/2.1.22 -> { major: 2, minor: 1, patch: 22, ok: true }
+ * @param {string} ua - User-Agent 字符串
+ * @returns {{ major: number, minor: number, patch: number, ok: boolean }}
+ */
+function parseUserAgentVersion(ua) {
+  if (typeof ua !== 'string') {
+    return { major: 0, minor: 0, patch: 0, ok: false }
+  }
+
+  // 匹配 xxx/x.y.z 格式
+  const match = ua.match(/\/(\d+)\.(\d+)\.(\d+)/)
+  if (!match) {
+    return { major: 0, minor: 0, patch: 0, ok: false }
+  }
+
+  const major = parseInt(match[1], 10) || 0
+  const minor = parseInt(match[2], 10) || 0
+  const patch = parseInt(match[3], 10) || 0
+
+  return { major, minor, patch, ok: true }
+}
+
+/**
+ * 比较版本号，判断 newUA 是否比 cachedUA 更新
+ * @param {string} newUA - 新的 User-Agent
+ * @param {string} cachedUA - 缓存的 User-Agent
+ * @returns {boolean} - 新版本更高返回 true
+ */
+function isNewerVersion(newUA, cachedUA) {
+  const newVersion = parseUserAgentVersion(newUA)
+  const cachedVersion = parseUserAgentVersion(cachedUA)
+
+  if (!newVersion.ok || !cachedVersion.ok) {
+    return false
+  }
+
+  if (newVersion.major > cachedVersion.major) {
+    return true
+  }
+  if (newVersion.major < cachedVersion.major) {
+    return false
+  }
+
+  if (newVersion.minor > cachedVersion.minor) {
+    return true
+  }
+  if (newVersion.minor < cachedVersion.minor) {
+    return false
+  }
+
+  return newVersion.patch > cachedVersion.patch
+}
 
 function formatUuidFromSeed(seed) {
   const digest = crypto.createHash('sha256').update(String(seed)).digest()
@@ -76,7 +153,7 @@ function hasFingerprintValues(fingerprint) {
   return fingerprint && typeof fingerprint === 'object' && Object.keys(fingerprint).length > 0
 }
 
-function sanitizeFingerprint(source) {
+function sanitizeFingerprint(source, allowedKeys = STAINLESS_HEADER_KEYS) {
   if (!source || typeof source !== 'object') {
     return {}
   }
@@ -92,7 +169,7 @@ function sanitizeFingerprint(source) {
     lowerCaseSource[key.toLowerCase()] = String(value)
   })
 
-  STAINLESS_HEADER_KEYS.forEach((key) => {
+  allowedKeys.forEach((key) => {
     if (lowerCaseSource[key]) {
       normalized[key] = lowerCaseSource[key]
     }
@@ -101,7 +178,7 @@ function sanitizeFingerprint(source) {
   return normalized
 }
 
-function collectFingerprintFromHeaders(headers) {
+function collectFingerprintFromHeaders(headers, allowedKeys = STAINLESS_HEADER_KEYS) {
   if (!headers || typeof headers !== 'object') {
     return {}
   }
@@ -110,12 +187,49 @@ function collectFingerprintFromHeaders(headers) {
 
   Object.keys(headers).forEach((key) => {
     const lowerKey = key.toLowerCase()
-    if (STAINLESS_HEADER_KEYS.includes(lowerKey)) {
+    if (allowedKeys.includes(lowerKey)) {
       subset[lowerKey] = headers[key]
     }
   })
 
-  return sanitizeFingerprint(subset)
+  return sanitizeFingerprint(subset, allowedKeys)
+}
+
+function countCachedFingerprintFields(fingerprint) {
+  if (!fingerprint || typeof fingerprint !== 'object') {
+    return 0
+  }
+
+  let count = 0
+  for (const key of CACHED_STAINLESS_HEADER_KEYS) {
+    if (fingerprint[key]) {
+      count += 1
+    }
+  }
+
+  return count
+}
+
+function hasCachedFingerprintValues(fingerprint) {
+  return countCachedFingerprintFields(fingerprint) >= MIN_FINGERPRINT_FIELDS
+}
+
+function getCachedUserAgent(fingerprint) {
+  if (!fingerprint || typeof fingerprint !== 'object') {
+    return ''
+  }
+  const ua = fingerprint[USER_AGENT_CACHE_KEY]
+  return typeof ua === 'string' ? ua : ''
+}
+
+function collectCachedFingerprintFromHeaders(headers) {
+  const fingerprint = collectFingerprintFromHeaders(headers, CACHED_STAINLESS_HEADER_KEYS)
+  CACHED_STAINLESS_HEADER_KEYS.forEach((key) => {
+    if (!fingerprint[key] && DEFAULT_FINGERPRINT[key]) {
+      fingerprint[key] = DEFAULT_FINGERPRINT[key]
+    }
+  })
+  return fingerprint
 }
 
 function removeHeaderCaseInsensitive(target, key) {
@@ -153,6 +267,137 @@ function applyFingerprintToHeaders(headers, fingerprint) {
   })
 
   return nextHeaders
+}
+
+function applyCachedFingerprintToHeaders(headers, fingerprint) {
+  return applyFingerprintToHeadersWithKeys(headers, fingerprint, CACHED_STAINLESS_HEADER_KEYS)
+}
+
+function applyFingerprintToHeadersWithKeys(headers, fingerprint, allowedKeys) {
+  if (!headers || typeof headers !== 'object') {
+    return headers
+  }
+
+  if (!hasFingerprintValues(fingerprint)) {
+    return { ...headers }
+  }
+
+  const nextHeaders = { ...headers }
+
+  allowedKeys.forEach((key) => {
+    if (!Object.prototype.hasOwnProperty.call(fingerprint, key)) {
+      return
+    }
+    removeHeaderCaseInsensitive(nextHeaders, key)
+    const properCaseKey = STAINLESS_HEADER_CASE_MAP[key] || key
+    nextHeaders[properCaseKey] = fingerprint[key]
+  })
+
+  return nextHeaders
+}
+
+// ============================================================================
+// 指纹缓存管理（参考 Go 版本 GetOrCreateFingerprint）
+// ============================================================================
+
+/**
+ * 从 Redis 获取缓存的指纹
+ * @param {string} accountId - 账户ID
+ * @returns {Promise<Object|null>} - 缓存的指纹对象，不存在则返回 null
+ */
+async function getCachedFingerprint(accountId) {
+  if (!accountId) {
+    return null
+  }
+
+  try {
+    const client = getRedisClient()
+    const key = `${REDIS_KEY_PREFIX}${accountId}`
+    const value = await client.get(key)
+
+    if (!value) {
+      return null
+    }
+
+    const fingerprint = safeParseJson(value)
+    return hasCachedFingerprintValues(fingerprint) ? fingerprint : null
+  } catch (error) {
+    logger.warn(`requestIdentityService: 获取缓存指纹失败 (${accountId}): ${error.message}`)
+    return null
+  }
+}
+
+/**
+ * 持久化指纹到 Redis（无条件覆盖）
+ * @param {string} accountId - 账户ID
+ * @param {Object} fingerprint - 指纹对象
+ */
+async function setFingerprint(accountId, fingerprint) {
+  if (!accountId || !hasCachedFingerprintValues(fingerprint)) {
+    return
+  }
+
+  try {
+    const client = getRedisClient()
+    const key = `${REDIS_KEY_PREFIX}${accountId}`
+    const serialized = JSON.stringify(fingerprint)
+
+    await client.set(key, serialized)
+    logger.info(`requestIdentityService: 更新账户 ${accountId} 的指纹`)
+  } catch (error) {
+    logger.error(`requestIdentityService: 持久化指纹失败 (${accountId}): ${error.message}`)
+  }
+}
+
+/**
+ * 获取或创建账户的指纹（核心函数）
+ *
+ * 逻辑：
+ * 1. 如果缓存存在，检查 User-Agent 版本，新版本则更新指纹（UA + 6个头）
+ * 2. 如果缓存不存在，从请求头创建新指纹并缓存
+ *
+ * @param {string} accountId - 账户ID
+ * @param {Object} headers - 请求头
+ * @returns {Promise<Object>} - 统一的指纹对象
+ */
+async function getOrCreateFingerprint(accountId, headers) {
+  const cached = await getCachedFingerprint(accountId)
+
+  if (cached) {
+    const clientUA = getHeaderValueCaseInsensitive(headers, 'user-agent')
+    const cachedUA = getCachedUserAgent(cached)
+
+    if (clientUA && (!cachedUA || isNewerVersion(clientUA, cachedUA))) {
+      const refreshedFingerprint = collectCachedFingerprintFromHeaders(headers)
+      if (hasCachedFingerprintValues(refreshedFingerprint)) {
+        refreshedFingerprint[USER_AGENT_CACHE_KEY] = clientUA
+        await setFingerprint(accountId, refreshedFingerprint)
+        logger.info(`requestIdentityService: 账户 ${accountId} User-Agent 版本更新为 ${clientUA}`)
+        return refreshedFingerprint
+      }
+
+      logger.warn(`requestIdentityService: 账户 ${accountId} 指纹字段不足，已保持原样`)
+      return cached
+    }
+
+    return cached
+  }
+
+  const fingerprint = collectCachedFingerprintFromHeaders(headers)
+
+  if (!hasCachedFingerprintValues(fingerprint)) {
+    return null
+  }
+
+  const clientUA = getHeaderValueCaseInsensitive(headers, 'user-agent')
+  if (clientUA) {
+    fingerprint[USER_AGENT_CACHE_KEY] = clientUA
+  }
+
+  await setFingerprint(accountId, fingerprint)
+  logger.info(`requestIdentityService: 账户 ${accountId} 创建新指纹`)
+
+  return fingerprint
 }
 
 function persistFingerprint(accountId, fingerprint) {
@@ -232,6 +477,79 @@ function resolveAccountId(payload) {
   }
 
   return null
+}
+
+/**
+ * 重写请求头（使用统一的指纹）
+ *
+ * 逻辑：
+ * 1. 从缓存获取或创建统一指纹
+ * 2. 应用统一指纹到请求头（不覆盖 retry-count/timeout）
+ */
+async function rewriteHeadersAsync(headers, accountId) {
+  if (!headers || typeof headers !== 'object') {
+    return { nextHeaders: headers, changed: false }
+  }
+
+  if (!accountId) {
+    return { nextHeaders: { ...headers }, changed: false }
+  }
+
+  const workingHeaders = { ...headers }
+
+  try {
+    const clientUA = getHeaderValueCaseInsensitive(workingHeaders, 'user-agent')
+    if (!clientUA) {
+      return {
+        nextHeaders: workingHeaders,
+        changed: false,
+        abortResponse: {
+          statusCode: 400,
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ error: 'missing_user_agent', message: 'User-Agent is required' })
+        }
+      }
+    }
+
+    const fingerprint = await getOrCreateFingerprint(accountId, workingHeaders)
+
+    if (!hasCachedFingerprintValues(fingerprint)) {
+      const currentFingerprint = collectCachedFingerprintFromHeaders(workingHeaders)
+      const fieldCount = countCachedFingerprintFields(currentFingerprint)
+
+      if (fieldCount < MIN_FINGERPRINT_FIELDS) {
+        logger.warn(
+          `requestIdentityService: 账号 ${accountId} 提供的 Stainless 指纹字段不足，已保持原样`
+        )
+        return { nextHeaders: workingHeaders, changed: false }
+      }
+
+      currentFingerprint[USER_AGENT_CACHE_KEY] = clientUA
+
+      await setFingerprint(accountId, currentFingerprint)
+      const appliedHeaders = applyCachedFingerprintToHeaders(workingHeaders, currentFingerprint)
+      const effectiveUA = getCachedUserAgent(currentFingerprint) || clientUA
+      if (effectiveUA) {
+        removeHeaderCaseInsensitive(appliedHeaders, 'user-agent')
+        appliedHeaders['user-agent'] = effectiveUA
+      }
+      const changed = headersChanged(workingHeaders, appliedHeaders)
+      return { nextHeaders: appliedHeaders, changed }
+    }
+
+    const appliedHeaders = applyCachedFingerprintToHeaders(workingHeaders, fingerprint)
+    const effectiveUA = getCachedUserAgent(fingerprint) || clientUA
+    if (effectiveUA) {
+      removeHeaderCaseInsensitive(appliedHeaders, 'user-agent')
+      appliedHeaders['user-agent'] = effectiveUA
+    }
+    const changed = headersChanged(workingHeaders, appliedHeaders)
+
+    return { nextHeaders: appliedHeaders, changed }
+  } catch (error) {
+    logger.error(`requestIdentityService: 重写请求头失败 (${accountId}): ${error.message}`)
+    return { nextHeaders: workingHeaders, changed: false }
+  }
 }
 
 function rewriteHeaders(headers, accountId) {
@@ -416,15 +734,59 @@ function transform(payload = {}) {
   }
 }
 
+/**
+ * 转换请求身份信息（异步版本）
+ * @param {Object} payload - 请求载荷
+ * @param {Object} payload.body - 请求体
+ * @param {Object} payload.headers - 请求头
+ * @param {string} payload.accountId - 账户ID
+ * @param {Object} payload.account - 账户对象
+ * @returns {Promise<Object>} 转换后的 { body, headers, abortResponse? }
+ */
+async function transformAsync(payload = {}) {
+  const currentBody = payload.body
+  const currentHeaders = payload.headers
+
+  if (!currentBody || !currentHeaders || !payload.accountId) {
+    return {
+      body: currentBody,
+      headers: currentHeaders
+    }
+  }
+
+  const accountUuid = extractAccountUuid(payload.account)
+  const accountIdForHeaders = resolveAccountId(payload)
+
+  const { nextBody } = rewriteUserId(currentBody, payload.accountId, accountUuid)
+  const headerResult = await rewriteHeadersAsync(currentHeaders, accountIdForHeaders)
+
+  const nextHeaders = headerResult ? headerResult.nextHeaders : currentHeaders
+  const abortResponse =
+    headerResult && headerResult.abortResponse ? headerResult.abortResponse : null
+
+  return {
+    body: nextBody,
+    headers: nextHeaders,
+    abortResponse
+  }
+}
+
 module.exports = {
   transform,
+  transformAsync,
   // 导出内部函数供测试使用
   _internal: {
     formatUuidFromSeed,
     collectFingerprintFromHeaders,
+    collectCachedFingerprintFromHeaders,
     rewriteHeaders,
+    rewriteHeadersAsync,
     rewriteUserId,
     extractAccountUuid,
-    resolveAccountId
+    resolveAccountId,
+    parseUserAgentVersion,
+    isNewerVersion,
+    getCachedFingerprint,
+    setFingerprint
   }
 }

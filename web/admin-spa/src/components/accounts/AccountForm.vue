@@ -1851,6 +1851,7 @@
                 <input
                   v-model="form.useUnifiedUserAgent"
                   class="mt-1 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700"
+                  disabled
                   type="checkbox"
                 />
                 <div class="ml-3">
@@ -2874,6 +2875,7 @@
               <input
                 v-model="form.useUnifiedUserAgent"
                 class="mt-1 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700"
+                disabled
                 type="checkbox"
               />
               <div class="ml-3">
