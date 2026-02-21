@@ -747,17 +747,17 @@ class UnifiedClaudeScheduler {
       }
     }
 
+    // 🔢 统计Console账户并发排除情况
+    let consoleAccountsEligibleCount = 0 // 符合基本条件的账户数
+    let consoleAccountsExcludedByConcurrency = 0 // 因并发满额被排除的账户数
+
     // 获取Claude Console账户
     if (allowConsole) {
       const consoleAccounts = await claudeConsoleAccountService.getAllAccounts()
       logger.info(`📋 Found ${consoleAccounts.length} total Claude Console accounts`)
 
-    // 🔢 统计Console账户并发排除情况
-    let consoleAccountsEligibleCount = 0 // 符合基本条件的账户数
-    let consoleAccountsExcludedByConcurrency = 0 // 因并发满额被排除的账户数
-
-    // 🚀 收集需要并发检查的账户ID列表（批量查询优化）
-    const accountsNeedingConcurrencyCheck = []
+      // 🚀 收集需要并发检查的账户ID列表（批量查询优化）
+      const accountsNeedingConcurrencyCheck = []
 
     for (const account of consoleAccounts) {
       // 主动检查封禁状态并尝试恢复（在过滤之前执行，确保可以恢复被封禁的账户）
