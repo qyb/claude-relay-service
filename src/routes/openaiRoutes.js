@@ -12,6 +12,7 @@ const apiKeyService = require('../services/apiKeyService')
 const crypto = require('crypto')
 const ProxyHelper = require('../utils/proxyHelper')
 const { updateRateLimitCounters } = require('../utils/rateLimitHelper')
+const { consumeSseLines } = require('../utils/sseStreamDecoder')
 
 // 创建代理 Agent（使用统一的代理工具）
 function createProxyAgent(proxy) {
@@ -577,7 +578,7 @@ const handleResponses = async (req, res) => {
     }
 
     // 处理响应并捕获 usage 数据和真实的 model
-    let buffer = ''
+    let pendingEventLines = []
     let usageData = null
     let actualModel = null
     let usageReported = false
@@ -692,112 +693,100 @@ const handleResponses = async (req, res) => {
       }
     }
 
-    upstream.data.on('data', (chunk) => {
-      try {
-        const chunkStr = chunk.toString()
+    const flushPendingEvent = () => {
+      if (pendingEventLines.length === 0) {
+        return
+      }
+      const event = pendingEventLines.join('\n')
+      pendingEventLines = []
+      if (event.trim()) {
+        parseSSEForUsage(event)
+      }
+    }
 
-        // 转发数据给客户端
+    consumeSseLines(upstream.data, {
+      onChunk: (chunk) => {
         if (!res.destroyed) {
           res.write(chunk)
         }
+      },
+      onLine: (line) => {
+        if (line === '') {
+          flushPendingEvent()
+          return
+        }
+        pendingEventLines.push(line)
+      },
+      onEnd: async () => {
+        flushPendingEvent()
 
-        // 同时解析数据以捕获 usage 信息
-        buffer += chunkStr
+        // 记录使用统计
+        if (!usageReported && usageData) {
+          try {
+            const totalInputTokens = usageData.input_tokens || 0
+            const outputTokens = usageData.output_tokens || 0
+            const cacheReadTokens = usageData.input_tokens_details?.cached_tokens || 0
+            const actualInputTokens = Math.max(0, totalInputTokens - cacheReadTokens)
+            const modelToRecord = actualModel || requestedModel || 'gpt-4'
 
-        // 处理完整的 SSE 事件
-        if (buffer.includes('\n\n')) {
-          const events = buffer.split('\n\n')
-          buffer = events.pop() || '' // 保留最后一个可能不完整的事件
+            await apiKeyService.recordUsage(
+              apiKeyData.id,
+              actualInputTokens,
+              outputTokens,
+              0,
+              cacheReadTokens,
+              modelToRecord,
+              accountId
+            )
 
-          for (const event of events) {
-            if (event.trim()) {
-              parseSSEForUsage(event)
-            }
+            logger.info(
+              `📊 Recorded OpenAI usage - Input: ${totalInputTokens}(actual:${actualInputTokens}+cached:${cacheReadTokens}), Output: ${outputTokens}, Total: ${usageData.total_tokens || totalInputTokens + outputTokens}, Model: ${modelToRecord} (actual: ${actualModel}, requested: ${requestedModel})`
+            )
+            usageReported = true
+
+            await applyRateLimitTracking(
+              req,
+              {
+                inputTokens: actualInputTokens,
+                outputTokens,
+                cacheCreateTokens: 0,
+                cacheReadTokens
+              },
+              modelToRecord,
+              'openai-stream'
+            )
+          } catch (error) {
+            logger.error('Failed to record OpenAI usage:', error)
           }
         }
-      } catch (error) {
-        logger.error('Error processing OpenAI stream chunk:', error)
-      }
-    })
 
-    upstream.data.on('end', async () => {
-      // 处理剩余的 buffer
-      if (buffer.trim()) {
-        parseSSEForUsage(buffer)
-      }
-
-      // 记录使用统计
-      if (!usageReported && usageData) {
-        try {
-          const totalInputTokens = usageData.input_tokens || 0
-          const outputTokens = usageData.output_tokens || 0
-          const cacheReadTokens = usageData.input_tokens_details?.cached_tokens || 0
-          // 计算实际输入token（总输入减去缓存部分）
-          const actualInputTokens = Math.max(0, totalInputTokens - cacheReadTokens)
-
-          // 使用响应中的真实 model，如果没有则使用请求中的 model，最后回退到默认值
-          const modelToRecord = actualModel || requestedModel || 'gpt-4'
-
-          await apiKeyService.recordUsage(
-            apiKeyData.id,
-            actualInputTokens, // 传递实际输入（不含缓存）
-            outputTokens,
-            0, // OpenAI没有cache_creation_tokens
-            cacheReadTokens,
-            modelToRecord,
-            accountId
+        if (rateLimitDetected) {
+          logger.warn(`🚫 Processing rate limit for OpenAI account ${accountId} from stream`)
+          await unifiedOpenAIScheduler.markAccountRateLimited(
+            accountId,
+            'openai',
+            sessionHash,
+            rateLimitResetsInSeconds
           )
-
-          logger.info(
-            `📊 Recorded OpenAI usage - Input: ${totalInputTokens}(actual:${actualInputTokens}+cached:${cacheReadTokens}), Output: ${outputTokens}, Total: ${usageData.total_tokens || totalInputTokens + outputTokens}, Model: ${modelToRecord} (actual: ${actualModel}, requested: ${requestedModel})`
-          )
-          usageReported = true
-
-          await applyRateLimitTracking(
-            req,
-            {
-              inputTokens: actualInputTokens,
-              outputTokens,
-              cacheCreateTokens: 0,
-              cacheReadTokens
-            },
-            modelToRecord,
-            'openai-stream'
-          )
-        } catch (error) {
-          logger.error('Failed to record OpenAI usage:', error)
+        } else if (upstream.status === 200) {
+          const isRateLimited = await unifiedOpenAIScheduler.isAccountRateLimited(accountId)
+          if (isRateLimited) {
+            logger.info(
+              `✅ Removing rate limit for OpenAI account ${accountId} after successful stream`
+            )
+            await unifiedOpenAIScheduler.removeAccountRateLimit(accountId, 'openai')
+          }
         }
-      }
 
-      // 如果在流式响应中检测到限流
-      if (rateLimitDetected) {
-        logger.warn(`🚫 Processing rate limit for OpenAI account ${accountId} from stream`)
-        await unifiedOpenAIScheduler.markAccountRateLimited(
-          accountId,
-          'openai',
-          sessionHash,
-          rateLimitResetsInSeconds
-        )
-      } else if (upstream.status === 200) {
-        // 流式请求成功，检查并移除限流状态
-        const isRateLimited = await unifiedOpenAIScheduler.isAccountRateLimited(accountId)
-        if (isRateLimited) {
-          logger.info(
-            `✅ Removing rate limit for OpenAI account ${accountId} after successful stream`
-          )
-          await unifiedOpenAIScheduler.removeAccountRateLimit(accountId, 'openai')
-        }
-      }
-
-      res.end()
-    })
-
-    upstream.data.on('error', (err) => {
-      logger.error('Upstream stream error:', err)
-      if (!res.headersSent) {
-        res.status(502).json({ error: { message: 'Upstream stream error' } })
-      } else {
         res.end()
+      },
+      onError: (err) => {
+        logger.error('Upstream stream error:', err)
+        if (!res.headersSent) {
+          res.status(502).json({ error: { message: 'Upstream stream error' } })
+        } else {
+          res.end()
+        }
       }
     })
 

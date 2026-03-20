@@ -12,6 +12,7 @@ const {
 const userMessageQueueService = require('./userMessageQueueService')
 const { isStreamWritable } = require('../utils/streamHelper')
 const { filterForClaude } = require('../utils/headerFilter')
+const { consumeSseLines } = require('../utils/sseStreamDecoder')
 
 class ClaudeConsoleRelayService {
   constructor() {
@@ -948,202 +949,155 @@ class ClaudeConsoleRelayService {
             })
           }
 
-          let buffer = ''
           let finalUsageReported = false
           const collectedUsageData = {
             model: body.model || account?.defaultModel || null
           }
 
-          // 处理流数据
-          response.data.on('data', (chunk) => {
-            try {
-              if (aborted) {
-                return
+          const writeConsoleStreamError = (error, isTerminalError = false) => {
+            logger.error(
+              `❌ Claude Console stream error (Account: ${account?.name || accountId}):`,
+              error
+            )
+            if (isStreamWritable(responseStream)) {
+              if (streamTransformer) {
+                responseStream.write(
+                  `data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`
+                )
+              } else {
+                responseStream.write('event: error\n')
+                responseStream.write(
+                  `data: ${JSON.stringify({
+                    error: isTerminalError ? 'Stream error' : 'Stream processing error',
+                    message: error.message,
+                    timestamp: new Date().toISOString()
+                  })}\n\n`
+                )
               }
-
-              const chunkStr = chunk.toString()
-              buffer += chunkStr
-
-              // 处理完整的SSE行
-              const lines = buffer.split('\n')
-              buffer = lines.pop() || ''
-
-              // 转发数据并解析usage
-              if (lines.length > 0) {
-                // 检查流是否可写（客户端连接是否有效）
-                if (isStreamWritable(responseStream)) {
-                  const linesToForward = lines.join('\n') + (lines.length > 0 ? '\n' : '')
-
-                  // 应用流转换器如果有
-                  let dataToWrite = linesToForward
-                  if (streamTransformer) {
-                    const transformed = streamTransformer(linesToForward)
-                    if (transformed) {
-                      dataToWrite = transformed
-                    } else {
-                      dataToWrite = null
-                    }
-                  }
-
-                  if (dataToWrite) {
-                    responseStream.write(dataToWrite)
-                  }
-                } else {
-                  // 客户端连接已断开，记录警告（但仍继续解析usage）
-                  logger.warn(
-                    `⚠️ [Console] Client disconnected during stream, skipping ${lines.length} lines for account: ${account?.name || accountId}`
-                  )
-                }
-
-                // 解析SSE数据寻找usage信息（无论连接状态如何）
-                for (const line of lines) {
-                  if (line.startsWith('data:')) {
-                    const jsonStr = line.slice(5).trimStart()
-                    if (!jsonStr || jsonStr === '[DONE]') {
-                      continue
-                    }
-                    try {
-                      const data = JSON.parse(jsonStr)
-
-                      // 收集usage数据
-                      if (data.type === 'message_start' && data.message && data.message.usage) {
-                        collectedUsageData.input_tokens = data.message.usage.input_tokens || 0
-                        collectedUsageData.cache_creation_input_tokens =
-                          data.message.usage.cache_creation_input_tokens || 0
-                        collectedUsageData.cache_read_input_tokens =
-                          data.message.usage.cache_read_input_tokens || 0
-                        collectedUsageData.model = data.message.model
-
-                        // 检查是否有详细的 cache_creation 对象
-                        if (
-                          data.message.usage.cache_creation &&
-                          typeof data.message.usage.cache_creation === 'object'
-                        ) {
-                          collectedUsageData.cache_creation = {
-                            ephemeral_5m_input_tokens:
-                              data.message.usage.cache_creation.ephemeral_5m_input_tokens || 0,
-                            ephemeral_1h_input_tokens:
-                              data.message.usage.cache_creation.ephemeral_1h_input_tokens || 0
-                          }
-                          logger.info(
-                            '📊 Collected detailed cache creation data:',
-                            JSON.stringify(collectedUsageData.cache_creation)
-                          )
-                        }
-                      }
-
-                      if (data.type === 'message_delta' && data.usage) {
-                        // 提取所有usage字段，message_delta可能包含完整的usage信息
-                        if (data.usage.output_tokens !== undefined) {
-                          collectedUsageData.output_tokens = data.usage.output_tokens || 0
-                        }
-
-                        // 提取input_tokens（如果存在）
-                        if (data.usage.input_tokens !== undefined) {
-                          collectedUsageData.input_tokens = data.usage.input_tokens || 0
-                        }
-
-                        // 提取cache相关的tokens
-                        if (data.usage.cache_creation_input_tokens !== undefined) {
-                          collectedUsageData.cache_creation_input_tokens =
-                            data.usage.cache_creation_input_tokens || 0
-                        }
-                        if (data.usage.cache_read_input_tokens !== undefined) {
-                          collectedUsageData.cache_read_input_tokens =
-                            data.usage.cache_read_input_tokens || 0
-                        }
-
-                        // 检查是否有详细的 cache_creation 对象
-                        if (
-                          data.usage.cache_creation &&
-                          typeof data.usage.cache_creation === 'object'
-                        ) {
-                          collectedUsageData.cache_creation = {
-                            ephemeral_5m_input_tokens:
-                              data.usage.cache_creation.ephemeral_5m_input_tokens || 0,
-                            ephemeral_1h_input_tokens:
-                              data.usage.cache_creation.ephemeral_1h_input_tokens || 0
-                          }
-                        }
-
-                        logger.info(
-                          '📊 [Console] Collected usage data from message_delta:',
-                          JSON.stringify(collectedUsageData)
-                        )
-
-                        // 如果已经收集到了完整数据，触发回调
-                        if (
-                          collectedUsageData.input_tokens !== undefined &&
-                          collectedUsageData.output_tokens !== undefined &&
-                          !finalUsageReported
-                        ) {
-                          if (!collectedUsageData.model) {
-                            collectedUsageData.model = body.model || account?.defaultModel || null
-                          }
-                          logger.info(
-                            '🎯 [Console] Complete usage data collected:',
-                            JSON.stringify(collectedUsageData)
-                          )
-                          if (usageCallback && typeof usageCallback === 'function') {
-                            usageCallback({ ...collectedUsageData, accountId })
-                          }
-                          finalUsageReported = true
-                        }
-                      }
-
-                      // 不再因为模型不支持而block账号
-                    } catch (e) {
-                      // 忽略解析错误
-                    }
-                  }
-                }
-              }
-            } catch (error) {
-              logger.error(
-                `❌ Error processing Claude Console stream data (Account: ${account?.name || accountId}):`,
-                error
-              )
-              if (isStreamWritable(responseStream)) {
-                // 如果有 streamTransformer（如测试请求），使用前端期望的格式
-                if (streamTransformer) {
-                  responseStream.write(
-                    `data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`
-                  )
-                } else {
-                  responseStream.write('event: error\n')
-                  responseStream.write(
-                    `data: ${JSON.stringify({
-                      error: 'Stream processing error',
-                      message: error.message,
-                      timestamp: new Date().toISOString()
-                    })}\n\n`
-                  )
-                }
+              if (isTerminalError) {
+                responseStream.end()
               }
             }
-          })
+          }
 
-          response.data.on('end', () => {
+          const handleLine = (line) => {
+            if (aborted) {
+              return
+            }
+
+            if (isStreamWritable(responseStream)) {
+              let dataToWrite = `${line}\n`
+              if (streamTransformer) {
+                const transformed = streamTransformer(dataToWrite)
+                dataToWrite = transformed || null
+              }
+
+              if (dataToWrite) {
+                responseStream.write(dataToWrite)
+              }
+            } else {
+              logger.warn(
+                `⚠️ [Console] Client disconnected during stream, skipping line for account: ${account?.name || accountId}`
+              )
+            }
+
+            if (!line.startsWith('data:')) {
+              return
+            }
+
+            const jsonStr = line.slice(5).trimStart()
+            if (!jsonStr || jsonStr === '[DONE]') {
+              return
+            }
+
             try {
-              // 处理缓冲区中剩余的数据
-              if (buffer.trim() && isStreamWritable(responseStream)) {
-                if (streamTransformer) {
-                  const transformed = streamTransformer(buffer)
-                  if (transformed) {
-                    responseStream.write(transformed)
+              const data = JSON.parse(jsonStr)
+
+              if (data.type === 'message_start' && data.message && data.message.usage) {
+                collectedUsageData.input_tokens = data.message.usage.input_tokens || 0
+                collectedUsageData.cache_creation_input_tokens =
+                  data.message.usage.cache_creation_input_tokens || 0
+                collectedUsageData.cache_read_input_tokens =
+                  data.message.usage.cache_read_input_tokens || 0
+                collectedUsageData.model = data.message.model
+
+                if (
+                  data.message.usage.cache_creation &&
+                  typeof data.message.usage.cache_creation === 'object'
+                ) {
+                  collectedUsageData.cache_creation = {
+                    ephemeral_5m_input_tokens:
+                      data.message.usage.cache_creation.ephemeral_5m_input_tokens || 0,
+                    ephemeral_1h_input_tokens:
+                      data.message.usage.cache_creation.ephemeral_1h_input_tokens || 0
                   }
-                } else {
-                  responseStream.write(buffer)
+                  logger.info(
+                    '📊 Collected detailed cache creation data:',
+                    JSON.stringify(collectedUsageData.cache_creation)
+                  )
                 }
               }
 
-              // 🔧 兜底逻辑：确保所有未保存的usage数据都不会丢失
+              if (data.type === 'message_delta' && data.usage) {
+                if (data.usage.output_tokens !== undefined) {
+                  collectedUsageData.output_tokens = data.usage.output_tokens || 0
+                }
+                if (data.usage.input_tokens !== undefined) {
+                  collectedUsageData.input_tokens = data.usage.input_tokens || 0
+                }
+                if (data.usage.cache_creation_input_tokens !== undefined) {
+                  collectedUsageData.cache_creation_input_tokens =
+                    data.usage.cache_creation_input_tokens || 0
+                }
+                if (data.usage.cache_read_input_tokens !== undefined) {
+                  collectedUsageData.cache_read_input_tokens =
+                    data.usage.cache_read_input_tokens || 0
+                }
+
+                if (data.usage.cache_creation && typeof data.usage.cache_creation === 'object') {
+                  collectedUsageData.cache_creation = {
+                    ephemeral_5m_input_tokens:
+                      data.usage.cache_creation.ephemeral_5m_input_tokens || 0,
+                    ephemeral_1h_input_tokens:
+                      data.usage.cache_creation.ephemeral_1h_input_tokens || 0
+                  }
+                }
+
+                logger.info(
+                  '📊 [Console] Collected usage data from message_delta:',
+                  JSON.stringify(collectedUsageData)
+                )
+
+                if (
+                  collectedUsageData.input_tokens !== undefined &&
+                  collectedUsageData.output_tokens !== undefined &&
+                  !finalUsageReported
+                ) {
+                  if (!collectedUsageData.model) {
+                    collectedUsageData.model = body.model || account?.defaultModel || null
+                  }
+                  logger.info(
+                    '🎯 [Console] Complete usage data collected:',
+                    JSON.stringify(collectedUsageData)
+                  )
+                  if (usageCallback && typeof usageCallback === 'function') {
+                    usageCallback({ ...collectedUsageData, accountId })
+                  }
+                  finalUsageReported = true
+                }
+              }
+            } catch (_) {
+              // 忽略解析错误
+            }
+          }
+
+          const handleStreamEnd = () => {
+            try {
               if (!finalUsageReported) {
                 if (
                   collectedUsageData.input_tokens !== undefined ||
                   collectedUsageData.output_tokens !== undefined
                 ) {
-                  // 补全缺失的字段
                   if (collectedUsageData.input_tokens === undefined) {
                     collectedUsageData.input_tokens = 0
                     logger.warn(
@@ -1156,7 +1110,6 @@ class ClaudeConsoleRelayService {
                       '⚠️ [Console] message_delta missing output_tokens, setting to 0. This may indicate incomplete usage data.'
                     )
                   }
-                  // 确保有 model 字段
                   if (!collectedUsageData.model) {
                     collectedUsageData.model = body.model || account?.defaultModel || null
                   }
@@ -1174,21 +1127,17 @@ class ClaudeConsoleRelayService {
                 }
               }
 
-              // 确保流正确结束
               if (isStreamWritable(responseStream)) {
-                // 📊 诊断日志：流结束前状态
                 logger.info(
                   `📤 [STREAM] Ending response | destroyed: ${responseStream.destroyed}, ` +
                     `socketDestroyed: ${responseStream.socket?.destroyed}, ` +
                     `socketBytesWritten: ${responseStream.socket?.bytesWritten || 0}`
                 )
 
-                // 禁用 Nagle 算法确保数据立即发送
                 if (responseStream.socket && !responseStream.socket.destroyed) {
                   responseStream.socket.setNoDelay(true)
                 }
 
-                // 等待数据完全 flush 到客户端后再 resolve
                 responseStream.end(() => {
                   logger.info(
                     `✅ [STREAM] Response ended and flushed | socketBytesWritten: ${responseStream.socket?.bytesWritten || 'unknown'}`
@@ -1196,7 +1145,6 @@ class ClaudeConsoleRelayService {
                   resolve()
                 })
               } else {
-                // 连接已断开，记录警告
                 logger.warn(
                   `⚠️ [Console] Client disconnected before stream end, data may not have been received | account: ${account?.name || accountId}`
                 )
@@ -1206,32 +1154,21 @@ class ClaudeConsoleRelayService {
               logger.error('❌ Error processing stream end:', error)
               reject(error)
             }
-          })
+          }
 
-          response.data.on('error', (error) => {
-            logger.error(
-              `❌ Claude Console stream error (Account: ${account?.name || accountId}):`,
-              error
-            )
-            if (isStreamWritable(responseStream)) {
-              // 如果有 streamTransformer（如测试请求），使用前端期望的格式
-              if (streamTransformer) {
-                responseStream.write(
-                  `data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`
-                )
-              } else {
-                responseStream.write('event: error\n')
-                responseStream.write(
-                  `data: ${JSON.stringify({
-                    error: 'Stream error',
-                    message: error.message,
-                    timestamp: new Date().toISOString()
-                  })}\n\n`
-                )
+          consumeSseLines(response.data, {
+            onLine: (line) => {
+              try {
+                handleLine(line)
+              } catch (error) {
+                writeConsoleStreamError(error)
               }
-              responseStream.end()
+            },
+            onEnd: handleStreamEnd,
+            onError: (error) => {
+              writeConsoleStreamError(error, true)
+              reject(error)
             }
-            reject(error)
           })
         })
         .catch((error) => {
