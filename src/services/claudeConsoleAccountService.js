@@ -465,7 +465,7 @@ class ClaudeConsoleAccountService {
   }
 
   // 🚫 标记账号为限流状态
-  async markAccountRateLimited(accountId) {
+  async markAccountRateLimited(accountId, rateLimitResetTimestamp = null) {
     try {
       const client = redis.getClientSafe()
       const account = await this.getAccount(accountId)
@@ -492,6 +492,20 @@ class ClaudeConsoleAccountService {
         rateLimitAutoStopped: 'true'
       }
 
+      // 如果提供了准确的重置时间戳（秒）
+      if (rateLimitResetTimestamp) {
+        const resetTime = new Date(rateLimitResetTimestamp * 1000)
+        updates.rateLimitEndAt = resetTime.toISOString()
+        const now = new Date()
+        const minutesUntilEnd = Math.ceil((resetTime - now) / (1000 * 60))
+        logger.warn(
+          `🚫 Claude Console account marked as rate limited with accurate reset time: ${account.name} (${accountId}) - ${minutesUntilEnd} minutes remaining until ${resetTime.toISOString()}`
+        )
+      } else {
+        // 无有效重置时间时，删除可能的旧 rateLimitEndAt，避免残留值干扰后续判定
+        await client.hdel(`${this.ACCOUNT_KEY_PREFIX}${accountId}`, 'rateLimitEndAt')
+      }
+
       // 只有当前状态不是quota_exceeded时才设置为rate_limited
       // 避免覆盖更重要的配额超限状态
       const currentStatus = await client.hget(`${this.ACCOUNT_KEY_PREFIX}${accountId}`, 'status')
@@ -505,13 +519,18 @@ class ClaudeConsoleAccountService {
       try {
         const webhookNotifier = require('../utils/webhookNotifier')
         const { getISOStringWithTimezone } = require('../utils/dateHelper')
+        const resetReasonStr = updates.rateLimitEndAt
+          ? `Will be automatically re-enabled at ${updates.rateLimitEndAt}`
+          : account.rateLimitDuration
+            ? `Will be automatically re-enabled after ${account.rateLimitDuration} minutes`
+            : 'Manual intervention required to re-enable'
         await webhookNotifier.sendAccountAnomalyNotification({
           accountId,
           accountName: account.name || 'Claude Console Account',
           platform: 'claude-console',
           status: 'error',
           errorCode: 'CLAUDE_CONSOLE_RATE_LIMITED',
-          reason: `Account rate limited (429 error) and has been disabled. ${account.rateLimitDuration ? `Will be automatically re-enabled after ${account.rateLimitDuration} minutes` : 'Manual intervention required to re-enable'}`,
+          reason: `Account rate limited (429 error) and has been disabled. ${resetReasonStr}`,
           timestamp: getISOStringWithTimezone(new Date())
         })
       } catch (webhookError) {
@@ -541,8 +560,8 @@ class ClaudeConsoleAccountService {
         'quotaStoppedAt'
       )
 
-      // 删除限流相关字段
-      await client.hdel(accountKey, 'rateLimitedAt', 'rateLimitStatus')
+      // 删除限流相关字段（包括 rateLimitEndAt）
+      await client.hdel(accountKey, 'rateLimitedAt', 'rateLimitStatus', 'rateLimitEndAt')
 
       // 根据不同情况决定是否恢复账户
       if (currentStatus === 'rate_limited') {
@@ -608,23 +627,42 @@ class ClaudeConsoleAccountService {
         return false
       }
 
-      if (account.rateLimitStatus === 'limited' && account.rateLimitedAt) {
-        const rateLimitedAt = new Date(account.rateLimitedAt)
+      if (
+        account.rateLimitStatus === 'limited' &&
+        (account.rateLimitedAt || account.rateLimitEndAt)
+      ) {
         const now = new Date()
-        const minutesSinceRateLimit = (now - rateLimitedAt) / (1000 * 60)
 
-        // 使用账户配置的限流时间
-        const rateLimitDuration =
-          typeof account.rateLimitDuration === 'number' && !Number.isNaN(account.rateLimitDuration)
-            ? account.rateLimitDuration
-            : 60
-
-        if (minutesSinceRateLimit >= rateLimitDuration) {
-          await this.removeAccountRateLimit(accountId)
-          return false
+        // 优先使用准确的重置时间字段 rateLimitEndAt
+        if (account.rateLimitEndAt) {
+          const resetTime = new Date(account.rateLimitEndAt)
+          if (!Number.isNaN(resetTime.getTime())) {
+            if (now >= resetTime) {
+              await this.removeAccountRateLimit(accountId)
+              return false
+            }
+            return true
+          }
         }
 
-        return true
+        // 回退逻辑：使用账户配置的限流时间段计算
+        if (account.rateLimitedAt) {
+          const rateLimitedAt = new Date(account.rateLimitedAt)
+          const minutesSinceRateLimit = (now - rateLimitedAt) / (1000 * 60)
+
+          const rateLimitDuration =
+            typeof account.rateLimitDuration === 'number' &&
+            !Number.isNaN(account.rateLimitDuration)
+              ? account.rateLimitDuration
+              : 60
+
+          if (minutesSinceRateLimit >= rateLimitDuration) {
+            await this.removeAccountRateLimit(accountId)
+            return false
+          }
+
+          return true
+        }
       }
 
       return false
@@ -1166,25 +1204,58 @@ class ClaudeConsoleAccountService {
 
   // 📊 获取限流信息
   _getRateLimitInfo(accountData) {
-    if (accountData.rateLimitStatus === 'limited' && accountData.rateLimitedAt) {
-      const rateLimitedAt = new Date(accountData.rateLimitedAt)
+    if (
+      accountData.rateLimitStatus === 'limited' &&
+      (accountData.rateLimitedAt || accountData.rateLimitEndAt)
+    ) {
       const now = new Date()
-      const minutesSinceRateLimit = Math.floor((now - rateLimitedAt) / (1000 * 60))
-      const __parsedDuration = parseInt(accountData.rateLimitDuration)
-      const rateLimitDuration = Number.isNaN(__parsedDuration) ? 60 : __parsedDuration
-      const minutesRemaining = Math.max(0, rateLimitDuration - minutesSinceRateLimit)
 
-      return {
-        isRateLimited: minutesRemaining > 0,
-        rateLimitedAt: accountData.rateLimitedAt,
-        minutesSinceRateLimit,
-        minutesRemaining
+      // 优先校验 rateLimitEndAt
+      if (accountData.rateLimitEndAt) {
+        const resetTime = new Date(accountData.rateLimitEndAt)
+        if (!Number.isNaN(resetTime.getTime())) {
+          if (now >= resetTime) {
+            return {
+              isRateLimited: false,
+              rateLimitedAt: accountData.rateLimitedAt || null,
+              rateLimitEndAt: null,
+              minutesSinceRateLimit: 0,
+              minutesRemaining: 0
+            }
+          }
+          const minutesRemaining = Math.max(0, Math.ceil((resetTime - now) / (1000 * 60)))
+          return {
+            isRateLimited: true,
+            rateLimitedAt: accountData.rateLimitedAt || null,
+            rateLimitEndAt: accountData.rateLimitEndAt,
+            minutesSinceRateLimit: 0,
+            minutesRemaining
+          }
+        }
+      }
+
+      // 回退校验 rateLimitedAt + rateLimitDuration
+      if (accountData.rateLimitedAt) {
+        const rateLimitedAt = new Date(accountData.rateLimitedAt)
+        const minutesSinceRateLimit = Math.floor((now - rateLimitedAt) / (1000 * 60))
+        const __parsedDuration = parseInt(accountData.rateLimitDuration)
+        const rateLimitDuration = Number.isNaN(__parsedDuration) ? 60 : __parsedDuration
+        const minutesRemaining = Math.max(0, rateLimitDuration - minutesSinceRateLimit)
+
+        return {
+          isRateLimited: minutesRemaining > 0,
+          rateLimitedAt: accountData.rateLimitedAt,
+          rateLimitEndAt: null,
+          minutesSinceRateLimit,
+          minutesRemaining
+        }
       }
     }
 
     return {
       isRateLimited: false,
       rateLimitedAt: null,
+      rateLimitEndAt: null,
       minutesSinceRateLimit: 0,
       minutesRemaining: 0
     }
@@ -1384,7 +1455,13 @@ class ClaudeConsoleAccountService {
         if (accountData.status === 'rate_limited') {
           const client = redis.getClientSafe()
           const accountKey = `${this.ACCOUNT_KEY_PREFIX}${accountId}`
-          await client.hdel(accountKey, 'rateLimitedAt', 'rateLimitStatus', 'rateLimitAutoStopped')
+          await client.hdel(
+            accountKey,
+            'rateLimitedAt',
+            'rateLimitStatus',
+            'rateLimitAutoStopped',
+            'rateLimitEndAt'
+          )
         }
 
         logger.info(
@@ -1477,6 +1554,8 @@ class ClaudeConsoleAccountService {
       const fieldsToDelete = [
         'rateLimitedAt',
         'rateLimitStatus',
+        'rateLimitEndAt',
+        'rateLimitAutoStopped',
         'unauthorizedAt',
         'unauthorizedCount',
         'overloadedAt',

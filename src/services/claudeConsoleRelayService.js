@@ -14,6 +14,46 @@ const { isStreamWritable } = require('../utils/streamHelper')
 const { filterForClaude } = require('../utils/headerFilter')
 const { consumeSseLines } = require('../utils/sseStreamDecoder')
 
+/**
+ * 解析智谱(ZhiPu) 429 报错中的重置时间 (code 1310)
+ * Payload 格式: {"error":{"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-08-05 15:16:26 重置。"}}
+ * @param {object|string} responseData 429 响应体
+ * @returns {number|null} 重置时间的 Unix 时间戳（秒），解析失败返回 null
+ */
+function parseZhipu429ResetTime(responseData) {
+  try {
+    let data = responseData
+    if (typeof data === 'string') {
+      try {
+        data = JSON.parse(data)
+      } catch (e) {
+        return null
+      }
+    }
+    if (data && data.error && (data.error.code === '1310' || data.error.code === 1310)) {
+      const message = data.error.message || ''
+      const match = message.match(/限额将在\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*重置/)
+      if (match && match[1]) {
+        const timeStr = match[1] // 例如 "2026-08-05 15:16:26"
+        const timezoneOffset = config.system.timezoneOffset || 8
+        const sign = timezoneOffset >= 0 ? '+' : '-'
+        const absOffset = Math.abs(timezoneOffset)
+        const offsetHours = String(Math.floor(absOffset)).padStart(2, '0')
+        const offsetMinutes = String(Math.round((absOffset % 1) * 60)).padStart(2, '0')
+        const isoStr = `${timeStr.replace(' ', 'T')}${sign}${offsetHours}:${offsetMinutes}`
+
+        const resetDate = new Date(isoStr)
+        if (!Number.isNaN(resetDate.getTime())) {
+          return Math.floor(resetDate.getTime() / 1000)
+        }
+      }
+    }
+  } catch (err) {
+    logger.error('Failed to parse ZhiPu 429 reset time:', err)
+  }
+  return null
+}
+
 class ClaudeConsoleRelayService {
   constructor() {
     this.defaultUserAgent = 'claude-cli/2.0.52 (external, cli)'
@@ -357,7 +397,8 @@ class ClaudeConsoleRelayService {
         })
 
         if (!autoProtectionDisabled) {
-          await claudeConsoleAccountService.markAccountRateLimited(accountId)
+          const resetTimestamp = parseZhipu429ResetTime(response.data)
+          await claudeConsoleAccountService.markAccountRateLimited(accountId, resetTimestamp)
         }
       } else if (response.status === 529) {
         logger.warn(
@@ -854,7 +895,11 @@ class ClaudeConsoleRelayService {
                   logger.error('❌ Failed to check quota after 429 error:', err)
                 })
                 if (!autoProtectionDisabled) {
-                  await claudeConsoleAccountService.markAccountRateLimited(accountId)
+                  const resetTimestamp = parseZhipu429ResetTime(response.data)
+                  await claudeConsoleAccountService.markAccountRateLimited(
+                    accountId,
+                    resetTimestamp
+                  )
                 }
               } else if (response.status === 529) {
                 logger.warn(
@@ -1186,7 +1231,8 @@ class ClaudeConsoleRelayService {
             if (error.response.status === 401) {
               claudeConsoleAccountService.markAccountUnauthorized(accountId)
             } else if (error.response.status === 429) {
-              claudeConsoleAccountService.markAccountRateLimited(accountId)
+              const resetTimestamp = parseZhipu429ResetTime(error.response.data)
+              claudeConsoleAccountService.markAccountRateLimited(accountId, resetTimestamp)
               // 检查是否因为超过每日额度
               claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
                 logger.error('❌ Failed to check quota after 429 error:', err)
