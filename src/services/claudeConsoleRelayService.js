@@ -16,13 +16,16 @@ const { consumeSseLines } = require('../utils/sseStreamDecoder')
 
 /**
  * 解析智谱(ZhiPu) 429 报错中的重置时间 (code 1310)
- * Payload 格式: {"error":{"code":"1310","message":"您已达到每周/每月使用上限，您的限额将在 2026-08-05 15:16:26 重置。"}}
- * @param {object|string} responseData 429 响应体
+ * Payload 格式: {"error":{"code":"1310","message":"[1310][您已达到每周/每月使用上限，您的限额将在 2026-08-05 15:16:26 重置。][foobar]"}}
+ * @param {object|string|Buffer} responseData 429 响应体
  * @returns {number|null} 重置时间的 Unix 时间戳（秒），解析失败返回 null
  */
 function parseZhipu429ResetTime(responseData) {
   try {
     let data = responseData
+    if (Buffer.isBuffer(data)) {
+      data = data.toString('utf-8')
+    }
     if (typeof data === 'string') {
       try {
         data = JSON.parse(data)
@@ -32,7 +35,7 @@ function parseZhipu429ResetTime(responseData) {
     }
     if (data && data.error && (data.error.code === '1310' || data.error.code === 1310)) {
       const message = data.error.message || ''
-      const match = message.match(/限额将在\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*重置/)
+      const match = message.match(/(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/)
       if (match && match[1]) {
         const timeStr = match[1] // 例如 "2026-08-05 15:16:26"
         const timezoneOffset = config.system.timezoneOffset || 8
