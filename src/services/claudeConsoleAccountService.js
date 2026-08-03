@@ -205,6 +205,10 @@ class ClaudeConsoleAccountService {
             status: accountData.status || 'active',
             errorMessage: accountData.errorMessage,
             rateLimitInfo,
+            // ✅ 适配前端 Web Admin 渲染逻辑，无须修改前端代码即可展示限流中倒计时
+            rateLimitStatus: rateLimitInfo,
+            rateLimitUntil: accountData.rateLimitEndAt || rateLimitInfo?.rateLimitEndAt || null,
+            rateLimitEndAt: accountData.rateLimitEndAt || null,
             schedulable: accountData.schedulable !== 'false', // 默认为true，只有明确设置为false才不可调度
 
             // ✅ 前端显示订阅过期时间（业务字段）
