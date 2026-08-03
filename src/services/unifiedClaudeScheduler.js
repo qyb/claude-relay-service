@@ -425,6 +425,18 @@ class UnifiedClaudeScheduler {
       )
 
       if (availableAccounts.length === 0) {
+        // 尝试获取全池限流的最早解禁时间
+        const resetInfo = await this._getNearestRateLimitReset(apiKeyData, effectiveModel)
+        if (resetInfo) {
+          const error = new Error(
+            `All available Claude accounts are rate limited. Try again in ${resetInfo.retryAfterSeconds} seconds.`
+          )
+          error.code = 'ALL_ACCOUNTS_RATE_LIMITED'
+          error.retryAfterSeconds = resetInfo.retryAfterSeconds
+          error.minResetTime = resetInfo.minResetTime
+          throw error
+        }
+
         // 提供更详细的错误信息
         if (effectiveModel) {
           throw new Error(
@@ -465,6 +477,161 @@ class UnifiedClaudeScheduler {
       logger.error('❌ Failed to select account for API key:', error)
       throw error
     }
+  }
+
+  // 🔍 获取该 Key 对应的所有限流账户中最早的解禁重置时间
+  async _getNearestRateLimitReset(apiKeyData, requestedModel = null) {
+    try {
+      const candidateAccounts = []
+      const now = new Date()
+
+      // 1. 收集专属绑定的账户
+      if (apiKeyData.claudeConsoleAccountId) {
+        const acc = await claudeConsoleAccountService.getAccount(apiKeyData.claudeConsoleAccountId)
+        if (acc) {
+          candidateAccounts.push({ account: acc, type: 'claude-console' })
+        }
+      }
+      if (apiKeyData.claudeAccountId) {
+        const acc = await redis.getClaudeAccount(apiKeyData.claudeAccountId)
+        if (acc) {
+          candidateAccounts.push({ account: acc, type: 'claude-official' })
+        }
+      }
+
+      // 2. 同时收集符合条件的共享池账户（兼容专属绑定账号在调度中的 Fallback）
+      const claudeAccounts = await redis.getAllClaudeAccounts()
+      for (const account of claudeAccounts) {
+        if (
+          (account.accountType === 'shared' || !account.accountType) &&
+          this._isModelSupportedByAccount(account, 'claude-official', requestedModel)
+        ) {
+          if (
+            !candidateAccounts.some(
+              (item) => item.account.id === account.id && item.type === 'claude-official'
+            )
+          ) {
+            candidateAccounts.push({ account, type: 'claude-official' })
+          }
+        }
+      }
+
+      const consoleAccounts = await claudeConsoleAccountService.getAllAccounts()
+      for (const account of consoleAccounts) {
+        if (
+          (account.accountType === 'shared' || !account.accountType) &&
+          this._isModelSupportedByAccount(account, 'claude-console', requestedModel)
+        ) {
+          if (
+            !candidateAccounts.some(
+              (item) => item.account.id === account.id && item.type === 'claude-console'
+            )
+          ) {
+            candidateAccounts.push({ account, type: 'claude-console' })
+          }
+        }
+      }
+
+      if (candidateAccounts.length === 0) {
+        return null
+      }
+
+      let minResetTime = null
+      let hasHardFailure = false
+      let rateLimitedAccountCount = 0
+
+      for (const item of candidateAccounts) {
+        const { account, type } = item
+        let isLimited = false
+        let endAt = null
+
+        if (type === 'claude-console') {
+          const info =
+            account.rateLimitInfo || claudeConsoleAccountService._getRateLimitInfo(account)
+          const isQuotaExceeded = await claudeConsoleAccountService.isAccountQuotaExceeded(
+            account.id
+          )
+          const isActive = account.isActive === true || account.isActive === 'true'
+          const isRateLimitedStatus =
+            account.status === 'rate_limited' || (info && info.isRateLimited)
+          const isAutoStopped =
+            account.rateLimitAutoStopped === 'true' || account.rateLimitAutoStopped === true
+
+          // 硬故障判定：
+          // 1. 额度已用尽 (isQuotaExceeded)
+          // 2. 状态异常 (既非 active 也非 rate_limited)
+          // 3. 在非限流/非限流自动保护停用状态下，被人工禁用
+          const isStatusValid = account.status === 'active' || isRateLimitedStatus
+          const isManuallyDisabled = !isActive && !isRateLimitedStatus && !isAutoStopped
+
+          if (isQuotaExceeded || !isStatusValid || isManuallyDisabled) {
+            hasHardFailure = true
+          }
+
+          if (info && info.isRateLimited) {
+            isLimited = true
+            if (info.rateLimitEndAt) {
+              endAt = new Date(info.rateLimitEndAt)
+            } else if (account.rateLimitEndAt) {
+              endAt = new Date(account.rateLimitEndAt)
+            } else if (info.minutesRemaining > 0) {
+              endAt = new Date(now.getTime() + info.minutesRemaining * 60 * 1000)
+            }
+          }
+        } else if (type === 'claude-official') {
+          const limited = await claudeAccountService.isAccountRateLimited(account.id)
+          const isActive = account.isActive === 'true' || account.isActive === true
+          const isStatusValid =
+            account.status !== 'error' &&
+            account.status !== 'blocked' &&
+            account.status !== 'temp_error'
+          const isAutoStopped = account.rateLimitAutoStopped === 'true'
+
+          // 非限流且非自动限流停用状态下被手动禁用，或状态严重异常
+          const isManuallyDisabled = !isActive && !limited && !isAutoStopped
+
+          if (!isStatusValid || isManuallyDisabled) {
+            hasHardFailure = true
+          }
+
+          if (limited) {
+            isLimited = true
+            const rateInfo = await claudeAccountService.getAccountRateLimitInfo(account.id)
+            if (rateInfo?.rateLimitEndAt || account.rateLimitEndAt) {
+              endAt = new Date(rateInfo?.rateLimitEndAt || account.rateLimitEndAt)
+            } else if (rateInfo?.minutesRemaining > 0) {
+              endAt = new Date(now.getTime() + rateInfo.minutesRemaining * 60 * 1000)
+            }
+          }
+        }
+
+        if (isLimited) {
+          rateLimitedAccountCount++
+          if (endAt && !Number.isNaN(endAt.getTime()) && endAt > now) {
+            if (!minResetTime || endAt < minResetTime) {
+              minResetTime = endAt
+            }
+          }
+        }
+      }
+
+      // 如果存在硬性故障，或者不是所有候选账户都仅因限流导致不可用，则不认定为全池纯限流
+      if (
+        hasHardFailure ||
+        rateLimitedAccountCount === 0 ||
+        rateLimitedAccountCount < candidateAccounts.length
+      ) {
+        return null
+      }
+
+      if (minResetTime) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((minResetTime - now) / 1000))
+        return { minResetTime, retryAfterSeconds }
+      }
+    } catch (err) {
+      logger.error('Failed to calculate nearest rate limit reset:', err)
+    }
+    return null
   }
 
   // 📋 获取所有可用账户（合并官方和Console）

@@ -359,6 +359,24 @@ async function handleMessagesRequest(req, res) {
           )
           return
         }
+        if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
+          res.status(429)
+          res.setHeader('Content-Type', 'application/json')
+          if (error.retryAfterSeconds) {
+            res.setHeader('Retry-After', String(error.retryAfterSeconds))
+          }
+          res.end(
+            JSON.stringify({
+              error: {
+                type: 'rate_limit_error',
+                message: error.message,
+                resets_in_seconds: error.retryAfterSeconds || 60,
+                resets_at: error.minResetTime ? error.minResetTime.toISOString() : null
+              }
+            })
+          )
+          return
+        }
         throw error
       }
 
@@ -915,6 +933,19 @@ async function handleMessagesRequest(req, res) {
           return res.status(403).json({
             error: 'upstream_rate_limited',
             message: limitMessage
+          })
+        }
+        if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
+          if (error.retryAfterSeconds) {
+            res.setHeader('Retry-After', String(error.retryAfterSeconds))
+          }
+          return res.status(429).json({
+            error: {
+              type: 'rate_limit_error',
+              message: error.message,
+              resets_in_seconds: error.retryAfterSeconds || 60,
+              resets_at: error.minResetTime ? error.minResetTime.toISOString() : null
+            }
           })
         }
         throw error

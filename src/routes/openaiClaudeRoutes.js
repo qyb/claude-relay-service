@@ -233,6 +233,21 @@ async function handleChatCompletion(req, res, apiKeyData) {
           message: limitMessage
         })
       }
+      if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
+        if (error.retryAfterSeconds) {
+          res.setHeader('Retry-After', String(error.retryAfterSeconds))
+        }
+        return res.status(429).json({
+          error: {
+            message: error.message,
+            type: 'requests',
+            param: null,
+            code: 'rate_limit_exceeded',
+            resets_in_seconds: error.retryAfterSeconds || 60,
+            resets_at: error.minResetTime ? error.minResetTime.toISOString() : null
+          }
+        })
+      }
       throw error
     }
     const { accountId, accountType } = accountSelection
