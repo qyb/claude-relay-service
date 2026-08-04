@@ -898,7 +898,7 @@ class ClaudeConsoleRelayService {
                   logger.error('❌ Failed to check quota after 429 error:', err)
                 })
                 if (!autoProtectionDisabled) {
-                  const resetTimestamp = parseZhipu429ResetTime(response.data)
+                  const resetTimestamp = parseZhipu429ResetTime(errorDataForCheck)
                   await claudeConsoleAccountService.markAccountRateLimited(
                     accountId,
                     resetTimestamp
