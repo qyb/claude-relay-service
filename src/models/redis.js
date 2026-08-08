@@ -1582,6 +1582,32 @@ class RedisClient {
     }
   }
 
+  // 📊 Zhipu Coding Plan 使用限额快照
+  async setZhipuUsageLimits(accountId, snapshot, ttl = 86400) {
+    const key = `zhipu_usage_limits:${accountId}`
+    await this.client.set(key, JSON.stringify(snapshot || {}), 'EX', ttl)
+  }
+
+  async getZhipuUsageLimits(accountId) {
+    const key = `zhipu_usage_limits:${accountId}`
+    const raw = await this.client.get(key)
+    if (!raw) {
+      return null
+    }
+
+    try {
+      return JSON.parse(raw)
+    } catch (error) {
+      logger.warn(`Failed to parse Zhipu usage limits cache for account ${accountId}`)
+      return null
+    }
+  }
+
+  async deleteZhipuUsageLimits(accountId) {
+    const key = `zhipu_usage_limits:${accountId}`
+    return await this.client.del(key)
+  }
+
   // 📊 账户余额缓存（本地统计）
   async setLocalBalance(platform, accountId, statisticsData, ttl = 300) {
     const key = `account_balance_local:${platform}:${accountId}`

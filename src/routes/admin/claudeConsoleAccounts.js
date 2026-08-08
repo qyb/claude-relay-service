@@ -8,6 +8,7 @@ const router = express.Router()
 
 const claudeConsoleAccountService = require('../../services/claudeConsoleAccountService')
 const claudeConsoleRelayService = require('../../services/claudeConsoleRelayService')
+const zhipuUsageLimitService = require('../../services/zhipuUsageLimitService')
 const accountGroupService = require('../../services/accountGroupService')
 const apiKeyService = require('../../services/apiKeyService')
 const redis = require('../../models/redis')
@@ -431,6 +432,51 @@ router.get('/claude-console-accounts/:accountId/usage', authenticateAdmin, async
     return res.status(500).json({ error: 'Failed to get usage stats', message: error.message })
   }
 })
+
+// 批量获取适用 Claude Console 账户的 Zhipu Coding Plan 使用限额
+router.get('/claude-console-accounts/usage-limits', authenticateAdmin, async (req, res) => {
+  try {
+    const data = await zhipuUsageLimitService.getAllUsageLimits()
+    return res.json({ success: true, data })
+  } catch (error) {
+    logger.error('❌ Failed to get Zhipu usage limits:', error)
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to get Zhipu usage limits'
+    })
+  }
+})
+
+// 强制刷新单个 Claude Console 账户的 Zhipu Coding Plan 使用限额
+router.post(
+  '/claude-console-accounts/:accountId/usage-limits/refresh',
+  authenticateAdmin,
+  async (req, res) => {
+    try {
+      const data = await zhipuUsageLimitService.getUsageLimits(req.params.accountId, {
+        forceRefresh: true
+      })
+      return res.json({ success: true, data })
+    } catch (error) {
+      if (error?.code === 'account_not_found' || error?.code === 'not_applicable') {
+        return res.status(error.statusCode).json({
+          success: false,
+          error: error.message,
+          code: error.code
+        })
+      }
+
+      logger.error(
+        `❌ Failed to refresh Zhipu usage limits for account ${req.params.accountId}:`,
+        error
+      )
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to refresh Zhipu usage limits'
+      })
+    }
+  }
+)
 
 // 手动重置Claude Console账户的每日使用量
 router.post(

@@ -126,7 +126,9 @@ class ClaudeConsoleAccountService {
     logger.debug(
       `[DEBUG] Saving account data to Redis with key: ${this.ACCOUNT_KEY_PREFIX}${accountId}`
     )
-    logger.debug(`[DEBUG] Account data to save: ${JSON.stringify(accountData, null, 2)}`)
+    logger.debug(
+      `[DEBUG] Account data to save: ${JSON.stringify({ ...accountData, apiKey: '[REDACTED]' }, null, 2)}`
+    )
 
     await client.hset(`${this.ACCOUNT_KEY_PREFIX}${accountId}`, accountData)
 
@@ -305,7 +307,13 @@ class ClaudeConsoleAccountService {
       logger.debug(
         `[DEBUG] Update request received with fields: ${Object.keys(updates).join(', ')}`
       )
-      logger.debug(`[DEBUG] Updates content: ${JSON.stringify(updates, null, 2)}`)
+      logger.debug(
+        `[DEBUG] Updates content: ${JSON.stringify(
+          updates.apiKey === undefined ? updates : { ...updates, apiKey: '[REDACTED]' },
+          null,
+          2
+        )}`
+      )
 
       if (updates.name !== undefined) {
         updatedData.name = updates.name
@@ -432,6 +440,11 @@ class ClaudeConsoleAccountService {
 
       await client.hset(`${this.ACCOUNT_KEY_PREFIX}${accountId}`, updatedData)
 
+      // endpoint 或凭据变化后，旧的 Zhipu 限额快照不再可信
+      if (updates.apiUrl !== undefined || updates.apiKey !== undefined) {
+        await redis.deleteZhipuUsageLimits(accountId)
+      }
+
       logger.success(`📝 Updated Claude Console account: ${accountId}`)
 
       return { success: true }
@@ -452,7 +465,7 @@ class ClaudeConsoleAccountService {
       }
 
       // 从Redis删除
-      await client.del(`${this.ACCOUNT_KEY_PREFIX}${accountId}`)
+      await client.del(`${this.ACCOUNT_KEY_PREFIX}${accountId}`, `zhipu_usage_limits:${accountId}`)
 
       // 从共享账户集合中移除
       if (account.accountType === 'shared') {
