@@ -254,7 +254,61 @@ const logger = winston.createLogger({
   exitOnError: false
 })
 
+// 📊 独立 LLM telemetry logger：不进入主日志或控制台
+const telemetryEnabled = process.env.LLM_TELEMETRY_ENABLED === 'true'
+let telemetryLogger = null
+
+if (telemetryEnabled) {
+  const telemetryFormat = winston.format.printf(({ level: _level, message: _message, ...record }) =>
+    JSON.stringify(record)
+  )
+  const telemetryTransport = new DailyRotateFile({
+    filename: path.join(logDir, 'llm-telemetry-%DATE%.log'),
+    datePattern: 'YYYY-MM-DD',
+    zippedArchive: true,
+    maxSize: process.env.LLM_TELEMETRY_MAX_SIZE || '100m',
+    maxFiles: process.env.LLM_TELEMETRY_MAX_FILES || '32d',
+    auditFile: path.join(logDir, '.llm-telemetry-audit.json'),
+    format: telemetryFormat
+  })
+
+  telemetryLogger = winston.createLogger({
+    level: 'info',
+    format: telemetryFormat,
+    transports: [telemetryTransport],
+    exitOnError: false
+  })
+
+  telemetryTransport.on('error', (error) => {
+    logger.error('LLM telemetry transport error:', error)
+  })
+}
+
 // 🎯 增强的自定义方法
+logger.telemetry = (record) => {
+  if (!telemetryLogger || !record || typeof record !== 'object') {
+    return false
+  }
+
+  try {
+    telemetryLogger.info('llm_request', record)
+    return true
+  } catch (error) {
+    logger.error('Failed to enqueue LLM telemetry record:', error)
+    return false
+  }
+}
+
+logger.isTelemetryEnabled = () => telemetryEnabled
+
+logger.closeTelemetry = () => {
+  if (!telemetryLogger) {
+    return false
+  }
+  telemetryLogger.close()
+  return true
+}
+
 logger.success = (message, metadata = {}) => {
   logger.info(`✅ ${message}`, { type: 'success', ...metadata })
 }
