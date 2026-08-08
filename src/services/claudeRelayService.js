@@ -398,7 +398,7 @@ class ClaudeRelayService {
         typeof requestBody?.model === 'string' && requestBody.model.toLowerCase().includes('opus')
 
       // 生成会话哈希用于sticky会话
-      const sessionHash = sessionHelper.generateSessionHash(requestBody)
+      const sessionHash = sessionHelper.generateSessionHash(requestBody, clientHeaders)
 
       // 选择可用的Claude账户（支持专属绑定和sticky会话）
       let accountSelection
@@ -1587,7 +1587,7 @@ class ClaudeRelayService {
         typeof requestBody?.model === 'string' && requestBody.model.toLowerCase().includes('opus')
 
       // 生成会话哈希用于sticky会话
-      const sessionHash = sessionHelper.generateSessionHash(requestBody)
+      const sessionHash = sessionHelper.generateSessionHash(requestBody, clientHeaders)
 
       // 选择可用的Claude账户（支持专属绑定和sticky会话）
       let accountSelection

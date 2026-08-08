@@ -3671,7 +3671,7 @@ async function handleAnthropicMessagesToGemini(req, res, { vendor, baseModel }) 
   }
 
   const isStream = req.body?.stream === true
-  const sessionHash = sessionHelper.generateSessionHash(req.body)
+  const sessionHash = sessionHelper.generateSessionHash(req.body, req.headers)
   const upstreamSessionId = sessionHash || req.apiKey?.id || null
 
   let accountSelection
@@ -5935,7 +5935,7 @@ async function handleAnthropicCountTokensToGemini(req, res, { vendor }) {
     return res.status(400).json(buildAnthropicError(`Unsupported vendor: ${vendor}`))
   }
 
-  const sessionHash = sessionHelper.generateSessionHash(req.body)
+  const sessionHash = sessionHelper.generateSessionHash(req.body, req.headers)
 
   const model = (req.body?.model || '').trim()
   if (!model) {

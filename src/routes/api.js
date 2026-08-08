@@ -270,7 +270,7 @@ async function handleMessagesRequest(req, res) {
       let usageDataCaptured = false
 
       // 生成会话哈希用于sticky会话
-      const sessionHash = sessionHelper.generateSessionHash(req.body)
+      const sessionHash = sessionHelper.generateSessionHash(req.body, req.headers)
 
       // 🔒 全局会话绑定验证
       let forcedAccount = null
@@ -281,7 +281,10 @@ async function handleMessagesRequest(req, res) {
         const globalBindingEnabled = await claudeRelayConfigService.isGlobalSessionBindingEnabled()
 
         if (globalBindingEnabled) {
-          const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(req.body)
+          const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(
+            req.body,
+            req.headers
+          )
 
           if (originalSessionId) {
             const validation = await claudeRelayConfigService.validateNewSession(
@@ -853,7 +856,7 @@ async function handleMessagesRequest(req, res) {
       }
 
       // 生成会话哈希用于sticky会话
-      const sessionHash = sessionHelper.generateSessionHash(req.body)
+      const sessionHash = sessionHelper.generateSessionHash(req.body, req.headers)
 
       // 🔒 全局会话绑定验证（非流式）
       let forcedAccountNonStream = null
@@ -864,7 +867,10 @@ async function handleMessagesRequest(req, res) {
         const globalBindingEnabled = await claudeRelayConfigService.isGlobalSessionBindingEnabled()
 
         if (globalBindingEnabled) {
-          const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(req.body)
+          const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(
+            req.body,
+            req.headers
+          )
 
           if (originalSessionId) {
             const validation = await claudeRelayConfigService.validateNewSession(
@@ -1195,7 +1201,7 @@ async function handleMessagesRequest(req, res) {
       if (!res.headersSent) {
         try {
           // 清理粘性会话映射（如果存在）
-          const sessionHash = sessionHelper.generateSessionHash(req.body)
+          const sessionHash = sessionHelper.generateSessionHash(req.body, req.headers)
           await unifiedClaudeScheduler.clearSessionMapping(sessionHash)
 
           logger.info('🔄 Session mapping cleared, retrying handleMessagesRequest...')
@@ -1517,7 +1523,7 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
   }
 
   // 🔗 会话绑定验证（与 messages 端点保持一致）
-  const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(req.body)
+  const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(req.body, req.headers)
   const sessionValidation = await claudeRelayConfigService.validateNewSession(
     req.body,
     originalSessionId
@@ -1553,7 +1559,7 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
 
   logger.info(`🔢 Processing token count request for key: ${req.apiKey.name}`)
 
-  const sessionHash = sessionHelper.generateSessionHash(req.body)
+  const sessionHash = sessionHelper.generateSessionHash(req.body, req.headers)
   const requestedModel = req.body.model
   const maxAttempts = 2
   let attempt = 0
