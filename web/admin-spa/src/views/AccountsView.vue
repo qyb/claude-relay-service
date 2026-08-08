@@ -1000,6 +1000,14 @@
                   </div>
                   <!-- Claude Console: 显示每日额度和并发状态 -->
                   <div v-else-if="account.platform === 'claude-console'" class="space-y-3">
+                    <ZhipuUsageLimits
+                      v-if="isZhipuClaudeConsoleAccount(account)"
+                      :data="account.zhipuUsageLimits"
+                      :load-error="zhipuUsageLimitsLoadError"
+                      :loading="zhipuUsageLimitsLoading"
+                      :refreshing="!!refreshingZhipuUsageLimits[account.id]"
+                      @refresh="refreshZhipuUsageLimits(account)"
+                    />
                     <div>
                       <template v-if="Number(account.dailyQuota) > 0">
                         <div class="flex items-center justify-between text-xs">
@@ -1522,7 +1530,15 @@
           <!-- 状态信息 -->
           <div class="mb-3 space-y-2">
             <!-- 会话窗口 -->
-            <div v-if="account.platform === 'claude'" class="space-y-2">
+            <ZhipuUsageLimits
+              v-if="isZhipuClaudeConsoleAccount(account)"
+              :data="account.zhipuUsageLimits"
+              :load-error="zhipuUsageLimitsLoadError"
+              :loading="zhipuUsageLimitsLoading"
+              :refreshing="!!refreshingZhipuUsageLimits[account.id]"
+              @refresh="refreshZhipuUsageLimits(account)"
+            />
+            <div v-else-if="account.platform === 'claude'" class="space-y-2">
               <!-- OAuth 账户：显示三窗口 OAuth usage -->
               <div v-if="isClaudeOAuth(account) && account.claudeUsage" class="space-y-2">
                 <!-- 5小时窗口 -->
@@ -2165,6 +2181,8 @@ import CustomDropdown from '@/components/common/CustomDropdown.vue'
 import ActionDropdown from '@/components/common/ActionDropdown.vue'
 import BalanceDisplay from '@/components/accounts/BalanceDisplay.vue'
 import AccountBalanceScriptModal from '@/components/accounts/AccountBalanceScriptModal.vue'
+import ZhipuUsageLimits from '@/components/accounts/ZhipuUsageLimits.vue'
+import { isZhipuClaudeConsoleAccount, mergeZhipuUsageLimitMap } from '@/utils/zhipuUsageLimits'
 
 // 使用确认弹窗
 const { showConfirmModal, confirmOptions, showConfirm, handleConfirm, handleCancel } = useConfirm()
@@ -2173,6 +2191,9 @@ const { showConfirmModal, confirmOptions, showConfirm, handleConfirm, handleCanc
 const accounts = ref([])
 const accountsLoading = ref(false)
 const refreshingBalances = ref(false)
+const zhipuUsageLimitsLoading = ref(false)
+const zhipuUsageLimitsLoadError = ref('')
+const refreshingZhipuUsageLimits = ref({})
 const accountsSortBy = ref('name')
 const accountsSortOrder = ref('asc')
 const apiKeys = ref([]) // 保留用于其他功能（如删除账户时显示绑定信息）
@@ -3168,6 +3189,86 @@ const loadBalanceCacheForAccounts = async () => {
   }))
 }
 
+let zhipuUsageLoadGeneration = 0
+
+const zhipuErrorMessage = (error, fallback) => {
+  return (
+    error?.response?.data?.error || error?.response?.data?.message || error?.message || fallback
+  )
+}
+
+const loadZhipuUsageLimits = async () => {
+  const generation = ++zhipuUsageLoadGeneration
+  const hasApplicableAccount = accounts.value.some((account) =>
+    isZhipuClaudeConsoleAccount(account)
+  )
+
+  if (!hasApplicableAccount) {
+    zhipuUsageLimitsLoading.value = false
+    zhipuUsageLimitsLoadError.value = ''
+    return
+  }
+
+  zhipuUsageLimitsLoading.value = true
+  zhipuUsageLimitsLoadError.value = ''
+  try {
+    const response = await apiClient.get('/admin/claude-console-accounts/usage-limits')
+    if (generation !== zhipuUsageLoadGeneration) {
+      return
+    }
+    if (!response?.success || !response.data || typeof response.data !== 'object') {
+      throw new Error(response?.error || 'GLM 使用限额加载失败')
+    }
+    accounts.value = mergeZhipuUsageLimitMap(accounts.value, response.data)
+  } catch (error) {
+    if (generation === zhipuUsageLoadGeneration) {
+      zhipuUsageLimitsLoadError.value = zhipuErrorMessage(error, 'GLM 使用限额加载失败')
+    }
+  } finally {
+    if (generation === zhipuUsageLoadGeneration) {
+      zhipuUsageLimitsLoading.value = false
+    }
+  }
+}
+
+const refreshZhipuUsageLimits = async (account) => {
+  if (!isZhipuClaudeConsoleAccount(account) || refreshingZhipuUsageLimits.value[account.id]) {
+    return
+  }
+
+  refreshingZhipuUsageLimits.value = {
+    ...refreshingZhipuUsageLimits.value,
+    [account.id]: true
+  }
+  try {
+    const response = await apiClient.post(
+      `/admin/claude-console-accounts/${account.id}/usage-limits/refresh`,
+      {}
+    )
+    if (!response?.success || !response.data) {
+      throw new Error(response?.error || 'GLM 使用限额刷新失败')
+    }
+
+    accounts.value = accounts.value.map((item) =>
+      item.id === account.id ? { ...item, zhipuUsageLimits: response.data } : item
+    )
+    zhipuUsageLimitsLoadError.value = ''
+
+    if (response.data.status === 'ok') {
+      showToast(`${account.name || 'GLM 账户'}限额已刷新`, 'success')
+    } else {
+      showToast(response.data.errorMessage || 'GLM 使用限额暂时不可用', 'warning')
+    }
+  } catch (error) {
+    const message = zhipuErrorMessage(error, 'GLM 使用限额刷新失败')
+    showToast(message, 'error')
+  } finally {
+    const next = { ...refreshingZhipuUsageLimits.value }
+    delete next[account.id]
+    refreshingZhipuUsageLimits.value = next
+  }
+}
+
 // 加载账户列表
 const loadAccounts = async (forceReload = false) => {
   accountsLoading.value = true
@@ -3360,6 +3461,9 @@ const loadAccounts = async (forceReload = false) => {
         console.debug('Claude usage loading failed:', err)
       })
     }
+
+    // 异步加载 Zhipu Claude Console 账户的 Coding Plan 使用限额
+    loadZhipuUsageLimits()
 
     // 异步加载余额缓存（按平台批量）
     loadBalanceCacheForAccounts().catch((err) => {
