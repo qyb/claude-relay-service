@@ -254,7 +254,7 @@ logger.telemetry(record)
 ```text
 LLM_TELEMETRY_ENABLED=false
 LLM_TELEMETRY_MAX_SIZE=100m
-LLM_TELEMETRY_MAX_FILES=90d
+LLM_TELEMETRY_MAX_FILES=32d
 ```
 
 `winston-daily-rotate-file` 解决单进程内的并发写入、日期分片、压缩和保留问题，但不提供数据库事务或跨进程 exactly-once。若使用 PM2 cluster 或多个副本，必须为每个进程使用不同文件名，或改用集中式日志/数据库。
@@ -276,7 +276,8 @@ finalizeTelemetry(context, outcome)
 
 - `logger.js`：独立 transport、轮转、结构化输出和开关。
 - `llmTelemetry.js`：字段提取、指纹、schema、终态幂等。
-- 路由/relay：提供调度结果、响应摘要、usage 和延迟，不负责拼装最终 schema。
+- `llmRequestObserver.js`：连接请求入口和响应生命周期，汇总调度结果、usage、SSE 摘要和延迟。
+- 路由/relay：只把已有的调度结果和 usage 交给 observer，不负责拼装最终 schema。
 
 `finalizeTelemetry()` 应在调用时同步将 context 标记为 finalized，再调用 best-effort logger，防止多个异步 callback 写入两个终态。它应返回是否接受了本次终态，方便测试和诊断。
 
@@ -289,26 +290,26 @@ finalizeTelemetry(context, outcome)
 - 指纹只能用于相等性比较，不能作为内容审计替代品。
 - 文档、测试 fixture 和日志中不得包含真实 API Key、OAuth token 或员工 prompt。
 
-## 十、当前状态与落地顺序
+## 十、当前接入状态
 
-### 已完成
+已完成：
 
 - Session ID 支持 header、JSON metadata、legacy 格式和兼容的内容 hash fallback。
 - `/v1/messages`、`count_tokens`、官方 Claude 二次调度和 Anthropic-to-Gemini bridge 已统一传递 headers。
+- `llmRequestObserver.js` 已接入 `/v1/messages` 和 `/claude/v1/messages` 的共享 handler。
+- Claude、Console、Bedrock、CCR、Gemini CLI 和 Antigravity 共用同一终态生命周期。
+- `finish`、异常 `close`、HTTP 错误和 Anthropic SSE error 只会竞争产生一个终态。
+- 流式响应旁路提取 `stop_reason`、tool use 名称、usage、upstream request ID 和 TTFT。
+- 非流式响应通过 `res.json()` 或显式 response observation 提取相同摘要。
+- 内部 Console 并发降级重试复用同一个 context，并增加 `attempt_count`。
+- observer 只在 `LLM_TELEMETRY_ENABLED=true` 时包装响应方法和解析 SSE。
+- Gemini CLI/Antigravity 的 provider 与 `account_type=gemini` 可记录；bridge 内部选出的具体 `account_id` 当前仍为空。
 
-### 本阶段
+仍待完成：
 
-1. 增加独立 Winston telemetry logger。
-2. 按 Schema v1 重写 `llmTelemetry.js`。
-3. 为请求摘要、指纹、终态幂等和隐私边界增加单元测试。
-4. 暂不接入生产请求路径。
-
-### 后续阶段
-
-1. 在所有 `/v1/messages` provider 的成功、无 usage、错误和客户端断开路径接入统一终态。
-2. 补充 `stop_reason`、tool use stream summary、TTFT 和 upstream request ID。
-3. 开启 feature flag 进行小流量验证。
-4. 增加离线分析脚本或导入 PostgreSQL，用于按 harness/session 聚合。
+- 开启 feature flag 进行小流量验证。
+- 增加离线分析脚本或导入 PostgreSQL，用于按 harness/session 聚合。
+- 若未来新增不输出 Anthropic 兼容 SSE 的 provider，需要为它补充专用响应摘要适配。
 
 ## 十一、最低测试要求
 

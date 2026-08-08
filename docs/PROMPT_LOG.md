@@ -4,7 +4,7 @@
 
 Prompt Log 用于工作内容审计。它与 harness/tool telemetry 完全独立，只记录员工通过 API Key 发出的最新用户 Prompt，不记录模型回复、工具参数、工具结果正文或完整请求体。
 
-本阶段使用独立 Winston logger 写入本地明文日志，不使用数据库，不做脱敏，不接入生产请求路径。
+当前使用独立 Winston logger 写入本地明文日志，不使用数据库、不做脱敏，并已接入通过校验的 `/v1/messages` 请求路径。
 
 ## 二、提取规则
 
@@ -140,11 +140,15 @@ logger_unavailable     功能关闭或 logger 不可用
 - logger 拒绝时不提交 LRU 状态。
 - Prompt transport 与普通日志和控制台隔离。
 
-## 八、后续接入
+## 八、当前接入状态
 
-基础设施验证后，再以独立提交接入 `/v1/messages` 请求入口：
+Prompt Log 已通过 `llmRequestObserver.js` 接入 `/v1/messages` 和 `/claude/v1/messages` 的共享 handler：
 
 1. 使用 `sessionHelper.extractClientSessionId(req.headers, req.body)`。
-2. 在请求 body 被转换前调用 `recordRequest()`。
-3. Prompt Log 失败不得阻断请求。
-4. 先保持开关关闭，部署后用测试 API Key 小范围验证。
+2. 只在权限、请求结构和模型限制校验通过后调用 `recordRequest()`。
+3. 在请求 body 被转换或交给 provider 前提取最新用户 Prompt。
+4. 同一 Express 请求发生内部账户重试时复用 observer，不重复调用 Prompt Logger。
+5. `PROMPT_LOG_ENABLED=false` 时不提取 Prompt；仅当 Prompt Log 和 telemetry 都关闭时，observer 才完全跳过 session 提取和响应包装。
+6. Prompt Log 失败不得阻断请求。
+
+部署时仍保持开关默认关闭，先使用测试 API Key 小范围验证日志权限、轮转和 LRU 去重结果。

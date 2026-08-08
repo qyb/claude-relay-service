@@ -21,6 +21,7 @@ const {
 } = require('../utils/warmupInterceptor')
 const { sanitizeUpstreamError } = require('../utils/errorSanitizer')
 const { dumpAnthropicMessagesRequest } = require('../utils/anthropicRequestDump')
+const { startLlmRequestObservation } = require('../utils/llmRequestObserver')
 const {
   handleAnthropicMessagesToGemini,
   handleAnthropicCountTokensToGemini
@@ -119,6 +120,7 @@ function isOldSession(body) {
 
 // 🔧 共享的消息处理函数
 async function handleMessagesRequest(req, res) {
+  let requestObservation = null
   try {
     const startTime = Date.now()
 
@@ -182,6 +184,8 @@ async function handleMessagesRequest(req, res) {
       }
     }
 
+    requestObservation = startLlmRequestObservation(req, res)
+
     logger.api('📥 /v1/messages request received', {
       model: req.body.model || null,
       forcedVendor,
@@ -198,6 +202,11 @@ async function handleMessagesRequest(req, res) {
     // /v1/messages 的扩展：按路径强制分流到 Gemini OAuth 账户（避免 model 前缀混乱）
     if (forcedVendor === 'gemini-cli' || forcedVendor === 'antigravity') {
       const baseModel = (req.body.model || '').trim()
+      requestObservation.observeUpstream({
+        provider: forcedVendor,
+        accountType: 'gemini',
+        model: baseModel
+      })
       return await handleAnthropicMessagesToGemini(req, res, { vendor: forcedVendor, baseModel })
     }
 
@@ -228,6 +237,7 @@ async function handleMessagesRequest(req, res) {
         logger.warn(
           `⚠️ Client disconnected before stream response could start for key: ${req.apiKey?.name || 'unknown'}`
         )
+        requestObservation.observeClientDisconnect()
         return undefined
       }
 
@@ -337,9 +347,11 @@ async function handleMessagesRequest(req, res) {
           forcedAccount
         )
         ;({ accountId, accountType } = selection)
+        requestObservation.observeUpstream({ accountId, accountType, model: requestedModel })
       } catch (error) {
         // 处理会话绑定账户不可用的错误
         if (error.code === 'SESSION_BINDING_ACCOUNT_UNAVAILABLE') {
+          requestObservation.observeError(error)
           const errorMessage = await claudeRelayConfigService.getSessionBindingErrorMessage()
           return res.status(403).json({
             error: {
@@ -349,6 +361,7 @@ async function handleMessagesRequest(req, res) {
           })
         }
         if (error.code === 'CLAUDE_DEDICATED_RATE_LIMITED') {
+          requestObservation.observeError(error)
           const limitMessage = claudeRelayService._buildStandardRateLimitMessage(
             error.rateLimitEndAt
           )
@@ -363,6 +376,7 @@ async function handleMessagesRequest(req, res) {
           return
         }
         if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
+          requestObservation.observeError(error)
           res.status(429)
           res.setHeader('Content-Type', 'application/json')
           if (error.retryAfterSeconds) {
@@ -497,6 +511,14 @@ async function handleMessagesRequest(req, res) {
                 }
               }
 
+              requestObservation
+                .observeUpstream({
+                  accountId: usageAccountId ?? accountId,
+                  accountType,
+                  model: usageData.model || requestedModel
+                })
+                .observeUsage(usageObject)
+
               apiKeyService
                 .recordUsageWithDetails(_apiKeyId, usageObject, model, usageAccountId, 'claude')
                 .catch((error) => {
@@ -589,6 +611,14 @@ async function handleMessagesRequest(req, res) {
                 }
               }
 
+              requestObservation
+                .observeUpstream({
+                  accountId: usageAccountId ?? accountId,
+                  accountType,
+                  model: usageData.model || requestedModel
+                })
+                .observeUsage(usageObject)
+
               apiKeyService
                 .recordUsageWithDetails(
                   _apiKeyIdConsole,
@@ -649,6 +679,9 @@ async function handleMessagesRequest(req, res) {
           if (result.usage) {
             const inputTokens = result.usage.input_tokens || 0
             const outputTokens = result.usage.output_tokens || 0
+            requestObservation
+              .observeUpstream({ accountId, accountType, model: result.model })
+              .observeUsage(result.usage)
 
             apiKeyService
               .recordUsage(
@@ -682,6 +715,7 @@ async function handleMessagesRequest(req, res) {
             )
           }
         } catch (error) {
+          requestObservation.observeError(error)
           logger.error('❌ Bedrock stream request failed:', error)
           if (!res.headersSent) {
             return res.status(500).json({ error: 'Bedrock service error', message: error.message })
@@ -750,6 +784,14 @@ async function handleMessagesRequest(req, res) {
                 }
               }
 
+              requestObservation
+                .observeUpstream({
+                  accountId: usageAccountId ?? accountId,
+                  accountType,
+                  model: usageData.model || requestedModel
+                })
+                .observeUsage(usageObject)
+
               apiKeyService
                 .recordUsageWithDetails(_apiKeyIdCcr, usageObject, model, usageAccountId, 'ccr')
                 .catch((error) => {
@@ -805,6 +847,7 @@ async function handleMessagesRequest(req, res) {
         logger.warn(
           `⚠️ Client disconnected before non-stream request could start for key: ${_apiKeyNameNonStream || 'unknown'}`
         )
+        requestObservation.observeClientDisconnect()
         return undefined
       }
 
@@ -922,8 +965,10 @@ async function handleMessagesRequest(req, res) {
           forcedAccountNonStream
         )
         ;({ accountId, accountType } = selection)
+        requestObservation.observeUpstream({ accountId, accountType, model: requestedModel })
       } catch (error) {
         if (error.code === 'SESSION_BINDING_ACCOUNT_UNAVAILABLE') {
+          requestObservation.observeError(error)
           const errorMessage = await claudeRelayConfigService.getSessionBindingErrorMessage()
           return res.status(403).json({
             error: {
@@ -933,6 +978,7 @@ async function handleMessagesRequest(req, res) {
           })
         }
         if (error.code === 'CLAUDE_DEDICATED_RATE_LIMITED') {
+          requestObservation.observeError(error)
           const limitMessage = claudeRelayService._buildStandardRateLimitMessage(
             error.rateLimitEndAt
           )
@@ -942,6 +988,7 @@ async function handleMessagesRequest(req, res) {
           })
         }
         if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
+          requestObservation.observeError(error)
           if (error.retryAfterSeconds) {
             res.setHeader('Retry-After', String(error.retryAfterSeconds))
           }
@@ -1063,6 +1110,7 @@ async function handleMessagesRequest(req, res) {
             response.body = JSON.stringify(responseData)
           }
         } catch (error) {
+          requestObservation.observeError(error)
           logger.error('❌ Bedrock non-stream request failed:', error)
           response = {
             statusCode: 500,
@@ -1089,6 +1137,11 @@ async function handleMessagesRequest(req, res) {
         headers: JSON.stringify(response.headers),
         bodyLength: response.body ? response.body.length : 0
       })
+      requestObservation.observeUpstream({
+        accountId: response.accountId ?? accountId,
+        accountType,
+        upstreamStatusCode: response.statusCode
+      })
 
       // 🔍 检查客户端连接是否仍然有效
       // 在长时间请求过程中，客户端可能已经断开连接（超时、用户取消等）
@@ -1096,6 +1149,7 @@ async function handleMessagesRequest(req, res) {
         logger.warn(
           `⚠️ Client disconnected before non-stream response could be sent for key: ${req.apiKey?.name || 'unknown'}`
         )
+        requestObservation.observeClientDisconnect()
         return undefined
       }
 
@@ -1114,6 +1168,7 @@ async function handleMessagesRequest(req, res) {
       // 尝试解析JSON响应并提取usage信息
       try {
         const jsonData = JSON.parse(response.body)
+        requestObservation.observeResponse(jsonData)
 
         logger.info('📊 Parsed Claude API response:', JSON.stringify(jsonData, null, 2))
 
@@ -1205,12 +1260,14 @@ async function handleMessagesRequest(req, res) {
           await unifiedClaudeScheduler.clearSessionMapping(sessionHash)
 
           logger.info('🔄 Session mapping cleared, retrying handleMessagesRequest...')
+          requestObservation?.noteRetry('console_account_concurrency_full')
 
           // 递归重试整个请求处理（会选择新账户）
           return await handleMessagesRequest(req, res)
         } catch (retryError) {
           // 重试失败
           if (retryError.code === 'CONSOLE_ACCOUNT_CONCURRENCY_FULL') {
+            requestObservation?.observeError(retryError)
             logger.error('❌ All Console accounts reached concurrency limit after retry')
             return res.status(503).json({
               error: 'service_unavailable',
@@ -1223,6 +1280,7 @@ async function handleMessagesRequest(req, res) {
         }
       } else {
         // 响应头已发送，无法重试
+        requestObservation?.observeError(handledError)
         logger.error('❌ Cannot retry concurrency full error - response headers already sent')
         if (!res.destroyed && !res.finished) {
           res.end()
@@ -1236,6 +1294,7 @@ async function handleMessagesRequest(req, res) {
       handledError.code === 'CONSOLE_ACCOUNT_CONCURRENCY_FULL' &&
       req._concurrencyRetryAttempted
     ) {
+      requestObservation?.observeError(handledError)
       logger.error('❌ All Console accounts reached concurrency limit (retry already attempted)')
       if (!res.headersSent) {
         return res.status(503).json({
@@ -1251,6 +1310,7 @@ async function handleMessagesRequest(req, res) {
       }
     }
 
+    requestObservation?.observeError(handledError)
     logger.error('❌ Claude relay error:', handledError.message, {
       code: handledError.code,
       stack: handledError.stack
@@ -1291,6 +1351,8 @@ async function handleMessagesRequest(req, res) {
       // 如果响应头已经发送，尝试结束响应
       if (!res.destroyed && !res.finished) {
         res.end()
+      } else if (res.destroyed) {
+        requestObservation?.observeClientDisconnect()
       }
       return undefined
     }
