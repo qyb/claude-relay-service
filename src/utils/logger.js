@@ -284,6 +284,37 @@ if (telemetryEnabled) {
   })
 }
 
+// 📝 独立明文 Prompt logger：高敏感数据不进入主日志、telemetry 或控制台
+const promptLogEnabled = process.env.PROMPT_LOG_ENABLED === 'true'
+let promptLogLogger = null
+
+if (promptLogEnabled) {
+  const promptLogFormat = winston.format.printf(({ level: _level, message: _message, ...record }) =>
+    JSON.stringify(record)
+  )
+  const promptLogTransport = new DailyRotateFile({
+    filename: path.join(logDir, 'prompt-log-%DATE%.log'),
+    datePattern: 'YYYY-MM-DD',
+    zippedArchive: false,
+    maxSize: process.env.PROMPT_LOG_MAX_SIZE || '100m',
+    maxFiles: process.env.PROMPT_LOG_MAX_FILES || '32d',
+    auditFile: path.join(logDir, '.prompt-log-audit.json'),
+    options: { flags: 'a', encoding: 'utf8', mode: 0o600 },
+    format: promptLogFormat
+  })
+
+  promptLogLogger = winston.createLogger({
+    level: 'info',
+    format: promptLogFormat,
+    transports: [promptLogTransport],
+    exitOnError: false
+  })
+
+  promptLogTransport.on('error', (error) => {
+    logger.error('Prompt log transport error:', error)
+  })
+}
+
 // 🎯 增强的自定义方法
 logger.telemetry = (record) => {
   if (!telemetryLogger || !record || typeof record !== 'object') {
@@ -306,6 +337,30 @@ logger.closeTelemetry = () => {
     return false
   }
   telemetryLogger.close()
+  return true
+}
+
+logger.promptLog = (record) => {
+  if (!promptLogLogger || !record || typeof record !== 'object') {
+    return false
+  }
+
+  try {
+    promptLogLogger.info('user_prompt_observed', record)
+    return true
+  } catch (error) {
+    logger.error('Failed to enqueue Prompt log record:', error)
+    return false
+  }
+}
+
+logger.isPromptLogEnabled = () => promptLogEnabled
+
+logger.closePromptLog = () => {
+  if (!promptLogLogger) {
+    return false
+  }
+  promptLogLogger.close()
   return true
 }
 
