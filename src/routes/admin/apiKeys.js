@@ -210,8 +210,6 @@ router.get('/api-keys', authenticateAdmin, async (req, res) => {
 
     // 如果是费用排序
     if (validSortBy === 'cost') {
-      const costRankService = require('../../services/costRankService')
-
       // 验证费用排序的时间范围
       const validCostTimeRanges = ['today', '7days', '30days', 'all', 'custom']
       const effectiveCostTimeRange = validCostTimeRanges.includes(costTimeRange)
@@ -259,11 +257,11 @@ router.get('/api-keys', authenticateAdmin, async (req, res) => {
 
         logger.info(`📊 Cost sort with custom range: ${costStartDate} to ${costEndDate}`)
 
-        // 实时计算费用排序
-        result = await getApiKeysSortedByCostCustom({
+        result = await getApiKeysSortedByCostAccurate({
           page: pageNum,
           pageSize: pageSizeNum,
           sortOrder: validSortOrder,
+          costTimeRange: 'custom',
           startDate: costStartDate,
           endDate: costEndDate,
           search,
@@ -278,24 +276,8 @@ router.get('/api-keys', authenticateAdmin, async (req, res) => {
           isRealTimeCalculation: true
         }
       } else {
-        // 使用预计算索引
-        const rankStatus = await costRankService.getRankStatus()
-        costSortStatus = rankStatus[effectiveCostTimeRange]
-
-        // 检查索引是否就绪
-        if (!costSortStatus || costSortStatus.status !== 'ready') {
-          return res.status(503).json({
-            success: false,
-            error: 'RANK_NOT_READY',
-            message: `费用排序索引 (${effectiveCostTimeRange}) 正在更新中，请稍后重试`,
-            costSortStatus: costSortStatus || { status: 'unknown' }
-          })
-        }
-
-        logger.info(`📊 Cost sort using precomputed index: ${effectiveCostTimeRange}`)
-
-        // 使用预计算索引排序
-        result = await getApiKeysSortedByCostPrecomputed({
+        // 费用升降序统一使用与 batch-stats 同源的实时统计结果。
+        result = await getApiKeysSortedByCostAccurate({
           page: pageNum,
           pageSize: pageSizeNum,
           sortOrder: validSortOrder,
@@ -307,7 +289,10 @@ router.get('/api-keys', authenticateAdmin, async (req, res) => {
           modelFilter
         })
 
-        costSortStatus.isRealTimeCalculation = false
+        costSortStatus = {
+          status: 'ready',
+          isRealTimeCalculation: true
+        }
       }
     } else {
       // 原有的非费用排序逻辑
@@ -355,7 +340,8 @@ router.get('/api-keys', authenticateAdmin, async (req, res) => {
       data: {
         items: result.items,
         pagination: result.pagination,
-        availableTags: result.availableTags
+        availableTags: result.availableTags,
+        inlineStats: result.inlineStats === true
       },
       // 标记当前请求的时间范围（供前端参考）
       timeRange
@@ -373,222 +359,147 @@ router.get('/api-keys', authenticateAdmin, async (req, res) => {
   }
 })
 
-/**
- * 使用预计算索引进行费用排序的分页查询
- */
-async function getApiKeysSortedByCostPrecomputed(options) {
-  const {
-    page,
-    pageSize,
-    sortOrder,
-    costTimeRange,
-    search,
-    searchMode,
-    tag,
-    isActive,
-    modelFilter = []
-  } = options
-  const costRankService = require('../../services/costRankService')
+async function applyApiKeyFilters(keys, options = {}) {
+  const { search = '', searchMode = 'apiKey', tag = '', isActive = '', modelFilter = [] } = options
+  let filteredKeys = keys
 
-  // 1. 获取排序后的全量 keyId 列表
-  const rankedKeyIds = await costRankService.getSortedKeyIds(costTimeRange, sortOrder)
-
-  if (rankedKeyIds.length === 0) {
-    return {
-      items: [],
-      pagination: { page: 1, pageSize, total: 0, totalPages: 1 },
-      availableTags: []
-    }
-  }
-
-  // 2. 批量获取 API Key 基础数据
-  const allKeys = await redis.batchGetApiKeys(rankedKeyIds)
-
-  // 3. 保持排序顺序（使用 Map 优化查找）
-  const keyMap = new Map(allKeys.map((k) => [k.id, k]))
-  let orderedKeys = rankedKeyIds.map((id) => keyMap.get(id)).filter((k) => k && !k.isDeleted)
-
-  // 4. 应用筛选条件
-  // 状态筛选
   if (isActive !== '' && isActive !== undefined && isActive !== null) {
     const activeValue = isActive === 'true' || isActive === true
-    orderedKeys = orderedKeys.filter((k) => k.isActive === activeValue)
+    filteredKeys = filteredKeys.filter((key) => key.isActive === activeValue)
   }
 
-  // 标签筛选
   if (tag) {
-    orderedKeys = orderedKeys.filter((k) => {
-      const tags = Array.isArray(k.tags) ? k.tags : []
+    filteredKeys = filteredKeys.filter((key) => {
+      const tags = Array.isArray(key.tags) ? key.tags : []
       return tags.includes(tag)
     })
   }
 
-  // 搜索筛选
   if (search) {
     const lowerSearch = search.toLowerCase().trim()
     if (searchMode === 'apiKey') {
-      orderedKeys = orderedKeys.filter((k) => k.name && k.name.toLowerCase().includes(lowerSearch))
+      filteredKeys = filteredKeys.filter(
+        (key) => key.name && key.name.toLowerCase().includes(lowerSearch)
+      )
     } else if (searchMode === 'bindingAccount') {
       const accountNameCacheService = require('../../services/accountNameCacheService')
-      orderedKeys = accountNameCacheService.searchByBindingAccount(orderedKeys, lowerSearch)
+      filteredKeys = accountNameCacheService.searchByBindingAccount(filteredKeys, lowerSearch)
     }
   }
 
-  // 模型筛选
   if (modelFilter.length > 0) {
     const keyIdsWithModels = await redis.getKeyIdsWithModels(
-      orderedKeys.map((k) => k.id),
+      filteredKeys.map((key) => key.id),
       modelFilter
     )
-    orderedKeys = orderedKeys.filter((k) => keyIdsWithModels.has(k.id))
+    filteredKeys = filteredKeys.filter((key) => keyIdsWithModels.has(key.id))
   }
 
-  // 5. 收集所有可用标签
+  return filteredKeys
+}
+
+function collectAvailableTags(keys) {
   const allTags = new Set()
-  for (const key of allKeys) {
+  for (const key of keys) {
     if (!key.isDeleted) {
       const tags = Array.isArray(key.tags) ? key.tags : []
-      tags.forEach((t) => allTags.add(t))
+      tags.forEach((tag) => allTags.add(tag))
     }
   }
-  const availableTags = [...allTags].sort()
+  return [...allTags].sort()
+}
 
-  // 6. 分页
-  const total = orderedKeys.length
-  const totalPages = Math.ceil(total / pageSize) || 1
-  const validPage = Math.min(Math.max(1, page), totalPages)
-  const start = (validPage - 1) * pageSize
-  const items = orderedKeys.slice(start, start + pageSize)
-
-  // 7. 为当前页的 Keys 附加费用数据
-  const keyCosts = await costRankService.getBatchKeyCosts(
-    costTimeRange,
-    items.map((k) => k.id)
-  )
-  for (const key of items) {
-    key._cost = keyCosts.get(key.id) || 0
-  }
-
+function emptyKeyStats(error = null) {
   return {
-    items,
-    pagination: {
-      page: validPage,
-      pageSize,
-      total,
-      totalPages
-    },
-    availableTags
+    requests: 0,
+    tokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheCreateTokens: 0,
+    cacheReadTokens: 0,
+    cost: 0,
+    formattedCost: '$0.00',
+    dailyCost: 0,
+    currentWindowCost: 0,
+    windowRemainingSeconds: null,
+    windowStartTime: null,
+    windowEndTime: null,
+    allTimeCost: 0,
+    ...(error ? { error: error.message } : {})
   }
 }
 
 /**
- * 使用实时计算进行 custom 时间范围的费用排序
+ * 使用 batch-stats 同源的实时统计进行费用升降序排序，并返回当前页完整统计数据。
+ * 避免列表排序和展示使用两套费用来源。
  */
-async function getApiKeysSortedByCostCustom(options) {
+async function getApiKeysSortedByCostAccurate(options) {
   const {
     page,
     pageSize,
-    sortOrder,
+    costTimeRange,
     startDate,
     endDate,
+    sortOrder = 'desc',
     search,
     searchMode,
     tag,
     isActive,
     modelFilter = []
   } = options
-  const costRankService = require('../../services/costRankService')
 
-  // 1. 实时计算所有 Keys 的费用
-  const costs = await costRankService.calculateCustomRangeCosts(startDate, endDate)
+  const keyIds = await redis.scanApiKeyIds()
+  const allKeys = await redis.batchGetApiKeys(keyIds)
+  let filteredKeys = allKeys.filter((key) => !key.isDeleted)
+  filteredKeys = await applyApiKeyFilters(filteredKeys, {
+    search,
+    searchMode,
+    tag,
+    isActive,
+    modelFilter
+  })
 
-  if (costs.size === 0) {
-    return {
-      items: [],
-      pagination: { page: 1, pageSize, total: 0, totalPages: 1 },
-      availableTags: []
-    }
-  }
-
-  // 2. 转换为数组并排序
-  const sortedEntries = [...costs.entries()].sort((a, b) =>
-    sortOrder === 'desc' ? b[1] - a[1] : a[1] - b[1]
-  )
-  const rankedKeyIds = sortedEntries.map(([keyId]) => keyId)
-
-  // 3. 批量获取 API Key 基础数据
-  const allKeys = await redis.batchGetApiKeys(rankedKeyIds)
-
-  // 4. 保持排序顺序
-  const keyMap = new Map(allKeys.map((k) => [k.id, k]))
-  let orderedKeys = rankedKeyIds.map((id) => keyMap.get(id)).filter((k) => k && !k.isDeleted)
-
-  // 5. 应用筛选条件
-  // 状态筛选
-  if (isActive !== '' && isActive !== undefined && isActive !== null) {
-    const activeValue = isActive === 'true' || isActive === true
-    orderedKeys = orderedKeys.filter((k) => k.isActive === activeValue)
-  }
-
-  // 标签筛选
-  if (tag) {
-    orderedKeys = orderedKeys.filter((k) => {
-      const tags = Array.isArray(k.tags) ? k.tags : []
-      return tags.includes(tag)
-    })
-  }
-
-  // 搜索筛选
-  if (search) {
-    const lowerSearch = search.toLowerCase().trim()
-    if (searchMode === 'apiKey') {
-      orderedKeys = orderedKeys.filter((k) => k.name && k.name.toLowerCase().includes(lowerSearch))
-    } else if (searchMode === 'bindingAccount') {
-      const accountNameCacheService = require('../../services/accountNameCacheService')
-      orderedKeys = accountNameCacheService.searchByBindingAccount(orderedKeys, lowerSearch)
-    }
-  }
-
-  // 模型筛选
-  if (modelFilter.length > 0) {
-    const keyIdsWithModels = await redis.getKeyIdsWithModels(
-      orderedKeys.map((k) => k.id),
-      modelFilter
+  const statsByKeyId = new Map()
+  const statsBatchSize = 20
+  for (let i = 0; i < filteredKeys.length; i += statsBatchSize) {
+    const batch = filteredKeys.slice(i, i + statsBatchSize)
+    const stats = await Promise.all(
+      batch.map(async (key) => {
+        try {
+          return [key.id, await calculateKeyStats(key.id, costTimeRange, startDate, endDate, key)]
+        } catch (error) {
+          logger.error(`❌ Failed to calculate stats for key ${key.id}:`, error)
+          return [key.id, emptyKeyStats(error)]
+        }
+      })
     )
-    orderedKeys = orderedKeys.filter((k) => keyIdsWithModels.has(k.id))
+    stats.forEach(([keyId, value]) => statsByKeyId.set(keyId, value))
   }
 
-  // 6. 收集所有可用标签
-  const allTags = new Set()
-  for (const key of allKeys) {
-    if (!key.isDeleted) {
-      const tags = Array.isArray(key.tags) ? key.tags : []
-      tags.forEach((t) => allTags.add(t))
-    }
-  }
-  const availableTags = [...allTags].sort()
+  filteredKeys.sort((a, b) => {
+    const aCost = statsByKeyId.get(a.id)?.cost || 0
+    const bCost = statsByKeyId.get(b.id)?.cost || 0
+    return sortOrder === 'asc' ? aCost - bCost : bCost - aCost
+  })
 
-  // 7. 分页
-  const total = orderedKeys.length
+  const availableTags = collectAvailableTags(allKeys)
+
+  const total = filteredKeys.length
   const totalPages = Math.ceil(total / pageSize) || 1
   const validPage = Math.min(Math.max(1, page), totalPages)
   const start = (validPage - 1) * pageSize
-  const items = orderedKeys.slice(start, start + pageSize)
+  const items = filteredKeys.slice(start, start + pageSize)
 
-  // 8. 为当前页的 Keys 附加费用数据
   for (const key of items) {
-    key._cost = costs.get(key.id) || 0
+    key._cost = statsByKeyId.get(key.id)?.cost || 0
+    key.stats = statsByKeyId.get(key.id) || emptyKeyStats()
   }
 
   return {
     items,
-    pagination: {
-      page: validPage,
-      pageSize,
-      total,
-      totalPages
-    },
-    availableTags
+    pagination: { page: validPage, pageSize, total, totalPages },
+    availableTags,
+    inlineStats: true
   }
 }
 
@@ -868,21 +779,7 @@ router.post('/api-keys/batch-stats', authenticateAdmin, async (req, res) => {
           stats[keyId] = await calculateKeyStats(keyId, timeRange, startDate, endDate)
         } catch (error) {
           logger.error(`❌ Failed to calculate stats for key ${keyId}:`, error)
-          stats[keyId] = {
-            requests: 0,
-            tokens: 0,
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheCreateTokens: 0,
-            cacheReadTokens: 0,
-            cost: 0,
-            formattedCost: '$0.00',
-            dailyCost: 0,
-            currentWindowCost: 0,
-            windowRemainingSeconds: null,
-            allTimeCost: 0,
-            error: error.message
-          }
+          stats[keyId] = emptyKeyStats(error)
         }
       })
     )
@@ -904,9 +801,10 @@ router.post('/api-keys/batch-stats', authenticateAdmin, async (req, res) => {
  * @param {string} timeRange - 时间范围
  * @param {string} startDate - 开始日期 (custom 模式)
  * @param {string} endDate - 结束日期 (custom 模式)
+ * @param {Object|null} apiKeyOverride - 已加载的 API Key 配置，避免重复读取
  * @returns {Object} 统计数据
  */
-async function calculateKeyStats(keyId, timeRange, startDate, endDate) {
+async function calculateKeyStats(keyId, timeRange, startDate, endDate, apiKeyOverride = null) {
   const client = redis.getClientSafe()
   const tzDate = redis.getDateInTimezone()
   const today = redis.getDateStringInTimezone()
@@ -927,6 +825,14 @@ async function calculateKeyStats(keyId, timeRange, startDate, endDate) {
   } else if (timeRange === '7days') {
     // 最近7天
     for (let i = 0; i < 7; i++) {
+      const d = new Date(tzDate)
+      d.setDate(d.getDate() - i)
+      const dateStr = redis.getDateStringInTimezone(d)
+      searchPatterns.push(`usage:${keyId}:model:daily:*:${dateStr}`)
+    }
+  } else if (timeRange === '30days') {
+    // 最近30天
+    for (let i = 0; i < 30; i++) {
       const d = new Date(tzDate)
       d.setDate(d.getDate() - i)
       const dateStr = redis.getDateStringInTimezone(d)
@@ -966,7 +872,7 @@ async function calculateKeyStats(keyId, timeRange, startDate, endDate) {
 
   try {
     // 先获取 API Key 配置，判断是否需要查询限制相关数据
-    const apiKey = await redis.getApiKey(keyId)
+    const apiKey = apiKeyOverride || (await redis.getApiKey(keyId))
     const rateLimitWindow = parseInt(apiKey?.rateLimitWindow) || 0
     const dailyCostLimit = parseFloat(apiKey?.dailyCostLimit) || 0
     const totalCostLimit = parseFloat(apiKey?.totalCostLimit) || 0
@@ -1097,13 +1003,15 @@ async function calculateKeyStats(keyId, timeRange, startDate, endDate) {
       continue
     }
 
-    // 跳过当前月的月数据
-    if (isMonthly && key.includes(`:${currentMonth}`)) {
-      continue
-    }
-    // 跳过非当前月的日数据
-    if (!isMonthly && !key.includes(`:${currentMonth}-`)) {
-      continue
+    // all 范围同时查询日/月数据：历史月份使用月数据，当前月份使用日数据，避免重复计算。
+    // 其它范围只查询所选日期（或当前月月数据），不能套用 all 的过滤规则，否则跨月份范围会漏算。
+    if (timeRange === 'all') {
+      if (isMonthly && key.includes(`:${currentMonth}`)) {
+        continue
+      }
+      if (!isMonthly && !key.includes(`:${currentMonth}-`)) {
+        continue
+      }
     }
 
     if (!modelStatsMap.has(model)) {

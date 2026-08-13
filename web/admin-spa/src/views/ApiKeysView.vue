@@ -2623,8 +2623,26 @@ const loadApiKeys = async (clearStatsCache = true) => {
         availableTags.value = data.data.availableTags
       }
 
-      // 异步加载当前页的统计数据（不等待，让页面先显示基础数据）
-      loadPageStats()
+      // 费用排序接口已在同一次请求中返回当前页完整统计，直接填充缓存。
+      const hasInlineStats = data.data?.inlineStats === true
+      if (hasInlineStats) {
+        const currentTimeRange =
+          globalDateFilter.type === 'custom' ? 'custom' : globalDateFilter.preset
+        for (const key of apiKeys.value) {
+          if (key.stats) {
+            statsCache.value.set(key.id, {
+              stats: key.stats,
+              timeRange: currentTimeRange,
+              startDate: globalDateFilter.customStart,
+              endDate: globalDateFilter.customEnd,
+              timestamp: Date.now()
+            })
+          }
+        }
+      } else {
+        // 普通排序仍使用原有的异步统计加载。
+        loadPageStats()
+      }
       // 异步加载当前页的最后使用账号数据
       loadPageLastUsage()
     }
@@ -2804,40 +2822,13 @@ const sortApiKeys = (field) => {
 
 // 计算是否可以进行费用排序
 const canSortByCost = computed(() => {
-  // custom 时间范围始终允许（实时计算）
-  if (globalDateFilter.type === 'custom') {
-    return true
-  }
-
-  // 检查对应时间范围的索引状态
-  const timeRange = globalDateFilter.preset
-  const status = costSortStatus.value[timeRange]
-  return status?.status === 'ready'
+  // 当前端点统一使用实时统计排序，不再依赖 cost_rank 索引状态。
+  return true
 })
 
 // 费用排序提示文字
 const costSortTooltip = computed(() => {
-  if (globalDateFilter.type === 'custom') {
-    return '点击按费用排序（实时计算，可能需要几秒钟）'
-  }
-
-  const timeRange = globalDateFilter.preset
-  const status = costSortStatus.value[timeRange]
-
-  if (!status) {
-    return '费用排序索引未初始化'
-  }
-
-  if (status.status === 'updating') {
-    return '费用排序索引正在更新中...'
-  }
-
-  if (status.status === 'ready') {
-    const lastUpdate = status.lastUpdate ? new Date(status.lastUpdate).toLocaleString() : '未知'
-    return `点击按费用排序（索引更新于: ${lastUpdate}）`
-  }
-
-  return '费用排序索引状态未知'
+  return '点击按费用排序（实时计算，可能需要几秒钟）'
 })
 
 // 费用排序索引状态刷新定时器
@@ -3495,23 +3486,6 @@ const calculatePeriodCost = (key) => {
 // 处理时间范围下拉框变化
 const handleTimeRangeChange = (value) => {
   setGlobalDateFilterPreset(value)
-
-  // 如果当前是费用排序，检查新时间范围的索引是否就绪
-  if (apiKeysSortBy.value === 'cost') {
-    // custom 时间范围始终允许（实时计算）
-    if (value === 'custom') {
-      return
-    }
-
-    // 检查新时间范围的索引状态
-    const status = costSortStatus.value[value]
-    if (!status || status.status !== 'ready') {
-      // 索引未就绪，回退到默认排序
-      apiKeysSortBy.value = 'createdAt'
-      apiKeysSortOrder.value = 'desc'
-      showToast('当前时间范围的费用排序索引未就绪，已切换到默认排序', 'info')
-    }
-  }
 }
 
 // 设置全局日期预设
