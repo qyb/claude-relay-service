@@ -4,7 +4,7 @@
 
 Prompt Log 用于工作内容审计。它与 harness/tool telemetry 完全独立，只记录员工通过 API Key 发出的最新用户 Prompt，不记录模型回复、工具参数、工具结果正文或完整请求体。
 
-当前使用独立 Winston logger 写入本地明文日志，不使用数据库、不做脱敏，并已接入通过校验的 `/v1/messages` 请求路径。
+当前使用独立 Winston logger 写入本地 Prompt 日志，并已接入通过校验的 `/v1/messages` 请求路径。Prompt 只在内存中保留原文，交给 `logger.promptLog()` 前会先经过 `promptMasker`；日志文件中的 `prompt` 不再保证是原文。
 
 ## 二、提取规则
 
@@ -17,7 +17,7 @@ Prompt Log 用于工作内容审计。它与 harness/tool telemetry 完全独立
 5. 如果最后一条 user 消息只有工具结果，继续向前查找更早的 user 文本。
 6. 同一 user 消息混合 `tool_result + text` 时，只保留最后一个普通 text 块。
 
-记录中的 `prompt` 保留原始明文，包括大小写、换行、标点和首尾空白。是否为空只通过 `trim()` 判断；用于去重的 hash 会去除首尾空白和 NUL，但不会改变内部内容。
+脱敏前的候选 Prompt 保留大小写、换行、标点和首尾空白；是否为空只通过 `trim()` 判断。用于去重的 hash 会去除首尾空白和 NUL，但不会改变内部内容；写盘记录中的 `prompt` 则是脱敏后的文本。
 
 ## 三、Session LRU 去重
 
@@ -63,7 +63,8 @@ logger.promptLog(record)
 - 默认保留 32 天。
 - 不压缩，文件 stream mode 为 `0600`。
 - 不进入 `claude-relay-*.log`，不输出到控制台。
-- 使用一行一个结构化 JSON object；`prompt` 字段保存明文。
+- 使用一行一个结构化 JSON object；`prompt` 字段保存脱敏后的文本。
+- 每条记录增加 `mask_version` 和 `mask_count`；高熵字符串只标记 `suspected_secret: true`，不自动替换。
 - best-effort 写入失败不阻断 LLM 请求。
 
 配置：
@@ -74,6 +75,9 @@ PROMPT_LOG_MAX_SIZE=100m
 PROMPT_LOG_MAX_FILES=32d
 PROMPT_LOG_CACHE_SIZE=10000
 PROMPT_LOG_CACHE_TTL_MS=86400000
+# Prompt Masking 从已有 ENCRYPTION_KEY 派生专用 HMAC 子密钥
+# PROMPT_MASKING_RULES_FILE=/etc/claude-relay/prompt-masking-rules.json
+# PROMPT_MASK_VERSION=2026.08.14
 ```
 
 示例记录：
@@ -99,11 +103,12 @@ PROMPT_LOG_CACHE_TTL_MS=86400000
 
 ## 五、隐私与运维
 
-Prompt Log 明确包含未脱敏的员工输入，敏感级别高于 telemetry 和普通运行日志：
+Prompt Log 包含员工输入，敏感级别高于 telemetry 和普通运行日志。密钥类内容在写盘前使用 HMAC 指纹替换，手机号、邮箱和身份证采用部分 mask；高熵但无结构的字符串仍可能保留原文，只增加复核标记：
 
 - 必须保持功能默认关闭。
 - 日志目录和文件只允许 CRS 服务账号及获授权管理员读取。
 - 不得把 Prompt Log 上传到普通日志聚合平台。
+- Prompt Masking 从已有 `ENCRYPTION_KEY` 派生专用 HMAC 子密钥；生产环境必须配置真实的 `ENCRYPTION_KEY`，不能使用示例默认值。
 - transport 错误只写标准错误信息，不能把失败 record 连同 Prompt 写入普通日志。
 - prompt log 与 telemetry 使用不同文件、开关、模块和未来的数据表。
 
@@ -127,7 +132,20 @@ logger_unavailable     功能关闭或 logger 不可用
 
 只有 logger 接受记录后才更新 LRU；功能关闭或同步入队失败时不更新缓存。
 
-## 七、最低测试要求
+## 七、真实日志 golden 测试
+
+生产 Prompt Log 不进入仓库。可从当前目录的本地日志提取少量、带来源行号的真实样本：
+
+```bash
+node scripts/extract-prompt-golden.js
+PROMPT_GOLDEN_DIR=.local npm test -- --runInBand tests/promptMasking.local-golden.test.js
+```
+
+脚本默认读取 `prompt-log-2026-08-08.log` 至 `prompt-log-2026-08-14.log`，输出 `.local/prompt-golden.jsonl`，文件权限为 `0600`，并由 `.gitignore` 排除。未设置 `PROMPT_GOLDEN_DIR` 时本地 golden 测试跳过；设置后文件缺失或样本结果变化会使测试失败。测试失败信息只包含日志文件名和行号，不输出 Prompt 原文。
+
+固定提交的测试仍使用合成样本，覆盖结构、值形状、PII、占位符、误报和高熵标记；真实 golden 只作为本地回归补充。
+
+## 八、最低测试要求
 
 - 多文本块只取最后一个普通 `text`。
 - tool-result-only 请求回退到更早的人工 Prompt。
@@ -136,11 +154,11 @@ logger_unavailable     功能关闭或 logger 不可用
 - 不同 session 相同 Prompt 分别写入。
 - A、B、A 写入三条。
 - 无 session 时不执行跨请求去重。
-- Prompt 明文原样进入 record，不做脱敏。
+- Prompt 在写盘前脱敏，原始 `prompt_length` 仍用于审计长度参考。
 - logger 拒绝时不提交 LRU 状态。
 - Prompt transport 与普通日志和控制台隔离。
 
-## 八、当前接入状态
+## 九、当前接入状态
 
 Prompt Log 已通过 `llmRequestObserver.js` 接入 `/v1/messages` 和 `/claude/v1/messages` 的共享 handler：
 

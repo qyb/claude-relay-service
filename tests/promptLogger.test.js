@@ -276,16 +276,21 @@ describe('PromptLogger LRU retention', () => {
     expect(writeRecord).toHaveBeenCalledTimes(2)
   })
 
-  it('Prompt 明文原样进入 record，不做脱敏或 trim', () => {
+  it('Prompt 在写盘前脱敏，但保留原始长度和审计字段', () => {
     const writeRecord = jest.fn(() => true)
-    const promptLogger = new PromptLogger({ writeRecord })
+    const promptLogger = new PromptLogger({ writeRecord, maskingHmacKey: 'test-mask-key' })
     const rawPrompt = '  password=secret\n第二行  '
 
     promptLogger.recordRequest(buildRequest([userText(rawPrompt)]), sessionInfo())
 
     const record = writeRecord.mock.calls[0][0]
-    expect(record.prompt).toBe(rawPrompt)
+    expect(record.prompt).toMatch(/^  password=\[MASKED:password:[0-9a-f]{8}\]\n第二行  $/)
+    expect(record.prompt).not.toContain('password=secret')
     expect(record.prompt_length).toBe(rawPrompt.length)
+    expect(record).toMatchObject({
+      mask_version: '2026.08.14',
+      mask_count: 1
+    })
     expect(record).toMatchObject({
       event_type: 'user_prompt_observed',
       api_key_record_id: 'key-record-1',

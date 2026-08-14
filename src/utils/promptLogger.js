@@ -1,13 +1,14 @@
 /**
  * Prompt Logger — 提取并按 session 去重记录最新用户 Prompt。
  *
- * Prompt 明文仅传给 logger.promptLog() 的独立高敏感日志 transport；LRU
- * 只保存 session 与 Prompt 的 SHA-256，不保存明文。
+ * Prompt 原文只在内存中经过脱敏，然后传给 logger.promptLog() 的独立高敏感
+ * 日志 transport；LRU 只保存 session 与 Prompt 的 SHA-256，不保存明文。
  */
 
 const crypto = require('crypto')
 const logger = require('./logger')
 const LRUCache = require('./lruCache')
+const { createPromptMasker, DEFAULT_MASK_VERSION } = require('./promptMasker')
 
 const SCHEMA_VERSION = 1
 const DEFAULT_CACHE_SIZE = 10000
@@ -107,6 +108,37 @@ function buildPromptSessionKey(apiKeyId, clientSessionId) {
     .digest('hex')
 }
 
+function maskPromptRecord(record, maskPromptFn) {
+  if (!record || typeof record.prompt !== 'string') {
+    return record
+  }
+
+  try {
+    const result = maskPromptFn(record.prompt)
+    const maskedRecord = {
+      ...record,
+      prompt: result.maskedPrompt,
+      mask_version: result.maskVersion || DEFAULT_MASK_VERSION,
+      mask_count: Number.isInteger(result.maskCount) ? result.maskCount : 0
+    }
+
+    if (result.suspectedSecret === true) {
+      maskedRecord.suspected_secret = true
+    }
+
+    return maskedRecord
+  } catch (error) {
+    // 脱敏异常时绝不能把明文继续写盘；使用不可逆占位符并保留可复核元字段。
+    return {
+      ...record,
+      prompt: '[MASKED:prompt_masking_error]',
+      mask_version: DEFAULT_MASK_VERSION,
+      mask_count: 0,
+      suspected_secret: true
+    }
+  }
+}
+
 class PromptLogger {
   constructor(options = {}) {
     const cacheSize = parsePositiveInteger(
@@ -119,10 +151,18 @@ class PromptLogger {
     )
     this.cache = options.cache || new LRUCache(cacheSize)
     this.writeRecord = options.writeRecord || ((record) => logger.promptLog(record))
+    this.maskPrompt =
+      options.maskPrompt ||
+      createPromptMasker({
+        hmacKey: options.maskingHmacKey,
+        maskVersion: options.maskVersion,
+        rules: options.maskingRules,
+        rulesFile: options.maskingRulesFile
+      })
   }
 
   recordRequest(req, sessionInfo = {}, skillRecords = []) {
-    // 1. 记录待落盘的 SKILL 明文
+    // 1. 记录待落盘的 SKILL Prompt（写盘前脱敏）
     if (Array.isArray(skillRecords)) {
       for (const skillRecord of skillRecords) {
         const record = {
@@ -147,7 +187,7 @@ class PromptLogger {
           prompt: skillRecord.prompt
         }
         try {
-          this.writeRecord(record)
+          this.writeRecord(maskPromptRecord(record, this.maskPrompt))
         } catch (error) {
           logger.error(
             'Failed to enqueue SKILL Prompt log record:',
@@ -189,7 +229,7 @@ class PromptLogger {
 
     let accepted = false
     try {
-      accepted = this.writeRecord(record) === true
+      accepted = this.writeRecord(maskPromptRecord(record, this.maskPrompt)) === true
     } catch (error) {
       logger.error('Failed to enqueue Prompt log record:', error?.message || String(error))
     }
@@ -219,3 +259,4 @@ module.exports.buildPromptSessionKey = buildPromptSessionKey
 module.exports.extractLatestUserPrompt = extractLatestUserPrompt
 module.exports.hashPrompt = hashPrompt
 module.exports.isHumanPrompt = isHumanPrompt
+module.exports.maskPromptRecord = maskPromptRecord
