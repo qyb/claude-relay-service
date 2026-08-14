@@ -294,3 +294,68 @@ describe('llmTelemetry finalization', () => {
     expect(logger.telemetry).not.toHaveBeenCalled()
   })
 })
+
+describe('llmTelemetry skill summary fields', () => {
+  beforeEach(() => {
+    logger.telemetry.mockClear()
+  })
+
+  it('skillSummary 展开为 telemetry 记录的 skill_* 摘要字段', () => {
+    const context = createTelemetryContext(buildRequest(), buildSessionInfo(), {
+      skill_detected: true,
+      skill_detection_confidence: 'exact_marker',
+      skill_detection_rule_version: 1,
+      skill_detection_types: ['invoked_skills'],
+      skill_names: ['verify'],
+      skill_count: 1,
+      skill_chars: 18420,
+      skill_newly_injected_count: 1,
+      skill_reinjected_count: 0,
+      skill_rehydrated: false
+    })
+
+    finalizeTelemetry(context, { eventType: 'llm_request_completed' })
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      skill_detected: true,
+      skill_detection_confidence: 'exact_marker',
+      skill_detection_rule_version: 1,
+      skill_detection_types: ['invoked_skills'],
+      skill_names: ['verify'],
+      skill_count: 1,
+      skill_chars: 18420,
+      skill_newly_injected_count: 1,
+      skill_reinjected_count: 0,
+      skill_rehydrated: false
+    })
+  })
+
+  it('无 skillSummary 时 telemetry 记录不含 skill_* 字段', () => {
+    const context = createTelemetryContext(buildRequest(), buildSessionInfo())
+
+    finalizeTelemetry(context, { eventType: 'llm_request_completed' })
+
+    const record = logger.telemetry.mock.calls[0][0]
+    expect(Object.keys(record).filter((key) => key.startsWith('skill_'))).toHaveLength(0)
+  })
+
+  it('skillSummary 字段缺失或类型错误时回退到安全默认值', () => {
+    const context = createTelemetryContext(buildRequest(), buildSessionInfo(), {
+      skill_detected: true
+    })
+
+    finalizeTelemetry(context, { eventType: 'llm_request_completed' })
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      skill_detected: true,
+      skill_detection_confidence: null,
+      skill_detection_types: [],
+      skill_names: [],
+      skill_count: 0,
+      skill_chars: 0,
+      skill_newly_injected_count: 0,
+      skill_reinjected_count: 0,
+      skill_rehydrated: false
+    })
+  })
+})

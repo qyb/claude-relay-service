@@ -7,7 +7,8 @@ const {
   PromptLogger,
   buildPromptSessionKey,
   extractLatestUserPrompt,
-  hashPrompt
+  hashPrompt,
+  isHumanPrompt
 } = require('../src/utils/promptLogger')
 
 const SESSION_A = '11111111-1111-4111-8111-111111111111'
@@ -113,6 +114,29 @@ describe('Prompt extraction', () => {
 
   it('没有普通用户文本时返回 null', () => {
     expect(extractLatestUserPrompt({ messages: [toolResult()] })).toBeNull()
+  })
+
+  it('8. 最后一条 user 消息是 SKILL/system-reminder 注入时回退到更早的人工文本', () => {
+    const skillText = `<system-reminder>
+<command-message>linter</command-message>
+<skill-format>true</skill-format>
+Run eslint on modified files
+</system-reminder>`
+    const reminderText =
+      '<system-reminder>The following skills are available for use with the Skill tool:\n- linter: lint</system-reminder>'
+
+    expect(
+      extractLatestUserPrompt({
+        messages: [userText('human prompt'), userText(skillText)]
+      })
+    ).toBe('human prompt')
+    expect(
+      extractLatestUserPrompt({
+        messages: [userText('human prompt'), userText(reminderText)]
+      })
+    ).toBe('human prompt')
+    // 全部 user 消息都是机器注入时不记录任何明文
+    expect(extractLatestUserPrompt({ messages: [userText(skillText)] })).toBeNull()
   })
 })
 
@@ -267,6 +291,86 @@ describe('PromptLogger LRU retention', () => {
       api_key_record_id: 'key-record-1',
       client_session_id: SESSION_A,
       model: 'claude-sonnet-test'
+    })
+  })
+
+  it('8. SKILL 明文只进入 skill_prompt_observed，不污染 user_prompt_observed', () => {
+    const writeRecord = jest.fn(() => true)
+    const promptLogger = new PromptLogger({ writeRecord })
+    const skillText = `<system-reminder>
+<command-message>linter</command-message>
+<skill-format>true</skill-format>
+Run eslint on modified files
+</system-reminder>`
+    const request = buildRequest([userText('human prompt'), userText(skillText)])
+    const skillRecords = [
+      {
+        skill_name: 'linter',
+        skill_path: null,
+        skill_detection_confidence: 'exact_marker',
+        skill_detection_rule_version: 1,
+        skill_injection_kind: 'newly_injected',
+        skill_rehydrated: false,
+        skill_chars: 28,
+        prompt: 'Run eslint on modified files'
+      }
+    ]
+
+    promptLogger.recordRequest(request, sessionInfo(), skillRecords)
+
+    const recordsByType = {}
+    for (const call of writeRecord.mock.calls) {
+      recordsByType[call[0].event_type] = call[0]
+    }
+
+    expect(Object.keys(recordsByType).sort()).toEqual([
+      'skill_prompt_observed',
+      'user_prompt_observed'
+    ])
+    // 员工输入与 SKILL 明文各归各的记录类型
+    expect(recordsByType.user_prompt_observed.prompt).toBe('human prompt')
+    expect(recordsByType.skill_prompt_observed.prompt).toBe('Run eslint on modified files')
+    expect(recordsByType.skill_prompt_observed).toMatchObject({
+      prompt_source: 'skill_injection',
+      skill_name: 'linter',
+      skill_injection_kind: 'newly_injected',
+      schema_version: 2
+    })
+    expect(JSON.stringify(recordsByType.skill_prompt_observed)).not.toContain('human prompt')
+    expect(JSON.stringify(recordsByType.user_prompt_observed)).not.toContain('Run eslint')
+  })
+
+  it('isHumanPrompt 识别常见机器注入标记', () => {
+    expect(isHumanPrompt('please help me refactor')).toBe(true)
+    expect(isHumanPrompt('<command-args>/tmp</command-args>')).toBe(false)
+    expect(isHumanPrompt('<command-contents>body</command-contents>')).toBe(false)
+    expect(isHumanPrompt('<local-command-stdout>output</local-command-stdout>')).toBe(false)
+    expect(isHumanPrompt('The following skills were invoked in this session:\n### Skill: x')).toBe(
+      false
+    )
+  })
+
+  it('保留 system_reminder 的 prompt_source', () => {
+    const writeRecord = jest.fn(() => true)
+    const promptLogger = new PromptLogger({ writeRecord })
+
+    promptLogger.recordRequest(buildRequest([userText('human prompt')]), sessionInfo(), [
+      {
+        prompt_source: 'system_reminder',
+        skill_name: null,
+        skill_path: null,
+        skill_detection_confidence: 'heuristic',
+        skill_detection_rule_version: 1,
+        skill_injection_kind: 'newly_injected',
+        skill_rehydrated: false,
+        skill_chars: 20,
+        prompt: 'Runtime guidance'
+      }
+    ])
+
+    expect(writeRecord.mock.calls[0][0]).toMatchObject({
+      event_type: 'skill_prompt_observed',
+      prompt_source: 'system_reminder'
     })
   })
 })

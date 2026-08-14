@@ -233,7 +233,7 @@ function getUsageFields(usage) {
   }
 }
 
-function createTelemetryContext(req, sessionInfo) {
+function createTelemetryContext(req, sessionInfo, skillSummary = null) {
   const startTimeMs = Date.now()
   return {
     finalized: false,
@@ -251,7 +251,8 @@ function createTelemetryContext(req, sessionInfo) {
     clientSessionId: sessionInfo?.clientSessionId ?? null,
     sessionIdSource: sessionInfo?.source ?? null,
     stickySessionKey: sessionInfo?.stickySessionKey ?? null,
-    requestSummary: summarizeRequestForTelemetry(req?.body, req?.headers)
+    requestSummary: summarizeRequestForTelemetry(req?.body, req?.headers),
+    skillSummary: skillSummary || null
   }
 }
 
@@ -271,6 +272,36 @@ function finalizeTelemetry(context, outcome = {}) {
   const responseSummary = summarizeResponseForTelemetry(outcome.responseSummary)
   const now = Date.now()
   const responseCompleted = outcome.responseCompleted ?? !isError
+  const effectiveSkillSummary = outcome.skillSummary ?? context.skillSummary
+
+  const skillFields = effectiveSkillSummary
+    ? {
+        skill_detected: effectiveSkillSummary.skill_detected === true,
+        skill_detection_confidence: effectiveSkillSummary.skill_detection_confidence ?? null,
+        skill_detection_rule_version: effectiveSkillSummary.skill_detection_rule_version ?? 1,
+        skill_detection_types: Array.isArray(effectiveSkillSummary.skill_detection_types)
+          ? effectiveSkillSummary.skill_detection_types
+          : [],
+        skill_names: Array.isArray(effectiveSkillSummary.skill_names)
+          ? effectiveSkillSummary.skill_names
+          : [],
+        skill_count: Number.isInteger(effectiveSkillSummary.skill_count)
+          ? effectiveSkillSummary.skill_count
+          : 0,
+        skill_chars: Number.isInteger(effectiveSkillSummary.skill_chars)
+          ? effectiveSkillSummary.skill_chars
+          : 0,
+        skill_newly_injected_count: Number.isInteger(
+          effectiveSkillSummary.skill_newly_injected_count
+        )
+          ? effectiveSkillSummary.skill_newly_injected_count
+          : 0,
+        skill_reinjected_count: Number.isInteger(effectiveSkillSummary.skill_reinjected_count)
+          ? effectiveSkillSummary.skill_reinjected_count
+          : 0,
+        skill_rehydrated: effectiveSkillSummary.skill_rehydrated === true
+      }
+    : {}
 
   const record = {
     schema_version: SCHEMA_VERSION,
@@ -286,6 +317,7 @@ function finalizeTelemetry(context, outcome = {}) {
     session_id_source: context.sessionIdSource,
     sticky_session_key: context.stickySessionKey,
     ...context.requestSummary,
+    ...skillFields,
     route: context.route,
     provider: outcome.provider ?? context.provider,
     account_id: outcome.accountId ?? context.accountId,

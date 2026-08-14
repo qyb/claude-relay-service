@@ -18,6 +18,27 @@ function parsePositiveInteger(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
+function isHumanPrompt(text) {
+  if (typeof text !== 'string' || !text.trim()) {
+    return false
+  }
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()
+  if (
+    normalized.includes('<command-message>') ||
+    normalized.includes('<command-name>') ||
+    normalized.includes('<skill-format>') ||
+    normalized.includes('<command-args>') ||
+    normalized.includes('<command-contents>') ||
+    normalized.includes('<local-command-stdout>') ||
+    normalized.includes('<system-reminder>') ||
+    /The following skills were invoked in this session:/i.test(normalized) ||
+    /The following skills are available for use with the Skill tool:/i.test(normalized)
+  ) {
+    return false
+  }
+  return true
+}
+
 function extractLatestUserPrompt(requestBody) {
   const messages = requestBody?.messages
   if (!Array.isArray(messages)) {
@@ -32,7 +53,7 @@ function extractLatestUserPrompt(requestBody) {
 
     const { content } = message
     if (typeof content === 'string') {
-      if (content.trim()) {
+      if (content.trim() && isHumanPrompt(content)) {
         return content
       }
       continue
@@ -44,7 +65,12 @@ function extractLatestUserPrompt(requestBody) {
 
     for (let blockIndex = content.length - 1; blockIndex >= 0; blockIndex -= 1) {
       const block = content[blockIndex]
-      if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+      if (
+        block?.type === 'text' &&
+        typeof block.text === 'string' &&
+        block.text.trim() &&
+        isHumanPrompt(block.text)
+      ) {
         return block.text
       }
     }
@@ -95,7 +121,43 @@ class PromptLogger {
     this.writeRecord = options.writeRecord || ((record) => logger.promptLog(record))
   }
 
-  recordRequest(req, sessionInfo = {}) {
+  recordRequest(req, sessionInfo = {}, skillRecords = []) {
+    // 1. 记录待落盘的 SKILL 明文
+    if (Array.isArray(skillRecords)) {
+      for (const skillRecord of skillRecords) {
+        const record = {
+          schema_version: 2,
+          event_type: 'skill_prompt_observed',
+          timestamp: new Date().toISOString(),
+          gateway_request_id: req?.requestId ?? null,
+          api_key_record_id: req?.apiKey?.id ?? null,
+          api_key_name: req?.apiKey?.name ?? null,
+          client_session_id: sessionInfo?.clientSessionId ?? null,
+          session_id_source: sessionInfo?.source ?? null,
+          route: req?.route?.path ?? req?.originalUrl?.split('?')[0] ?? null,
+          model: req?.body?.model ?? null,
+          prompt_source: skillRecord.prompt_source ?? 'skill_injection',
+          skill_name: skillRecord.skill_name ?? null,
+          skill_path: skillRecord.skill_path ?? null,
+          skill_detection_confidence: skillRecord.skill_detection_confidence ?? null,
+          skill_detection_rule_version: skillRecord.skill_detection_rule_version ?? 1,
+          skill_injection_kind: skillRecord.skill_injection_kind ?? 'newly_injected',
+          skill_rehydrated: skillRecord.skill_rehydrated === true,
+          skill_chars: skillRecord.skill_chars ?? 0,
+          prompt: skillRecord.prompt
+        }
+        try {
+          this.writeRecord(record)
+        } catch (error) {
+          logger.error(
+            'Failed to enqueue SKILL Prompt log record:',
+            error?.message || String(error)
+          )
+        }
+      }
+    }
+
+    // 2. 提取并记录员工 Prompt
     const prompt = extractLatestUserPrompt(req?.body)
     const promptHash = hashPrompt(prompt)
     if (!prompt || !promptHash) {
@@ -156,3 +218,4 @@ module.exports.SCHEMA_VERSION = SCHEMA_VERSION
 module.exports.buildPromptSessionKey = buildPromptSessionKey
 module.exports.extractLatestUserPrompt = extractLatestUserPrompt
 module.exports.hashPrompt = hashPrompt
+module.exports.isHumanPrompt = isHumanPrompt

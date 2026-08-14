@@ -7,9 +7,27 @@ jest.mock('../src/utils/logger', () => ({
   isTelemetryEnabled: jest.fn()
 }))
 
-jest.mock('../src/utils/promptLogger', () => ({
-  recordRequest: jest.fn()
-}))
+jest.mock('../src/utils/promptLogger', () => {
+  const crypto = require('crypto')
+  return {
+    recordRequest: jest.fn(),
+    // 与真实 buildPromptSessionKey 保持一致的构造方式
+    buildPromptSessionKey: (apiKeyId, clientSessionId) => {
+      if (
+        (typeof apiKeyId !== 'string' && typeof apiKeyId !== 'number') ||
+        !String(apiKeyId).trim() ||
+        typeof clientSessionId !== 'string' ||
+        !clientSessionId.trim()
+      ) {
+        return null
+      }
+      return crypto
+        .createHash('sha256')
+        .update(`${String(apiKeyId)}\u0000anthropic\u0000${clientSessionId.trim().toLowerCase()}`)
+        .digest('hex')
+    }
+  }
+})
 
 jest.mock('../src/utils/sessionHelper', () => ({
   extractClientSessionId: jest.fn()
@@ -144,7 +162,7 @@ describe('LLM request observation lifecycle', () => {
     expect(second).toBe(first)
     expect(sessionHelper.extractClientSessionId).toHaveBeenCalledTimes(1)
     expect(promptLogger.recordRequest).toHaveBeenCalledTimes(1)
-    expect(promptLogger.recordRequest).toHaveBeenCalledWith(req, SESSION_INFO)
+    expect(promptLogger.recordRequest).toHaveBeenCalledWith(req, SESSION_INFO, [])
   })
 
   it('session 提取失败时按无 session 继续，不阻断 Prompt 和 telemetry', () => {
@@ -159,11 +177,15 @@ describe('LLM request observation lifecycle', () => {
     expect(() => startLlmRequestObservation(req, res)).not.toThrow()
     res.emit('finish')
 
-    expect(promptLogger.recordRequest).toHaveBeenCalledWith(req, {
-      clientSessionId: null,
-      source: 'none',
-      stickySessionKey: null
-    })
+    expect(promptLogger.recordRequest).toHaveBeenCalledWith(
+      req,
+      {
+        clientSessionId: null,
+        source: 'none',
+        stickySessionKey: null
+      },
+      []
+    )
     expect(logger.telemetry).toHaveBeenCalledTimes(1)
     expect(logger.error).toHaveBeenCalledWith(
       'Failed to extract LLM client session:',
@@ -383,5 +405,64 @@ describe('LLM request observation lifecycle', () => {
       error_code: 'overloaded_error'
     })
     expect(JSON.stringify(record)).not.toContain('sensitive upstream message')
+  })
+
+  it('11. SKILL 分析器失败不影响 Prompt 记录和 telemetry（fail-open）', () => {
+    logger.isPromptLogEnabled.mockReturnValue(true)
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const skillPromptAnalyzer = require('../src/utils/skillPromptAnalyzer')
+    const analyzeSpy = jest.spyOn(skillPromptAnalyzer, 'analyze').mockImplementation(() => {
+      throw new Error('analyzer boom')
+    })
+    const req = buildRequest()
+    const res = new FakeResponse()
+
+    try {
+      expect(() => startLlmRequestObservation(req, res)).not.toThrow()
+      expect(promptLogger.recordRequest).toHaveBeenCalledWith(req, SESSION_INFO, [])
+      res.emit('finish')
+
+      expect(logger.telemetry).toHaveBeenCalledTimes(1)
+      expect(logger.telemetry.mock.calls[0][0].event_type).toBe('llm_request_completed')
+      expect(logger.error).toHaveBeenCalledWith(
+        'Failed to analyze SKILL prompt injection:',
+        'analyzer boom'
+      )
+    } finally {
+      analyzeSpy.mockRestore()
+    }
+  })
+
+  it('检测到 SKILL 注入时 telemetry 记录包含 skill_* 摘要字段', () => {
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const skillText = `<system-reminder>
+<command-message>verify</command-message>
+<skill-format>true</skill-format>
+Verify the build
+</system-reminder>`
+    const req = buildRequest({
+      body: {
+        model: 'claude-sonnet-test',
+        stream: true,
+        messages: [{ role: 'user', content: [{ type: 'text', text: skillText }] }]
+      }
+    })
+    const res = new FakeResponse()
+
+    startLlmRequestObservation(req, res)
+    res.emit('finish')
+
+    const record = logger.telemetry.mock.calls[0][0]
+    expect(record).toMatchObject({
+      skill_detected: true,
+      skill_detection_confidence: 'exact_marker',
+      skill_names: ['verify'],
+      skill_count: 1,
+      skill_newly_injected_count: 1,
+      skill_reinjected_count: 0,
+      skill_rehydrated: false
+    })
+    // telemetry 只含摘要，不含 SKILL 正文明文
+    expect(JSON.stringify(record)).not.toContain('Verify the build')
   })
 })

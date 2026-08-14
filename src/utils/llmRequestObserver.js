@@ -16,6 +16,8 @@ const {
   summarizeResponseForTelemetry
 } = require('./llmTelemetry')
 
+const skillPromptAnalyzer = require('./skillPromptAnalyzer')
+
 const REQUEST_OBSERVER = Symbol('llmRequestObserver')
 
 function isFeatureEnabled(methodName) {
@@ -73,10 +75,12 @@ function mergeUsage(current, incoming) {
 }
 
 class LlmRequestObserver {
-  constructor(req, res, sessionInfo, telemetryEnabled) {
+  constructor(req, res, sessionInfo, telemetryEnabled, skillSummary = null) {
     this.res = res
     this.telemetryEnabled = telemetryEnabled
-    this.context = telemetryEnabled ? createTelemetryContext(req, sessionInfo) : null
+    this.context = telemetryEnabled
+      ? createTelemetryContext(req, sessionInfo, skillSummary)
+      : null
     this.finishSeen = false
     this.usage = null
     this.responseSummary = null
@@ -398,15 +402,30 @@ function startLlmRequestObservation(req, res) {
     }
   }
 
+  let skillAnalysis = { summary: null, skillRecords: [] }
+  if (promptLogEnabled || telemetryEnabled) {
+    try {
+      skillAnalysis = skillPromptAnalyzer.analyze(req?.body, sessionInfo, req?.apiKey?.id)
+    } catch (error) {
+      logger.error('Failed to analyze SKILL prompt injection:', error?.message || String(error))
+    }
+  }
+
   if (promptLogEnabled) {
     try {
-      promptLogger.recordRequest(req, sessionInfo)
+      promptLogger.recordRequest(req, sessionInfo, skillAnalysis.skillRecords)
     } catch (error) {
       logger.error('Failed to record latest user Prompt:', error?.message || String(error))
     }
   }
 
-  const observer = new LlmRequestObserver(req, res, sessionInfo, telemetryEnabled)
+  const observer = new LlmRequestObserver(
+    req,
+    res,
+    sessionInfo,
+    telemetryEnabled,
+    skillAnalysis.summary
+  )
   if (req && typeof req === 'object') {
     Object.defineProperty(req, REQUEST_OBSERVER, {
       value: observer,
