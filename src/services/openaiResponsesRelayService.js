@@ -137,7 +137,8 @@ class OpenAIResponsesRelayService {
           account,
           response,
           req.body?.stream,
-          sessionHash
+          sessionHash,
+          req.requestId
         )
 
         // 返回错误响应（使用处理后的数据，避免循环引用）
@@ -218,7 +219,8 @@ class OpenAIResponsesRelayService {
               account.id,
               'openai-responses',
               sessionHash,
-              reason
+              reason,
+              req.requestId
             )
           } catch (markError) {
             logger.error(
@@ -354,7 +356,8 @@ class OpenAIResponsesRelayService {
               account.id,
               'openai-responses',
               sessionHash,
-              reason
+              reason,
+              req.requestId
             )
           } catch (markError) {
             logger.error(
@@ -581,7 +584,8 @@ class OpenAIResponsesRelayService {
           account.id,
           'openai-responses',
           sessionHash,
-          rateLimitResetsInSeconds
+          rateLimitResetsInSeconds,
+          req.requestId
         )
 
         logger.warn(
@@ -709,7 +713,13 @@ class OpenAIResponsesRelayService {
   }
 
   // 处理 429 限流错误
-  async _handle429Error(account, response, isStream = false, sessionHash = null) {
+  async _handle429Error(
+    account,
+    response,
+    isStream = false,
+    sessionHash = null,
+    gatewayRequestId = null
+  ) {
     let resetsInSeconds = null
     let errorData = null
 
@@ -796,7 +806,8 @@ class OpenAIResponsesRelayService {
       account.id,
       'openai-responses',
       sessionHash,
-      resetsInSeconds
+      resetsInSeconds,
+      gatewayRequestId
     )
 
     logger.warn('OpenAI-Responses account rate limited', {

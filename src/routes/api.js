@@ -547,6 +547,12 @@ async function handleMessagesRequest(req, res) {
                 JSON.stringify(usageData)
               )
             }
+          },
+          null,
+          {
+            gatewayRequestId: req.requestId,
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details),
+            onRetry: (reason) => requestObservation.noteRetry(reason)
           }
         )
       } else if (accountType === 'claude-console') {
@@ -654,7 +660,13 @@ async function handleMessagesRequest(req, res) {
               )
             }
           },
-          accountId
+          accountId,
+          null,
+          {
+            gatewayRequestId: req.requestId,
+            sessionHash,
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details)
+          }
         )
       } else if (accountType === 'bedrock') {
         // Bedrock账号使用Bedrock转发服务
@@ -821,7 +833,13 @@ async function handleMessagesRequest(req, res) {
               )
             }
           },
-          accountId
+          accountId,
+          null,
+          {
+            gatewayRequestId: req.requestId,
+            sessionHash,
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details)
+          }
         )
       }
 
@@ -1066,7 +1084,12 @@ async function handleMessagesRequest(req, res) {
           _apiKeyNonStream,
           req, // clientRequest 用于断开检测，保留但服务层已优化
           res,
-          _headersNonStream
+          _headersNonStream,
+          {
+            gatewayRequestId: req.requestId,
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details),
+            onRetry: (reason) => requestObservation.noteRetry(reason)
+          }
         )
       } else if (accountType === 'claude-console') {
         // Claude Console账号使用Console转发服务
@@ -1079,7 +1102,12 @@ async function handleMessagesRequest(req, res) {
           req, // clientRequest 保留用于断开检测
           res,
           _headersNonStream,
-          accountId
+          accountId,
+          {
+            gatewayRequestId: req.requestId,
+            sessionHash,
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details)
+          }
         )
       } else if (accountType === 'bedrock') {
         // Bedrock账号使用Bedrock转发服务
@@ -1128,7 +1156,12 @@ async function handleMessagesRequest(req, res) {
           req, // clientRequest 保留用于断开检测
           res,
           _headersNonStream,
-          accountId
+          accountId,
+          {
+            gatewayRequestId: req.requestId,
+            sessionHash,
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details)
+          }
         )
       }
 

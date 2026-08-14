@@ -432,7 +432,8 @@ const handleResponses = async (req, res) => {
         accountId,
         'openai',
         sessionHash,
-        resetsInSeconds
+        resetsInSeconds,
+        req.requestId
       )
 
       // 返回错误响应给客户端
@@ -513,7 +514,8 @@ const handleResponses = async (req, res) => {
           accountId,
           'openai',
           sessionHash,
-          reason
+          reason,
+          req.requestId
         )
       } catch (markError) {
         logger.error(
@@ -766,7 +768,8 @@ const handleResponses = async (req, res) => {
             accountId,
             'openai',
             sessionHash,
-            rateLimitResetsInSeconds
+            rateLimitResetsInSeconds,
+            req.requestId
           )
         } else if (upstream.status === 200) {
           const isRateLimited = await unifiedOpenAIScheduler.isAccountRateLimited(accountId)
@@ -832,7 +835,8 @@ const handleResponses = async (req, res) => {
           accountId,
           accountType || 'openai',
           sessionHash,
-          reason
+          reason,
+          req.requestId
         )
       } catch (markError) {
         logger.error('❌ Failed to mark OpenAI account unauthorized in catch handler:', markError)

@@ -13,7 +13,13 @@ const MAX_TOOL_NAMES = 64
 const MAX_TOOL_NAME_LENGTH = 128
 const MAX_HARNESS_ID_LENGTH = 64
 const MAX_HARNESS_VERSION_LENGTH = 64
-const VALID_EVENT_TYPES = new Set(['llm_request_completed', 'llm_request_error'])
+const VALID_EVENT_TYPES = new Set([
+  'llm_request_completed',
+  'llm_request_error',
+  'account_failover',
+  'sticky_session_lifecycle'
+])
+const UPSTREAM_EVENT_TYPES = new Set(['account_failover', 'sticky_session_lifecycle'])
 
 function getHeader(headers, name) {
   if (!headers || typeof headers !== 'object') {
@@ -36,6 +42,57 @@ function sanitizeToken(value, maxLength) {
   }
   const sanitized = value.trim().replace(/[^a-zA-Z0-9._-]/g, '-')
   return sanitized ? sanitized.slice(0, maxLength) : null
+}
+
+function normalizeStatusCode(value) {
+  return Number.isInteger(value) && value >= 100 && value <= 999 ? value : null
+}
+
+function recordUpstreamTelemetry(eventType, fields = {}) {
+  if (!UPSTREAM_EVENT_TYPES.has(eventType)) {
+    return false
+  }
+
+  const gatewayRequestId = sanitizeToken(fields.gatewayRequestId, 128)
+  const sessionHash = sanitizeToken(fields.sessionHash, 128)
+  if (!gatewayRequestId && !sessionHash) {
+    return false
+  }
+
+  const commonFields = {
+    schema_version: SCHEMA_VERSION,
+    event_type: eventType,
+    timestamp: new Date().toISOString()
+  }
+
+  if (eventType === 'account_failover') {
+    return Boolean(
+      logger.telemetry({
+        ...commonFields,
+        gateway_request_id: gatewayRequestId,
+        session_hash: sessionHash,
+        account_id: sanitizeToken(fields.accountId, 256),
+        account_type: sanitizeToken(fields.accountType, 128),
+        reason: sanitizeToken(fields.reason, 64),
+        upstream_status_code: normalizeStatusCode(fields.upstreamStatusCode),
+        sticky_deleted: fields.stickyDeleted === true
+      })
+    )
+  }
+
+  return Boolean(
+    logger.telemetry({
+      ...commonFields,
+      gateway_request_id: gatewayRequestId,
+      session_hash: sessionHash,
+      account_id: sanitizeToken(fields.accountId, 256),
+      account_type: sanitizeToken(fields.accountType, 128),
+      action: sanitizeToken(fields.action, 32),
+      ttl_seconds:
+        Number.isInteger(fields.ttlSeconds) && fields.ttlSeconds >= 0 ? fields.ttlSeconds : null,
+      reason: sanitizeToken(fields.reason, 64)
+    })
+  )
 }
 
 function normalizeToolNames(names) {
@@ -261,7 +318,8 @@ function finalizeTelemetry(context, outcome = {}) {
     !context ||
     context.finalized ||
     !context.gatewayRequestId ||
-    !VALID_EVENT_TYPES.has(outcome.eventType)
+    !VALID_EVENT_TYPES.has(outcome.eventType) ||
+    UPSTREAM_EVENT_TYPES.has(outcome.eventType)
   ) {
     return false
   }
@@ -352,6 +410,7 @@ module.exports = {
   finalizeTelemetry,
   hashValue,
   normalizeToolNames,
+  recordUpstreamTelemetry,
   stableSerialize,
   summarizeRequestForTelemetry,
   summarizeResponseForTelemetry

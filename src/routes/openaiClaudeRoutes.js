@@ -335,7 +335,11 @@ async function handleChatCompletion(req, res, apiKeyData) {
           claudeCodeHeaders,
           usageCallback,
           accountId,
-          streamTransformer
+          streamTransformer,
+          {
+            gatewayRequestId: req.requestId,
+            sessionHash
+          }
         )
       } else {
         // Claude Official 账户使用标准转发服务
@@ -366,7 +370,11 @@ async function handleChatCompletion(req, res, apiKeyData) {
           req,
           res,
           claudeCodeHeaders,
-          accountId
+          accountId,
+          {
+            gatewayRequestId: req.requestId,
+            sessionHash
+          }
         )
       } else {
         // Claude Official 账户使用标准转发服务

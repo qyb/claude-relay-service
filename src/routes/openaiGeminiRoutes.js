@@ -669,7 +669,13 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
     // 处理速率限制
     if (error.status === 429) {
       if (req.apiKey && account && accountSelection) {
-        await unifiedGeminiScheduler.markAccountRateLimited(account.id, 'gemini', sessionHash)
+        await unifiedGeminiScheduler.markAccountRateLimited(
+          account.id,
+          'gemini',
+          sessionHash,
+          null,
+          req.requestId
+        )
       }
     }
 

@@ -365,9 +365,13 @@ describe('LLM request observation lifecycle', () => {
     const res = new FakeResponse()
     const observer = startLlmRequestObservation(req, res)
 
+    observer.observeUpstream({ queueRequestId: 'queue-1' })
     observer.noteRetry('console concurrency full')
     observer.observeError(
-      Object.assign(new Error('upstream timeout'), { code: 'UPSTREAM_TIMEOUT' })
+      Object.assign(new Error('upstream timeout'), {
+        code: 'UPSTREAM_TIMEOUT',
+        response: { status: 429 }
+      })
     )
     res.statusCode = 504
     res.emit('finish')
@@ -376,7 +380,9 @@ describe('LLM request observation lifecycle', () => {
       event_type: 'llm_request_error',
       attempt_count: 2,
       retry_reason: 'console-concurrency-full',
+      queue_request_id: 'queue-1',
       status_code: 504,
+      upstream_status_code: 429,
       error_type: 'Error',
       error_code: 'UPSTREAM_TIMEOUT',
       response_completed: false

@@ -3,6 +3,7 @@ const geminiApiAccountService = require('./geminiApiAccountService')
 const accountGroupService = require('./accountGroupService')
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
+const { recordUpstreamTelemetry } = require('../utils/llmTelemetry')
 
 const OAUTH_PROVIDER_GEMINI_CLI = 'gemini-cli'
 const OAUTH_PROVIDER_ANTIGRAVITY = 'antigravity'
@@ -161,8 +162,18 @@ class UnifiedGeminiScheduler {
             logger.warn(
               `⚠️ Mapped account ${mappedAccount.accountId} is no longer available, selecting new account`
             )
-            await this._deleteSessionMapping(sessionHash)
+            await this._deleteSessionMapping(sessionHash, {
+              reason: 'account_error',
+              accountId: mappedAccount.accountId,
+              accountType: mappedAccount.accountType
+            })
           }
+        } else {
+          recordUpstreamTelemetry('sticky_session_lifecycle', {
+            action: 'miss',
+            sessionHash,
+            reason: 'unknown_or_expired'
+          })
         }
       }
 
@@ -537,20 +548,51 @@ class UnifiedGeminiScheduler {
       return
     }
     await client.setex(key, ttlSeconds, mappingData)
+    recordUpstreamTelemetry('sticky_session_lifecycle', {
+      action: 'set',
+      sessionHash,
+      accountId,
+      accountType,
+      ttlSeconds,
+      reason: 'first_assign'
+    })
   }
 
   // 🗑️ 删除会话映射
-  async _deleteSessionMapping(sessionHash) {
+  async _deleteSessionMapping(sessionHash, details = {}) {
     const client = redis.getClientSafe()
     if (!sessionHash) {
-      return
+      return false
     }
 
     const keys = [this._getSessionMappingKey(sessionHash)]
     for (const provider of KNOWN_OAUTH_PROVIDERS) {
       keys.push(this._getSessionMappingKey(sessionHash, provider))
     }
+    const existingMappings = []
+    for (const key of keys.filter(Boolean)) {
+      const mappingData = await client.get(key)
+      if (mappingData) {
+        existingMappings.push(mappingData)
+      }
+    }
     await client.del(keys.filter(Boolean))
+    for (const mappingData of existingMappings) {
+      let mapping = {}
+      try {
+        mapping = JSON.parse(mappingData)
+      } catch (_) {
+        mapping = {}
+      }
+      recordUpstreamTelemetry('sticky_session_lifecycle', {
+        action: 'deleted',
+        sessionHash,
+        accountId: details.accountId ?? mapping.accountId,
+        accountType: details.accountType ?? mapping.accountType,
+        reason: details.reason || 'account_error'
+      })
+    }
+    return existingMappings.length > 0
   }
 
   // 🔁 续期统一调度会话映射TTL（针对 unified_gemini_session_mapping:* 键），遵循会话配置
@@ -564,6 +606,11 @@ class UnifiedGeminiScheduler {
       const remainingTTL = await client.ttl(key)
 
       if (remainingTTL === -2) {
+        recordUpstreamTelemetry('sticky_session_lifecycle', {
+          action: 'expired',
+          sessionHash,
+          reason: 'ttl_lapse'
+        })
         return false
       }
       if (remainingTTL === -1) {
@@ -598,7 +645,13 @@ class UnifiedGeminiScheduler {
   }
 
   // 🚫 标记账户为限流状态
-  async markAccountRateLimited(accountId, accountType, sessionHash = null, resetsInSeconds = null) {
+  async markAccountRateLimited(
+    accountId,
+    accountType,
+    sessionHash = null,
+    resetsInSeconds = null,
+    gatewayRequestId = null
+  ) {
     try {
       if (accountType === 'gemini') {
         await geminiAccountService.setAccountRateLimited(accountId, true, resetsInSeconds)
@@ -609,7 +662,27 @@ class UnifiedGeminiScheduler {
 
       // 删除会话映射
       if (sessionHash) {
-        await this._deleteSessionMapping(sessionHash)
+        const stickyDeleted = await this._deleteSessionMapping(sessionHash, {
+          reason: 'failover',
+          accountId,
+          accountType
+        })
+        recordUpstreamTelemetry('account_failover', {
+          sessionHash,
+          accountId,
+          accountType,
+          reason: 'rate_limit',
+          stickyDeleted,
+          gatewayRequestId
+        })
+      } else {
+        recordUpstreamTelemetry('account_failover', {
+          accountId,
+          accountType,
+          reason: 'rate_limit',
+          stickyDeleted: false,
+          gatewayRequestId
+        })
       }
 
       return { success: true }
@@ -782,7 +855,17 @@ class UnifiedGeminiScheduler {
             }
           }
           // 如果映射的账户不可用或不在分组中，删除映射
-          await this._deleteSessionMapping(sessionHash)
+          await this._deleteSessionMapping(sessionHash, {
+            reason: 'account_error',
+            accountId: mappedAccount.accountId,
+            accountType: mappedAccount.accountType
+          })
+        } else {
+          recordUpstreamTelemetry('sticky_session_lifecycle', {
+            action: 'miss',
+            sessionHash,
+            reason: 'unknown_or_expired'
+          })
         }
       }
 

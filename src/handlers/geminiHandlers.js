@@ -658,7 +658,9 @@ async function handleMessages(req, res) {
         await unifiedGeminiScheduler.markAccountRateLimited(
           accountId,
           rateLimitAccountType,
-          sessionHash
+          sessionHash,
+          null,
+          req.requestId
         )
         logger.warn(`⚠️ Gemini account ${accountId} rate limited (/messages), marking as limited`)
       } catch (limitError) {

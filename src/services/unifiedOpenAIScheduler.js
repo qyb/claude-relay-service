@@ -3,6 +3,7 @@ const openaiResponsesAccountService = require('./openaiResponsesAccountService')
 const accountGroupService = require('./accountGroupService')
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
+const { recordUpstreamTelemetry } = require('../utils/llmTelemetry')
 
 class UnifiedOpenAIScheduler {
   constructor() {
@@ -312,8 +313,18 @@ class UnifiedOpenAIScheduler {
             logger.warn(
               `⚠️ Mapped account ${mappedAccount.accountId} is no longer available, selecting new account`
             )
-            await this._deleteSessionMapping(sessionHash)
+            await this._deleteSessionMapping(sessionHash, {
+              reason: 'account_error',
+              accountId: mappedAccount.accountId,
+              accountType: mappedAccount.accountType
+            })
           }
+        } else {
+          recordUpstreamTelemetry('sticky_session_lifecycle', {
+            action: 'miss',
+            sessionHash,
+            reason: 'unknown_or_expired'
+          })
         }
       }
 
@@ -591,12 +602,44 @@ class UnifiedOpenAIScheduler {
     const ttlHours = appConfig.session?.stickyTtlHours || 1
     const ttlSeconds = Math.max(1, Math.floor(ttlHours * 60 * 60))
     await client.setex(`${this.SESSION_MAPPING_PREFIX}${sessionHash}`, ttlSeconds, mappingData)
+    recordUpstreamTelemetry('sticky_session_lifecycle', {
+      action: 'set',
+      sessionHash,
+      accountId,
+      accountType,
+      ttlSeconds,
+      reason: 'first_assign'
+    })
   }
 
   // 🗑️ 删除会话映射
-  async _deleteSessionMapping(sessionHash) {
+  async _deleteSessionMapping(sessionHash, details = {}) {
     const client = redis.getClientSafe()
-    await client.del(`${this.SESSION_MAPPING_PREFIX}${sessionHash}`)
+    if (!sessionHash) {
+      return false
+    }
+
+    const key = `${this.SESSION_MAPPING_PREFIX}${sessionHash}`
+    const mappingData = await client.get(key)
+    await client.del(key)
+    if (!mappingData) {
+      return false
+    }
+
+    let mapping = {}
+    try {
+      mapping = JSON.parse(mappingData)
+    } catch (_) {
+      mapping = {}
+    }
+    recordUpstreamTelemetry('sticky_session_lifecycle', {
+      action: 'deleted',
+      sessionHash,
+      accountId: details.accountId ?? mapping.accountId,
+      accountType: details.accountType ?? mapping.accountType,
+      reason: details.reason || 'account_error'
+    })
+    return true
   }
 
   // 🔁 续期统一调度会话映射TTL（针对 unified_openai_session_mapping:* 键），遵循会话配置
@@ -607,6 +650,11 @@ class UnifiedOpenAIScheduler {
       const remainingTTL = await client.ttl(key)
 
       if (remainingTTL === -2) {
+        recordUpstreamTelemetry('sticky_session_lifecycle', {
+          action: 'expired',
+          sessionHash,
+          reason: 'ttl_lapse'
+        })
         return false
       }
       if (remainingTTL === -1) {
@@ -641,7 +689,13 @@ class UnifiedOpenAIScheduler {
   }
 
   // 🚫 标记账户为限流状态
-  async markAccountRateLimited(accountId, accountType, sessionHash = null, resetsInSeconds = null) {
+  async markAccountRateLimited(
+    accountId,
+    accountType,
+    sessionHash = null,
+    resetsInSeconds = null,
+    gatewayRequestId = null
+  ) {
     try {
       if (accountType === 'openai') {
         await openaiAccountService.setAccountRateLimited(accountId, true, resetsInSeconds)
@@ -661,7 +715,27 @@ class UnifiedOpenAIScheduler {
 
       // 删除会话映射
       if (sessionHash) {
-        await this._deleteSessionMapping(sessionHash)
+        const stickyDeleted = await this._deleteSessionMapping(sessionHash, {
+          reason: 'failover',
+          accountId,
+          accountType
+        })
+        recordUpstreamTelemetry('account_failover', {
+          sessionHash,
+          accountId,
+          accountType,
+          reason: 'rate_limit',
+          stickyDeleted,
+          gatewayRequestId
+        })
+      } else {
+        recordUpstreamTelemetry('account_failover', {
+          accountId,
+          accountType,
+          reason: 'rate_limit',
+          stickyDeleted: false,
+          gatewayRequestId
+        })
       }
 
       return { success: true }
@@ -679,7 +753,8 @@ class UnifiedOpenAIScheduler {
     accountId,
     accountType,
     sessionHash = null,
-    reason = 'OpenAI账号认证失败（401错误）'
+    reason = 'OpenAI账号认证失败（401错误）',
+    gatewayRequestId = null
   ) {
     try {
       if (accountType === 'openai') {
@@ -694,7 +769,29 @@ class UnifiedOpenAIScheduler {
       }
 
       if (sessionHash) {
-        await this._deleteSessionMapping(sessionHash)
+        const stickyDeleted = await this._deleteSessionMapping(sessionHash, {
+          reason: 'failover',
+          accountId,
+          accountType
+        })
+        recordUpstreamTelemetry('account_failover', {
+          sessionHash,
+          accountId,
+          accountType,
+          reason: 'unauthorized',
+          upstreamStatusCode: 401,
+          stickyDeleted,
+          gatewayRequestId
+        })
+      } else {
+        recordUpstreamTelemetry('account_failover', {
+          accountId,
+          accountType,
+          reason: 'unauthorized',
+          upstreamStatusCode: 401,
+          stickyDeleted: false,
+          gatewayRequestId
+        })
       }
 
       return { success: true }
@@ -817,7 +914,17 @@ class UnifiedOpenAIScheduler {
             }
           }
           // 如果账户不可用或不在分组中，删除映射
-          await this._deleteSessionMapping(sessionHash)
+          await this._deleteSessionMapping(sessionHash, {
+            reason: 'account_error',
+            accountId: mappedAccount.accountId,
+            accountType: mappedAccount.accountType
+          })
+        } else {
+          recordUpstreamTelemetry('sticky_session_lifecycle', {
+            action: 'miss',
+            sessionHash,
+            reason: 'unknown_or_expired'
+          })
         }
       }
 

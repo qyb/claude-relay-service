@@ -500,6 +500,9 @@ class ClaudeRelayService {
             `📬 User message queue lock acquired for account ${accountId}, requestId: ${queueRequestId}`
           )
         }
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails({ accountId, accountType, queueRequestId })
+        }
       }
 
       // 获取账户信息
@@ -601,6 +604,9 @@ class ClaudeRelayService {
           shouldRetry = response.statusCode === 403 && retryCount < maxRetries
           if (shouldRetry) {
             retryCount++
+            if (typeof requestOptions.onRetry === 'function') {
+              requestOptions.onRetry('upstream_403')
+            }
             logger.warn(
               `🔄 403 error for account ${accountId}, retry ${retryCount}/${maxRetries} after 2s`
             )
@@ -618,6 +624,9 @@ class ClaudeRelayService {
         this._isClaudeCodeCredentialError(response.body) &&
         requestOptions.useRandomizedToolNames !== true
       ) {
+        if (typeof requestOptions.onRetry === 'function') {
+          requestOptions.onRetry('credential_retry')
+        }
         requestOptions = { ...requestOptions, useRandomizedToolNames: true }
         ;({ response, retryCount } = await makeRequestWithRetries(requestOptions))
       }
@@ -691,7 +700,8 @@ class ClaudeRelayService {
             await unifiedClaudeScheduler.markAccountUnauthorized(
               accountId,
               accountType,
-              sessionHash
+              sessionHash,
+              options.gatewayRequestId
             )
           }
         }
@@ -701,14 +711,24 @@ class ClaudeRelayService {
           logger.error(
             `🚫 Forbidden error (403) detected for account ${accountId}${retryCount > 0 ? ` after ${retryCount} retries` : ''}, marking as blocked`
           )
-          await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
+          await unifiedClaudeScheduler.markAccountBlocked(
+            accountId,
+            accountType,
+            sessionHash,
+            options.gatewayRequestId
+          )
         }
         // 检查是否返回组织被禁用错误（400状态码）
         else if (organizationDisabledError) {
           logger.error(
             `🚫 Organization disabled error (400) detected for account ${accountId}, marking as blocked`
           )
-          await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
+          await unifiedClaudeScheduler.markAccountBlocked(
+            accountId,
+            accountType,
+            sessionHash,
+            options.gatewayRequestId
+          )
         }
         // 检查是否为529状态码（服务过载）
         else if (response.statusCode === 529) {
@@ -731,7 +751,14 @@ class ClaudeRelayService {
         // 检查是否为5xx状态码
         else if (response.statusCode >= 500 && response.statusCode < 600) {
           logger.warn(`🔥 Server error (${response.statusCode}) detected for account ${accountId}`)
-          await this._handleServerError(accountId, response.statusCode, sessionHash)
+          await this._handleServerError(
+            accountId,
+            response.statusCode,
+            sessionHash,
+            '',
+            accountType,
+            options.gatewayRequestId
+          )
         }
         // 检查是否为429状态码
         else if (response.statusCode === 429) {
@@ -810,7 +837,8 @@ class ClaudeRelayService {
             accountId,
             accountType,
             sessionHash,
-            rateLimitResetTimestamp
+            rateLimitResetTimestamp,
+            options.gatewayRequestId
           )
 
           if (dedicatedRateLimitMessage) {
@@ -1537,7 +1565,14 @@ class ClaudeRelayService {
         } else if (error.code === 'ETIMEDOUT') {
           errorMessage = 'Connection timed out to Claude API server'
 
-          await this._handleServerError(accountId, 504, null, 'Network')
+          await this._handleServerError(
+            accountId,
+            504,
+            null,
+            'Network',
+            'claude-official',
+            options.gatewayRequestId
+          )
         }
 
         reject(new Error(errorMessage))
@@ -1547,7 +1582,14 @@ class ClaudeRelayService {
         req.destroy()
         logger.error(`❌ Claude API request timeout (Account: ${accountId})`)
 
-        await this._handleServerError(accountId, 504, null, 'Request')
+        await this._handleServerError(
+          accountId,
+          504,
+          null,
+          'Request',
+          'claude-official',
+          options.gatewayRequestId
+        )
 
         reject(new Error('Request timeout'))
       })
@@ -1692,6 +1734,9 @@ class ClaudeRelayService {
           logger.debug(
             `📬 User message queue lock acquired for account ${accountId} (stream), requestId: ${queueRequestId}`
           )
+        }
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails({ accountId, accountType, queueRequestId })
         }
       }
 
@@ -1923,7 +1968,8 @@ class ClaudeRelayService {
                 accountId,
                 accountType,
                 sessionHash,
-                rateLimitResetTimestamp
+                rateLimitResetTimestamp,
+                requestOptions.gatewayRequestId
               )
               logger.warn(`🚫 [Stream] Rate limit detected for account ${accountId}, status 429`)
 
@@ -1958,6 +2004,9 @@ class ClaudeRelayService {
               !responseStream.headersSent
 
             if (canRetry) {
+              if (typeof requestOptions.onRetry === 'function') {
+                requestOptions.onRetry('upstream_403')
+              }
               logger.warn(
                 `🔄 [Stream] 403 error for account ${accountId}, retry ${retryCount + 1}/${maxRetries} after 2s`
               )
@@ -2027,7 +2076,8 @@ class ClaudeRelayService {
                 await unifiedClaudeScheduler.markAccountUnauthorized(
                   accountId,
                   accountType,
-                  sessionHash
+                  sessionHash,
+                  requestOptions.gatewayRequestId
                 )
               }
             } else if (res.statusCode === 403) {
@@ -2036,7 +2086,12 @@ class ClaudeRelayService {
               logger.error(
                 `🚫 [Stream] Forbidden error (403) detected for account ${accountId}${retryCount > 0 ? ` after ${retryCount} retries` : ''}, marking as blocked`
               )
-              await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
+              await unifiedClaudeScheduler.markAccountBlocked(
+                accountId,
+                accountType,
+                sessionHash,
+                requestOptions.gatewayRequestId
+              )
             } else if (res.statusCode === 529) {
               logger.warn(`🚫 [Stream] Overload error (529) detected for account ${accountId}`)
 
@@ -2062,7 +2117,14 @@ class ClaudeRelayService {
               logger.warn(
                 `🔥 [Stream] Server error (${res.statusCode}) detected for account ${accountId}`
               )
-              await this._handleServerError(accountId, res.statusCode, sessionHash, '[Stream]')
+              await this._handleServerError(
+                accountId,
+                res.statusCode,
+                sessionHash,
+                '[Stream]',
+                accountType,
+                requestOptions.gatewayRequestId
+              )
             }
           }
 
@@ -2131,7 +2193,8 @@ class ClaudeRelayService {
                   await unifiedClaudeScheduler.markAccountBlocked(
                     accountId,
                     accountType,
-                    sessionHash
+                    sessionHash,
+                    requestOptions.gatewayRequestId
                   )
                 } catch (markError) {
                   logger.error(
@@ -2465,7 +2528,8 @@ class ClaudeRelayService {
                 accountId,
                 accountType,
                 sessionHash,
-                rateLimitResetTimestamp
+                rateLimitResetTimestamp,
+                requestOptions.gatewayRequestId
               )
             }
           } else if (res.statusCode === 200) {
@@ -2624,7 +2688,8 @@ class ClaudeRelayService {
     statusCode,
     sessionHash = null,
     context = '',
-    accountType = 'claude-official'
+    accountType = 'claude-official',
+    gatewayRequestId = null
   ) {
     try {
       await claudeAccountService.recordServerError(accountId, statusCode)
@@ -2645,7 +2710,8 @@ class ClaudeRelayService {
           accountId,
           accountType,
           sessionHash,
-          300
+          300,
+          gatewayRequestId
         )
       } catch (markError) {
         logger.error(`❌ Failed to mark account temporarily unavailable: ${accountId}`, markError)

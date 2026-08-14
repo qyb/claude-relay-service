@@ -78,9 +78,7 @@ class LlmRequestObserver {
   constructor(req, res, sessionInfo, telemetryEnabled, skillSummary = null) {
     this.res = res
     this.telemetryEnabled = telemetryEnabled
-    this.context = telemetryEnabled
-      ? createTelemetryContext(req, sessionInfo, skillSummary)
-      : null
+    this.context = telemetryEnabled ? createTelemetryContext(req, sessionInfo, skillSummary) : null
     this.finishSeen = false
     this.usage = null
     this.responseSummary = null
@@ -89,6 +87,7 @@ class LlmRequestObserver {
     this.accountType = null
     this.model = req?.body?.model ?? null
     this.upstreamRequestId = null
+    this.queueRequestId = null
     this.upstreamStatusCode = null
     this.attemptCount = 1
     this.retryReason = null
@@ -113,6 +112,7 @@ class LlmRequestObserver {
     this.accountType = details.accountType ?? this.accountType
     this.provider = details.provider ?? providerForAccountType(details.accountType) ?? this.provider
     this.model = details.model ?? this.model
+    this.queueRequestId = details.queueRequestId ?? this.queueRequestId
     this.upstreamStatusCode = details.upstreamStatusCode ?? this.upstreamStatusCode
     return this
   }
@@ -138,7 +138,12 @@ class LlmRequestObserver {
     this.errorType = details.errorType ?? error?.name ?? this.errorType ?? 'request_error'
     this.errorCode = details.errorCode ?? error?.code ?? this.errorCode
     this.upstreamStatusCode =
-      details.upstreamStatusCode ?? error?.statusCode ?? error?.status ?? this.upstreamStatusCode
+      details.upstreamStatusCode ??
+      error?.response?.statusCode ??
+      error?.response?.status ??
+      error?.statusCode ??
+      error?.status ??
+      this.upstreamStatusCode
     return this
   }
 
@@ -368,6 +373,7 @@ class LlmRequestObserver {
       accountType: this.accountType,
       model: this.model,
       upstreamRequestId: this.upstreamRequestId,
+      queueRequestId: this.queueRequestId,
       usage: this.usage,
       responseSummary: this._getResponseSummary(),
       ttftMs:

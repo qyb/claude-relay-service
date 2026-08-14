@@ -10,6 +10,7 @@ const {
   finalizeTelemetry,
   hashValue,
   normalizeToolNames,
+  recordUpstreamTelemetry,
   summarizeRequestForTelemetry,
   summarizeResponseForTelemetry
 } = require('../src/utils/llmTelemetry')
@@ -292,6 +293,72 @@ describe('llmTelemetry finalization', () => {
     expect(finalizeTelemetry(context, { eventType: 'completed' })).toBe(false)
     expect(context.finalized).toBe(false)
     expect(logger.telemetry).not.toHaveBeenCalled()
+  })
+})
+
+describe('upstream telemetry events', () => {
+  beforeEach(() => {
+    logger.telemetry.mockClear()
+    logger.telemetry.mockReturnValue(true)
+  })
+
+  it('记录账号 failover 事件且只保留结构化字段', () => {
+    expect(
+      recordUpstreamTelemetry('account_failover', {
+        gatewayRequestId: 'gateway-1',
+        sessionHash: 'hash-1',
+        accountId: 'account-1',
+        accountType: 'claude-official',
+        reason: 'rate_limit',
+        upstreamStatusCode: 429,
+        stickyDeleted: true,
+        errorMessage: 'PRIVATE UPSTREAM RESPONSE'
+      })
+    ).toBe(true)
+
+    expect(logger.telemetry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        schema_version: SCHEMA_VERSION,
+        event_type: 'account_failover',
+        gateway_request_id: 'gateway-1',
+        session_hash: 'hash-1',
+        account_id: 'account-1',
+        account_type: 'claude-official',
+        reason: 'rate_limit',
+        upstream_status_code: 429,
+        sticky_deleted: true
+      })
+    )
+    expect(JSON.stringify(logger.telemetry.mock.calls[0][0])).not.toContain(
+      'PRIVATE UPSTREAM RESPONSE'
+    )
+  })
+
+  it('记录 sticky 生命周期事件并拒绝未知事件类型', () => {
+    recordUpstreamTelemetry('sticky_session_lifecycle', {
+      action: 'set',
+      sessionHash: 'hash-1',
+      accountId: 'account-1',
+      accountType: 'claude-official',
+      ttlSeconds: 3600,
+      reason: 'first_assign'
+    })
+
+    expect(logger.telemetry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'sticky_session_lifecycle',
+        action: 'set',
+        ttl_seconds: 3600
+      })
+    )
+    expect(recordUpstreamTelemetry('unknown_event', {})).toBe(false)
+    expect(
+      recordUpstreamTelemetry('account_failover', {
+        accountId: 'account-without-join-key',
+        reason: 'rate_limit'
+      })
+    ).toBe(false)
+    expect(logger.telemetry).toHaveBeenCalledTimes(1)
   })
 })
 

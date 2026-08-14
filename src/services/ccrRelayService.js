@@ -1,5 +1,6 @@
 const axios = require('axios')
 const ccrAccountService = require('./ccrAccountService')
+const unifiedClaudeScheduler = require('./unifiedClaudeScheduler')
 const logger = require('../utils/logger')
 const config = require('../../config/config')
 const { parseVendorPrefixedModel } = require('../utils/modelHelper')
@@ -82,6 +83,10 @@ class CcrRelayService {
             `📬 User message queue lock acquired for CCR account ${accountId}, requestId: ${queueRequestId}`
           )
         }
+      }
+
+      if (typeof options.onUpstreamDetails === 'function') {
+        options.onUpstreamDetails({ accountId, accountType: 'ccr', queueRequestId })
       }
 
       // 获取账户信息
@@ -261,7 +266,12 @@ class CcrRelayService {
       // 检查错误状态并相应处理
       if (response.status === 401) {
         logger.warn(`🚫 Unauthorized error detected for CCR account ${accountId}`)
-        await ccrAccountService.markAccountUnauthorized(accountId)
+        await unifiedClaudeScheduler.markAccountUnauthorized(
+          accountId,
+          'ccr',
+          options.sessionHash,
+          options.gatewayRequestId
+        )
       } else if (response.status === 429) {
         logger.warn(`🚫 Rate limit detected for CCR account ${accountId}`)
         // 收到429先检查是否因为超过了手动配置的每日额度
@@ -269,7 +279,13 @@ class CcrRelayService {
           logger.error('❌ Failed to check quota after 429 error:', err)
         })
 
-        await ccrAccountService.markAccountRateLimited(accountId)
+        await unifiedClaudeScheduler.markAccountRateLimited(
+          accountId,
+          'ccr',
+          options.sessionHash,
+          null,
+          options.gatewayRequestId
+        )
       } else if (response.status === 529) {
         logger.warn(`🚫 Overload error detected for CCR account ${accountId}`)
         await ccrAccountService.markAccountOverloaded(accountId)
@@ -410,6 +426,10 @@ class CcrRelayService {
             `📬 User message queue lock acquired for CCR account ${accountId} (stream), requestId: ${queueRequestId}`
           )
         }
+      }
+
+      if (typeof options.onUpstreamDetails === 'function') {
+        options.onUpstreamDetails({ accountId, accountType: 'ccr', queueRequestId })
       }
 
       // 获取账户信息
@@ -597,9 +617,20 @@ class CcrRelayService {
             )
 
             if (response.status === 401) {
-              ccrAccountService.markAccountUnauthorized(accountId)
+              await unifiedClaudeScheduler.markAccountUnauthorized(
+                accountId,
+                'ccr',
+                requestOptions.sessionHash,
+                requestOptions.gatewayRequestId
+              )
             } else if (response.status === 429) {
-              ccrAccountService.markAccountRateLimited(accountId)
+              await unifiedClaudeScheduler.markAccountRateLimited(
+                accountId,
+                'ccr',
+                requestOptions.sessionHash,
+                null,
+                requestOptions.gatewayRequestId
+              )
               // 检查是否因为超过每日额度
               ccrAccountService.checkQuotaUsage(accountId).catch((err) => {
                 logger.error('❌ Failed to check quota after 429 error:', err)

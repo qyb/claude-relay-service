@@ -1,6 +1,7 @@
 const axios = require('axios')
 const { v4: uuidv4 } = require('uuid')
 const claudeConsoleAccountService = require('./claudeConsoleAccountService')
+const unifiedClaudeScheduler = require('./unifiedClaudeScheduler')
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
 const config = require('../../config/config')
@@ -137,6 +138,9 @@ class ClaudeConsoleRelayService {
           logger.debug(
             `📬 User message queue lock acquired for console account ${accountId}, requestId: ${queueRequestId}`
           )
+        }
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails({ accountId, accountType: 'claude-console', queueRequestId })
         }
       }
 
@@ -380,7 +384,12 @@ class ClaudeConsoleRelayService {
           `🚫 Unauthorized error detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
         )
         if (!autoProtectionDisabled) {
-          await claudeConsoleAccountService.markAccountUnauthorized(accountId)
+          await unifiedClaudeScheduler.markAccountUnauthorized(
+            accountId,
+            'claude-console',
+            options.sessionHash,
+            options.gatewayRequestId
+          )
         }
       } else if (accountDisabledError) {
         logger.error(
@@ -390,7 +399,14 @@ class ClaudeConsoleRelayService {
         const errorDetails =
           typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
         if (!autoProtectionDisabled) {
-          await claudeConsoleAccountService.markConsoleAccountBlocked(accountId, errorDetails)
+          await unifiedClaudeScheduler.markAccountBlocked(
+            accountId,
+            'claude-console',
+            options.sessionHash,
+            options.gatewayRequestId,
+            errorDetails,
+            400
+          )
         }
       } else if (response.status === 429) {
         logger.warn(
@@ -403,7 +419,13 @@ class ClaudeConsoleRelayService {
 
         if (!autoProtectionDisabled) {
           const resetTimestamp = parseZhipu429ResetTime(response.data)
-          await claudeConsoleAccountService.markAccountRateLimited(accountId, resetTimestamp)
+          await unifiedClaudeScheduler.markAccountRateLimited(
+            accountId,
+            'claude-console',
+            options.sessionHash,
+            resetTimestamp,
+            options.gatewayRequestId
+          )
         }
       } else if (response.status === 529) {
         logger.warn(
@@ -588,6 +610,9 @@ class ClaudeConsoleRelayService {
           logger.debug(
             `📬 User message queue lock acquired for console account ${accountId} (stream), requestId: ${queueRequestId}`
           )
+        }
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails({ accountId, accountType: 'claude-console', queueRequestId })
         }
       }
 
@@ -878,7 +903,12 @@ class ClaudeConsoleRelayService {
                   `🚫 [Stream] Unauthorized error detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
                 )
                 if (!autoProtectionDisabled) {
-                  await claudeConsoleAccountService.markAccountUnauthorized(accountId)
+                  await unifiedClaudeScheduler.markAccountUnauthorized(
+                    accountId,
+                    'claude-console',
+                    requestOptions.sessionHash,
+                    requestOptions.gatewayRequestId
+                  )
                 }
               } else if (accountDisabledError) {
                 logger.error(
@@ -886,9 +916,13 @@ class ClaudeConsoleRelayService {
                 )
                 // 传入完整的错误详情到 webhook
                 if (!autoProtectionDisabled) {
-                  await claudeConsoleAccountService.markConsoleAccountBlocked(
+                  await unifiedClaudeScheduler.markAccountBlocked(
                     accountId,
-                    errorDataForCheck
+                    'claude-console',
+                    requestOptions.sessionHash,
+                    requestOptions.gatewayRequestId,
+                    errorDataForCheck,
+                    400
                   )
                 }
               } else if (response.status === 429) {
@@ -901,9 +935,12 @@ class ClaudeConsoleRelayService {
                 })
                 if (!autoProtectionDisabled) {
                   const resetTimestamp = parseZhipu429ResetTime(errorDataForCheck)
-                  await claudeConsoleAccountService.markAccountRateLimited(
+                  await unifiedClaudeScheduler.markAccountRateLimited(
                     accountId,
-                    resetTimestamp
+                    'claude-console',
+                    requestOptions.sessionHash,
+                    resetTimestamp,
+                    requestOptions.gatewayRequestId
                   )
                 }
               } else if (response.status === 529) {
@@ -1234,10 +1271,29 @@ class ClaudeConsoleRelayService {
           // 检查错误状态
           if (error.response) {
             if (error.response.status === 401) {
-              claudeConsoleAccountService.markAccountUnauthorized(accountId)
+              unifiedClaudeScheduler
+                .markAccountUnauthorized(
+                  accountId,
+                  'claude-console',
+                  requestOptions.sessionHash,
+                  requestOptions.gatewayRequestId
+                )
+                .catch((markError) => {
+                  logger.error('❌ Failed to mark Claude Console account unauthorized:', markError)
+                })
             } else if (error.response.status === 429) {
               const resetTimestamp = parseZhipu429ResetTime(error.response.data)
-              claudeConsoleAccountService.markAccountRateLimited(accountId, resetTimestamp)
+              unifiedClaudeScheduler
+                .markAccountRateLimited(
+                  accountId,
+                  'claude-console',
+                  requestOptions.sessionHash,
+                  resetTimestamp,
+                  requestOptions.gatewayRequestId
+                )
+                .catch((markError) => {
+                  logger.error('❌ Failed to mark Claude Console account rate limited:', markError)
+                })
               // 检查是否因为超过每日额度
               claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
                 logger.error('❌ Failed to check quota after 429 error:', err)
