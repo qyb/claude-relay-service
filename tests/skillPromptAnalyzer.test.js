@@ -5,16 +5,12 @@ jest.mock('../src/utils/logger', () => ({
 
 const {
   SkillPromptAnalyzer,
-  RULE_VERSION,
   classifyPromptSource,
-  extractSkillsFromText,
   parseInvokedSkills,
-  parseCommandMarkers,
-  stripOuterSystemReminder
+  parseCommandMarkers
 } = require('../src/utils/skillPromptAnalyzer')
 
 const SESSION_A = '11111111-1111-4111-8111-111111111111'
-const SESSION_B = '22222222-2222-4222-8222-222222222222'
 
 function sessionInfo(clientSessionId = SESSION_A) {
   return {

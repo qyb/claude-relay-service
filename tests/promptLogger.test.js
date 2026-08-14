@@ -284,7 +284,7 @@ describe('PromptLogger LRU retention', () => {
     promptLogger.recordRequest(buildRequest([userText(rawPrompt)]), sessionInfo())
 
     const record = writeRecord.mock.calls[0][0]
-    expect(record.prompt).toMatch(/^  password=\[MASKED:password:[0-9a-f]{8}\]\n第二行  $/)
+    expect(record.prompt).toMatch(/^ {2}password=\[MASKED:password:[0-9a-f]{8}\]\n第二行 {2}$/)
     expect(record.prompt).not.toContain('password=secret')
     expect(record.prompt_length).toBe(rawPrompt.length)
     expect(record).toMatchObject({

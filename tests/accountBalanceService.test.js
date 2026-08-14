@@ -169,7 +169,9 @@ describe('AccountBalanceService', () => {
     expect(claudeBucketCached.cooldown.models).toHaveLength(1)
     expect(claudeBucketCached.cooldown.models[0].modelId).toBe('claude-opus-4-5-thinking')
 
-    const flashBucketCached = cachedResult.data.quota.buckets.find((b) => b.category === 'Gemini Flash')
+    const flashBucketCached = cachedResult.data.quota.buckets.find(
+      (b) => b.category === 'Gemini Flash'
+    )
     expect(flashBucketCached.cooldown).toBeTruthy()
     expect(flashBucketCached.cooldown.models).toHaveLength(1)
     expect(flashBucketCached.cooldown.models[0].modelId).toBe('gemini-2.0-flash')
