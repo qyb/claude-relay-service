@@ -102,7 +102,7 @@ The following skills are available for use with the Skill tool:
     expect(classifyPromptSource(listText)).toBe('system_reminder')
   })
 
-  it('7. 普通 system reminder 被标为低置信度 (heuristic)，而不是确定 SKILL', () => {
+  it('7. 普通 system reminder 完全拆出 SKILL 指标，不再违反计数不变量', () => {
     const analyzer = new SkillPromptAnalyzer()
     const reminderText = '<system-reminder>Generic environment note</system-reminder>'
 
@@ -111,11 +111,22 @@ The following skills are available for use with the Skill tool:
     }
 
     const { summary, skillRecords } = analyzer.analyze(requestBody, sessionInfo(), 'key-1')
-    expect(summary.skill_detected).toBe(true)
-    expect(summary.skill_detection_confidence).toBe('heuristic')
-    expect(summary.skill_detection_types).toContain('generic_system_reminder')
+    // SKILL 指标不为通用 reminder 置位：newly + reinjected (0) <= skill_count (0) 恒成立
+    expect(summary.skill_detected).toBe(false)
+    expect(summary.skill_detection_confidence).toBeNull()
+    expect(summary.skill_detection_types).toEqual([])
     expect(summary.skill_names).toHaveLength(0)
     expect(summary.skill_count).toBe(0)
+    expect(summary.skill_injection_count).toBe(0)
+    expect(summary.skill_newly_injected_count).toBe(0)
+    expect(summary.skill_reinjected_count).toBe(0)
+    // 通用 reminder 走独立字段
+    expect(summary.system_reminder_detected).toBe(true)
+    expect(summary.system_reminder_count).toBe(1)
+    expect(summary.system_reminder_detection_types).toContain('generic_system_reminder')
+    expect(summary.system_reminder_newly_injected_count).toBe(1)
+    expect(summary.system_reminder_chars).toBeGreaterThan(0)
+    // 明文记录仍然生成，prompt_source 标记为 system_reminder
     expect(skillRecords).toHaveLength(1)
     expect(skillRecords[0].skill_name).toBeNull()
     expect(skillRecords[0].skill_detection_confidence).toBe('heuristic')
@@ -202,7 +213,7 @@ Run eslint on modified files
     expect(res2.skillRecords[0].skill_injection_kind).toBe('newly_injected')
   })
 
-  it('system prompt 中未变化的 system-reminder 判为 carried_over', () => {
+  it('system prompt 中未变化的 system-reminder 判为 carried_over，计入 reminder 指标', () => {
     const analyzer = new SkillPromptAnalyzer()
     const systemSkill = '<system-reminder>Runtime guidance</system-reminder>'
     const request = {
@@ -213,9 +224,10 @@ Run eslint on modified files
     const first = analyzer.analyze(request, sessionInfo(), 'key-1')
     const second = analyzer.analyze(request, sessionInfo(), 'key-1')
 
-    expect(first.summary.skill_newly_injected_count).toBe(1)
-    expect(second.summary.skill_newly_injected_count).toBe(0)
-    expect(second.summary.skill_reinjected_count).toBe(0)
+    expect(first.summary.skill_newly_injected_count).toBe(0)
+    expect(first.summary.system_reminder_newly_injected_count).toBe(1)
+    expect(second.summary.system_reminder_newly_injected_count).toBe(0)
+    expect(second.summary.system_reminder_reinjected_count).toBe(0)
     expect(second.skillRecords).toHaveLength(0)
   })
 
@@ -292,6 +304,217 @@ Code review body text
       skill_injection_kind: 're_injected',
       skill_rehydrated: true
     })
+  })
+
+  it('消息附加其他文本不再导致同一 SKILL 误判为重新注入', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const skillText =
+      '<system-reminder><command-message>linter</command-message><skill-format>true</skill-format>Body</system-reminder>'
+
+    analyzer.analyze(
+      { messages: [{ role: 'user', content: [{ type: 'text', text: skillText }] }] },
+      sessionInfo(),
+      'key-1'
+    )
+    const result = analyzer.analyze(
+      {
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: skillText },
+              { type: 'text', text: 'extra appended text' }
+            ]
+          }
+        ]
+      },
+      sessionInfo(),
+      'key-1'
+    )
+
+    expect(result.summary.skill_newly_injected_count).toBe(0)
+    expect(result.summary.skill_reinjected_count).toBe(0)
+    expect(result.skillRecords).toHaveLength(0)
+  })
+
+  it('同一请求内直接从 command marker 变为恢复结构判为 re_injected 且 rehydrated', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const originalSkill = `<system-reminder>
+<command-message>reviewer</command-message>
+<skill-format>true</skill-format>
+Code review body text
+</system-reminder>`
+
+    const rehydratedSkill = `<system-reminder>
+The following skills were invoked in this session:
+
+### Skill: reviewer
+Path: /skills/reviewer/SKILL.md
+
+Code review body text
+</system-reminder>`
+
+    // 请求 1: 原始注入
+    analyzer.analyze(
+      { messages: [{ role: 'user', content: [{ type: 'text', text: originalSkill }] }] },
+      sessionInfo(),
+      'key-1'
+    )
+
+    // 请求 2: 压缩在一步内完成，直接出现恢复结构（没有中间“消失”请求）
+    const result = analyzer.analyze(
+      {
+        messages: [
+          { role: 'user', content: 'compacted summary of history' },
+          { role: 'user', content: [{ type: 'text', text: rehydratedSkill }] }
+        ]
+      },
+      sessionInfo(),
+      'key-1'
+    )
+
+    expect(result.summary.skill_reinjected_count).toBe(1)
+    expect(result.summary.skill_rehydrated).toBe(true)
+    expect(result.skillRecords).toHaveLength(1)
+    expect(result.skillRecords[0]).toMatchObject({
+      skill_name: 'reviewer',
+      skill_injection_kind: 're_injected',
+      skill_rehydrated: true
+    })
+  })
+
+  it('skill_injection_count 统计本次请求的实例数，包含 carried_over 实例', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const skill1 =
+      '<system-reminder><command-message>skill-one</command-message><skill-format>true</skill-format>Skill 1</system-reminder>'
+    const skill2 =
+      '<system-reminder><command-message>skill-two</command-message><skill-format>true</skill-format>Skill 2</system-reminder>'
+
+    analyzer.analyze(
+      { messages: [{ role: 'user', content: [{ type: 'text', text: skill1 }] }] },
+      sessionInfo(),
+      'key-1'
+    )
+    const result = analyzer.analyze(
+      {
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: skill1 }] },
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: [{ type: 'text', text: skill2 }] }
+        ]
+      },
+      sessionInfo(),
+      'key-1'
+    )
+
+    // 不变量：newly (1) + reinjected (0) <= injection_count (2)
+    expect(result.summary.skill_injection_count).toBe(2)
+    expect(result.summary.skill_newly_injected_count).toBe(1)
+    expect(result.summary.skill_reinjected_count).toBe(0)
+    expect(
+      result.summary.skill_newly_injected_count + result.summary.skill_reinjected_count
+    ).toBeLessThanOrEqual(result.summary.skill_injection_count)
+  })
+
+  it('超过扫描上限时截断并记录自观测字段', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const filler = 'x'.repeat(600 * 1024)
+
+    const result = analyzer.analyze(
+      { messages: [{ role: 'user', content: filler }] },
+      sessionInfo(),
+      'key-1'
+    )
+
+    expect(result.summary.analysis_truncated).toBe(true)
+    expect(result.summary.analysis_scanned_chars).toBe(512 * 1024)
+    expect(result.summary.analysis_duration_ms).toBeGreaterThanOrEqual(0)
+    // 无 marker 的纯文本不产生任何检测结果
+    expect(result.summary.skill_detected).toBe(false)
+  })
+
+  it('旧历史耗尽扫描预算时，末尾和 system 的 Skill 仍被检测', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const filler = 'x'.repeat(600 * 1024)
+    const lateSkill =
+      '<system-reminder><command-message>late-skill</command-message><skill-format>true</skill-format>Late body</system-reminder>'
+    const systemSkill =
+      '<system-reminder><command-message>system-skill</command-message><skill-format>true</skill-format>System body</system-reminder>'
+    const messages = [
+      { role: 'user', content: filler },
+      { role: 'user', content: filler },
+      { role: 'user', content: filler },
+      { role: 'user', content: filler },
+      { role: 'user', content: [{ type: 'text', text: lateSkill }] }
+    ]
+
+    const result = analyzer.analyze({ system: systemSkill, messages }, sessionInfo(), 'key-1')
+
+    expect(result.summary.skill_names).toContain('late-skill')
+    expect(result.summary.skill_names).toContain('system-skill')
+    expect(result.summary.analysis_truncated).toBe(true)
+  })
+
+  it('单次扫描字符量硬性封顶在 2MB', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const filler = 'y'.repeat(500 * 1024)
+    const messages = [0, 1, 2, 3, 4].map(() => ({ role: 'user', content: filler }))
+
+    const result = analyzer.analyze({ messages }, sessionInfo(), 'key-1')
+
+    expect(result.summary.analysis_scanned_chars).toBeLessThanOrEqual(2 * 1024 * 1024)
+    expect(result.summary.analysis_truncated).toBe(true)
+  })
+
+  it('通用 reminder 出现→消失→再出现计为 re_injected', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const reminder = '<system-reminder>Runtime guidance</system-reminder>'
+
+    analyzer.analyze(
+      { messages: [{ role: 'user', content: [{ type: 'text', text: reminder }] }] },
+      sessionInfo(),
+      'key-1'
+    )
+    analyzer.analyze(
+      { messages: [{ role: 'user', content: 'compacted, reminder gone' }] },
+      sessionInfo(),
+      'key-1'
+    )
+    const third = analyzer.analyze(
+      {
+        messages: [
+          { role: 'assistant', content: 'hi' },
+          { role: 'user', content: [{ type: 'text', text: reminder }] }
+        ]
+      },
+      sessionInfo(),
+      'key-1'
+    )
+
+    expect(third.summary.system_reminder_newly_injected_count).toBe(0)
+    expect(third.summary.system_reminder_reinjected_count).toBe(1)
+  })
+
+  it('__proto__ 等特殊 Skill 名称不会污染状态表', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const skillText =
+      '<system-reminder><command-message>__proto__</command-message><skill-format>true</skill-format>Body</system-reminder>'
+
+    const first = analyzer.analyze(
+      { messages: [{ role: 'user', content: [{ type: 'text', text: skillText }] }] },
+      sessionInfo(),
+      'key-1'
+    )
+    const second = analyzer.analyze(
+      { messages: [{ role: 'user', content: [{ type: 'text', text: skillText }] }] },
+      sessionInfo(),
+      'key-1'
+    )
+
+    expect(first.summary.skill_newly_injected_count).toBe(1)
+    // 状态未被原型污染时，第二次应正确判为 carried_over
+    expect(second.summary.skill_newly_injected_count).toBe(0)
+    expect(second.summary.skill_reinjected_count).toBe(0)
   })
 
   it('12. session 状态 LRU 有界，超量淘汰不导致错误', () => {

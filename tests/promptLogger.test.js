@@ -284,19 +284,25 @@ describe('PromptLogger LRU retention', () => {
     promptLogger.recordRequest(buildRequest([userText(rawPrompt)]), sessionInfo())
 
     const record = writeRecord.mock.calls[0][0]
-    expect(record.prompt).toMatch(/^ {2}password=\[MASKED:password:[0-9a-f]{8}\]\n第二行 {2}$/)
+    expect(record.prompt).toMatch(/^ {2}password=\[MASKED:password:[0-9a-f]{16}\]\n第二行 {2}$/)
     expect(record.prompt).not.toContain('password=secret')
     expect(record.prompt_length).toBe(rawPrompt.length)
     expect(record).toMatchObject({
-      mask_version: '2026.08.14',
+      mask_version: '2026.08.15',
       mask_count: 1
     })
+    expect(record.mask_key_id).toMatch(/^ek-[0-9a-f]{8}$/)
     expect(record).toMatchObject({
       event_type: 'user_prompt_observed',
       api_key_record_id: 'key-record-1',
       client_session_id: SESSION_A,
-      model: 'claude-sonnet-test'
+      model: 'claude-sonnet-test',
+      prompt_source: 'human',
+      prompt_source_rule_version: 3,
+      schema_version: 2
     })
+    // 测试环境未配置 ENCRYPTION_KEY，prompt hash 使用进程随机密钥（ephemeral-）
+    expect(record.hash_key_id).toMatch(/^(ek|ephemeral)-[0-9a-f]{8}$/)
   })
 
   it('8. SKILL 明文只进入 skill_prompt_observed，不污染 user_prompt_observed', () => {
@@ -353,6 +359,62 @@ Run eslint on modified files
     expect(isHumanPrompt('The following skills were invoked in this session:\n### Skill: x')).toBe(
       false
     )
+  })
+
+  it('isHumanPrompt 排除 suggestion/recap/系统通知/自动分类器等机器模板', () => {
+    expect(isHumanPrompt('[SUGGESTION MODE: draft a follow-up]')).toBe(false)
+    expect(isHumanPrompt('[SYSTEM NOTIFICATION - NOT USER INPUT] build finished')).toBe(false)
+    expect(
+      isHumanPrompt('This session is being continued from a previous conversation.\nSummary...')
+    ).toBe(false)
+    expect(isHumanPrompt('[AUTO MODE] classify the request')).toBe(false)
+    expect(isHumanPrompt('Base directory for this skill: /home/user/.claude/skills/x')).toBe(false)
+    // 未收录的方括号头按员工输入保留（[TODO]/[BUG] 等前缀是常见研发写法），
+    // 宁可漏判机器也不误杀员工输入
+    expect(isHumanPrompt('[SOME UNKNOWN MACHINE HEADER] payload')).toBe(true)
+  })
+
+  it('机器模板不被记录为员工 Prompt', () => {
+    const writeRecord = jest.fn(() => true)
+    const promptLogger = new PromptLogger({ writeRecord })
+
+    const result = promptLogger.recordRequest(
+      buildRequest([userText('[SUGGESTION MODE: draft a follow-up]')]),
+      sessionInfo()
+    )
+
+    expect(result).toMatchObject({ logged: false, reason: 'no_prompt' })
+    expect(writeRecord).not.toHaveBeenCalled()
+  })
+
+  it('skill_path 中的用户目录被归一化为 $HOME 前缀', () => {
+    const writeRecord = jest.fn(() => true)
+    const promptLogger = new PromptLogger({ writeRecord })
+
+    promptLogger.recordRequest(buildRequest([userText('human prompt')]), sessionInfo(), [
+      {
+        prompt_source: 'skill_injection',
+        skill_name: 'x',
+        skill_path: '/home/alice/.claude/skills/x/SKILL.md',
+        prompt: 'body'
+      },
+      {
+        prompt_source: 'skill_injection',
+        skill_name: 'y',
+        skill_path: 'C:\\Users\\bob\\.claude\\skills\\y\\SKILL.md',
+        prompt: 'body'
+      }
+    ])
+
+    const paths = writeRecord.mock.calls
+      .filter((call) => call[0].event_type === 'skill_prompt_observed')
+      .map((call) => call[0].skill_path)
+    expect(paths).toEqual([
+      '$HOME/.claude/skills/x/SKILL.md',
+      '$HOME\\.claude\\skills\\y\\SKILL.md'
+    ])
+    expect(JSON.stringify(writeRecord.mock.calls)).not.toContain('alice')
+    expect(JSON.stringify(writeRecord.mock.calls)).not.toContain('bob')
   })
 
   it('保留 system_reminder 的 prompt_source', () => {

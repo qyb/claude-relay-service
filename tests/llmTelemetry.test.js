@@ -304,6 +304,24 @@ describe('llmTelemetry finalization', () => {
     })
   })
 
+  it('未知价格保留 cost=null 而不是 0，且 schema 版本为 2', () => {
+    const context = createTelemetryContext(
+      buildRequest({ body: { model: 'totally-unknown-model', stream: false } }),
+      buildSessionInfo()
+    )
+
+    finalizeTelemetry(context, {
+      eventType: 'llm_request_completed',
+      model: 'totally-unknown-model',
+      usage: { input_tokens: 1000, output_tokens: 10 }
+    })
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      schema_version: 2,
+      cost: null,
+      has_pricing: false
+    })
+  })
+
   it('缺少 gateway request ID 时拒绝终态', () => {
     const request = buildRequest()
     delete request.requestId
@@ -397,14 +415,24 @@ describe('llmTelemetry skill summary fields', () => {
     const context = createTelemetryContext(buildRequest(), buildSessionInfo(), {
       skill_detected: true,
       skill_detection_confidence: 'exact_marker',
-      skill_detection_rule_version: 1,
+      skill_detection_rule_version: 2,
       skill_detection_types: ['invoked_skills'],
       skill_names: ['verify'],
       skill_count: 1,
+      skill_injection_count: 2,
       skill_chars: 18420,
       skill_newly_injected_count: 1,
       skill_reinjected_count: 0,
-      skill_rehydrated: false
+      skill_rehydrated: false,
+      system_reminder_detected: true,
+      system_reminder_count: 3,
+      system_reminder_detection_types: ['generic_system_reminder'],
+      system_reminder_chars: 900,
+      system_reminder_newly_injected_count: 2,
+      system_reminder_reinjected_count: 1,
+      analysis_duration_ms: 2,
+      analysis_scanned_chars: 2048,
+      analysis_truncated: false
     })
 
     finalizeTelemetry(context, { eventType: 'llm_request_completed' })
@@ -412,14 +440,24 @@ describe('llmTelemetry skill summary fields', () => {
     expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
       skill_detected: true,
       skill_detection_confidence: 'exact_marker',
-      skill_detection_rule_version: 1,
+      skill_detection_rule_version: 2,
       skill_detection_types: ['invoked_skills'],
       skill_names: ['verify'],
       skill_count: 1,
+      skill_injection_count: 2,
       skill_chars: 18420,
       skill_newly_injected_count: 1,
       skill_reinjected_count: 0,
-      skill_rehydrated: false
+      skill_rehydrated: false,
+      system_reminder_detected: true,
+      system_reminder_count: 3,
+      system_reminder_detection_types: ['generic_system_reminder'],
+      system_reminder_chars: 900,
+      system_reminder_newly_injected_count: 2,
+      system_reminder_reinjected_count: 1,
+      skill_analysis_duration_ms: 2,
+      skill_analysis_scanned_chars: 2048,
+      skill_analysis_truncated: false
     })
   })
 

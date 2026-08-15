@@ -9,7 +9,8 @@ const crypto = require('crypto')
 const logger = require('./logger')
 const pricingService = require('../services/pricingService')
 
-const SCHEMA_VERSION = 1
+// v2：未知价格时 cost 保留 null（不再写 0），并透传 skill/system-reminder 拆分指标
+const SCHEMA_VERSION = 2
 const MAX_TOOL_NAMES = 64
 const MAX_TOOL_NAME_LENGTH = 128
 const MAX_HARNESS_ID_LENGTH = 64
@@ -347,7 +348,8 @@ function finalizeTelemetry(context, outcome = {}) {
         outcome.model ?? context.model,
         { apiUrl: outcome.apiUrl ?? context.apiUrl }
       )
-      cost = costResult.hasPricing ? costResult.totalCost : 0
+      // 未知价格保留 null，避免消费者把“未知”聚合为“免费”；只有确认价格才写数值
+      cost = costResult.hasPricing ? costResult.totalCost : null
       hasPricing = costResult.hasPricing === true
       pricingModel = costResult.pricing_model ?? null
       pricingRegion = costResult.region ?? null
@@ -371,6 +373,9 @@ function finalizeTelemetry(context, outcome = {}) {
         skill_count: Number.isInteger(effectiveSkillSummary.skill_count)
           ? effectiveSkillSummary.skill_count
           : 0,
+        skill_injection_count: Number.isInteger(effectiveSkillSummary.skill_injection_count)
+          ? effectiveSkillSummary.skill_injection_count
+          : 0,
         skill_chars: Number.isInteger(effectiveSkillSummary.skill_chars)
           ? effectiveSkillSummary.skill_chars
           : 0,
@@ -382,7 +387,36 @@ function finalizeTelemetry(context, outcome = {}) {
         skill_reinjected_count: Number.isInteger(effectiveSkillSummary.skill_reinjected_count)
           ? effectiveSkillSummary.skill_reinjected_count
           : 0,
-        skill_rehydrated: effectiveSkillSummary.skill_rehydrated === true
+        skill_rehydrated: effectiveSkillSummary.skill_rehydrated === true,
+        system_reminder_detected: effectiveSkillSummary.system_reminder_detected === true,
+        system_reminder_count: Number.isInteger(effectiveSkillSummary.system_reminder_count)
+          ? effectiveSkillSummary.system_reminder_count
+          : 0,
+        system_reminder_detection_types: Array.isArray(
+          effectiveSkillSummary.system_reminder_detection_types
+        )
+          ? effectiveSkillSummary.system_reminder_detection_types
+          : [],
+        system_reminder_chars: Number.isInteger(effectiveSkillSummary.system_reminder_chars)
+          ? effectiveSkillSummary.system_reminder_chars
+          : 0,
+        system_reminder_newly_injected_count: Number.isInteger(
+          effectiveSkillSummary.system_reminder_newly_injected_count
+        )
+          ? effectiveSkillSummary.system_reminder_newly_injected_count
+          : 0,
+        system_reminder_reinjected_count: Number.isInteger(
+          effectiveSkillSummary.system_reminder_reinjected_count
+        )
+          ? effectiveSkillSummary.system_reminder_reinjected_count
+          : 0,
+        skill_analysis_duration_ms: Number.isInteger(effectiveSkillSummary.analysis_duration_ms)
+          ? effectiveSkillSummary.analysis_duration_ms
+          : null,
+        skill_analysis_scanned_chars: Number.isInteger(effectiveSkillSummary.analysis_scanned_chars)
+          ? effectiveSkillSummary.analysis_scanned_chars
+          : null,
+        skill_analysis_truncated: effectiveSkillSummary.analysis_truncated === true
       }
     : {}
 

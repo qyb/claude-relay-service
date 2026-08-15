@@ -282,8 +282,8 @@ skill_chars
 
 以 `api_key_record_id + client_session_id` 为范围，在内存中维护有界的 LRU 状态，保存每个 session 最近一次请求的：
 
-- 消息内容 hash 列表（按消息索引）；
-- 已见过的 SKILL 内容 hash 及其首次出现的标记格式（command marker 或 rehydrate 结构）。
+- 每个消息位置（messageIndex，system 为 -1）上活跃实例的内容 hash 集合；
+- 已见过的 SKILL 内容 hash 及其最近一次出现的标记格式（command marker 或 rehydrate 结构），名称表同样记录最近格式；通用 reminder 使用独立的有界历史 hash 表（支持出现→消失→再出现的 `re_injected` 判定）。以上历史表均设有每 session 条目上限（256），防止长会话无界膨胀。
 
 LRU 的 key 直接复用 `promptLogger` 导出的 `buildPromptSessionKey(apiKeyId, clientSessionId)`（即对 `apiKeyId + "\0" + "anthropic" + "\0" + normalizedSessionId` 取 SHA-256），不重复实现构造逻辑，也不在内存中保存原始 apiKeyId 字符串。
 
@@ -291,24 +291,27 @@ LRU 的 key 直接复用 `promptLogger` 导出的 `buildPromptSessionKey(apiKeyI
 对本次请求中检测到的每个 SKILL，与上一次请求对比后分类为：
 
 ```text
-carried_over      内容位于未变化的历史消息中（索引与 hash 均一致）
+carried_over      同一消息位置上出现相同内容的实例（含消息其余部分被修改的情况）
 newly_injected    内容出现在上一次请求不存在的新消息中
-re_injected       内容此前存在、随后消失、本次又出现在新位置
+re_injected       内容此前存在、随后消失、本次又出现；或直接从注入格式变为恢复结构
 ```
 
 分类规则：
 
-- hash 与索引都匹配上一次请求 → `carried_over`；
-- hash 未见过，或出现在新增索引处 → `newly_injected`；
-- hash 见过但上一次请求中不存在，本次出现在新索引 → `re_injected`。
+- 同一 messageIndex 上存在相同内容 hash（system 位置额外要求整体 system hash 一致）→ `carried_over`。判定不依赖整条消息的 hash：消息中附加或修改其他文本不会把延续中的 SKILL 误判为重新注入；
+- 内容 hash 或名称未见过，或出现在新位置且上一请求仍活跃 → `newly_injected`；
+- 内容 hash 或名称见过，且上一请求已消失 → `re_injected`；
+- 名称见过且上一请求仍以 command marker 等注入格式活跃，本次直接以恢复结构（`### Skill:` / `Path:`）出现 → `re_injected`。这覆盖压缩在一步内完成的场景（没有中间“消失”请求）。
 
-`re_injected` 且本次标记格式为恢复结构（`### Skill:` / `Path:`）时，判定为压缩恢复：
+`re_injected` 且本次标记格式为恢复结构时，判定为压缩恢复：
 
 ```text
 skill_rehydrated = true
 ```
 
 由于原始注入与恢复注入的标记格式可区分（见 3.3），该判定通常是强信号，不再需要 `unknown` 三态。
+
+已知限制（暂缓处理）：父代理与子代理可能共享根 session id，请求交错时后到的请求会覆盖 LRU 状态，导致父代理的延续被误判为 `re_injected`。在用真实日志验证该场景的实际发生率之前，`re_injected` / `skill_rehydrated` 不应用于员工级横向比较；修复方向是引入叶级上下文标识（如上下文指纹）并允许同一根 session 下并存多条状态分支。
 
 状态说明：
 
@@ -323,25 +326,38 @@ skill_rehydrated = true
 {
   "skill_detected": true,
   "skill_detection_confidence": "exact_marker",
-  "skill_detection_rule_version": 1,
+  "skill_detection_rule_version": 2,
   "skill_detection_types": ["invoked_skills"],
   "skill_names": ["verify"],
   "skill_count": 2,
+  "skill_injection_count": 3,
   "skill_chars": 18420,
   "skill_newly_injected_count": 1,
   "skill_reinjected_count": 0,
-  "skill_rehydrated": false
+  "skill_rehydrated": false,
+  "system_reminder_detected": false,
+  "system_reminder_count": 0,
+  "system_reminder_detection_types": [],
+  "system_reminder_chars": 0,
+  "system_reminder_newly_injected_count": 0,
+  "system_reminder_reinjected_count": 0,
+  "skill_analysis_duration_ms": 1,
+  "skill_analysis_scanned_chars": 51200,
+  "skill_analysis_truncated": false
 }
 ```
 
 字段定义（消除聚合歧义）：
 
 - `skill_names`：本次请求快照中检测到的全部 SKILL 名称（含 `carried_over`），清洗、去重后按字典序排序；
-- `skill_count`：`skill_names` 的元素数量，是本次请求的瞬态计数而非 session 累计。不变量：`skill_newly_injected_count + skill_reinjected_count <= skill_count`；
+- `skill_count`：`skill_names` 的元素数量，即唯一 Skill 名称数，是本次请求的瞬态计数而非 session 累计；
+- `skill_injection_count`：本次请求快照中的 SKILL 注入实例数（含 `carried_over`，含未识别名称的实例）。不变量：`skill_newly_injected_count + skill_reinjected_count <= skill_injection_count`；
 - `skill_chars`：本次请求快照中所有 SKILL 文本的字符总和（含 `carried_over`），见 §7.4；
-- `skill_newly_injected_count` / `skill_reinjected_count`：本次新增/重新注入的 SKILL 数量；
-- `skill_detection_confidence`：取本次所有检测结果中的最高置信度；
-- `skill_rehydrated`：本次请求中任一 SKILL 满足压缩恢复判定即为 `true`。
+- `skill_newly_injected_count` / `skill_reinjected_count`：本次新增/重新注入的 SKILL 实例数量；
+- `skill_detection_confidence`：取本次所有 SKILL 检测结果中的最高置信度；
+- `skill_rehydrated`：本次请求中任一 SKILL 满足压缩恢复判定即为 `true`；
+- `system_reminder_*`：通用 `<system-reminder>`（未匹配到 SKILL 结构）的独立指标，与 SKILL 指标完全分开计数，二者不可互相抵扣或求和。通用 reminder 的明文仍按 §9.2 写入 `skill_prompt_observed`（`prompt_source=system_reminder`），但不进入任何 `skill_*` 计数；
+- `skill_analysis_*`：分析器自观测字段——耗时、扫描字符数和是否因超过扫描上限被截断（单块 512KB、单请求累计 2MB，按剩余预算钳制）。扫描顺序为 system 优先、messages 从最新到最旧：预算耗尽时优先保住末尾新注入内容和 system。检测实例超过 64 个同样置 truncated。`skill_analysis_truncated=true` 时本请求的检测为部分结果。
 
 
 ### 8.1 名称字段策略
@@ -354,20 +370,22 @@ SKILL 名称和路径在 `exact_marker` 或 `strong_pattern` 下直接保存清�
 
 ### 9.1 Prompt 来源分类
 
-提取 Prompt 时增加内部分类：
+提取 Prompt 时按 `promptSourceClassifier` 的规则分类（`prompt_source_rule_version` 随规则演进递增）：
 
 ```text
-prompt_source = human
-prompt_source = skill_injection
-prompt_source = system_reminder
-prompt_source = tool_result
-prompt_source = unknown_meta
+prompt_source = human            员工自然语言输入
+prompt_source = skill            SKILL 命令/注入标记、Base directory 等
+prompt_source = system           <system-reminder>、技能列表、local-command-stdout
+prompt_source = suggestion       [SUGGESTION MODE: ...]
+prompt_source = recap            离开后恢复上下文的会话延续请求
+prompt_source = auto_classifier  自动分类器请求
+prompt_source = unknown          空输入
 ```
 
-- `prompt_source=human`：写入现有 `user_prompt_observed` 记录（明文）；
-- `prompt_source=skill_injection`：写入新的 `skill_prompt_observed` 记录（明文）；
-- `prompt_source=system_reminder`：写入 `skill_prompt_observed` 记录（明文），并在记录中保留该来源类型；这类内容仍按 `heuristic` 或实际匹配到的置信度处理，不因此视为确定的 SKILL；
-- 其余来源不写入明文记录。
+- `prompt_source=human`：写入现有 `user_prompt_observed` 记录，并在记录中保留 `prompt_source` 与 `prompt_source_rule_version`；
+- `prompt_source=skill`：写入新的 `skill_prompt_observed` 记录（记录内 `prompt_source=skill_injection`）；
+- `prompt_source=system`：写入 `skill_prompt_observed` 记录（记录内 `prompt_source=system_reminder`），按 `heuristic` 或实际匹配到的置信度处理；
+- 其余来源（`suggestion` / `recap` / `auto_classifier` / `unknown`）一律不进入 `user_prompt_observed`，也不进入员工行为统计。机器模板只匹配稳定、明确的标记（XML 标签、固定头短语、已在真实日志中出现过的机器方括号头白名单），不做自然语言片段猜测，也不使用宽泛的方括号兜底：研发常用 `[TODO]`/`[BUG]` 等前缀写 Prompt，未收录的机器模板宁可按 human 漏判进员工统计，也不误杀员工输入；通过 `prompt_source_rule_version` 迭代逐步收敛。
 
 ### 9.2 `skill_prompt_observed` 记录（包括 SKILL 与 `system-reminder`）
 
@@ -398,7 +416,16 @@ prompt_source = unknown_meta
 落盘范围：
 
 - 只记录 `newly_injected` 和 `re_injected` 的 SKILL 或 `system-reminder` 明文；
-- `carried_over` 的内容位于未变化的历史消息前缀中，每个请求都会完整重发，逐请求落盘会产生大量重复记录；更重要的是，它大概率已被上游 Prompt Cache 命中，边际成本远低于全价输入，不构成需要单独记录的新注入事件。因此只进入 telemetry 的 `skill_count` 和 `skill_chars` 计数，不写明文记录。
+- `carried_over` 的内容位于未变化的历史消息前缀中，每个请求都会完整重发，逐请求落盘会产生大量重复记录；更重要的是，它大概率已被上游 Prompt Cache 命中，边际成本远低于全价输入，不构成需要单独记录的新注入事件。因此只进入 telemetry 的 `skill_count`、`skill_injection_count` 和 `skill_chars` 计数，不写明文记录。
+
+### 9.2.1 写盘前脱敏与可关联性元字段
+
+`user_prompt_observed` 与 `skill_prompt_observed` 的正文均先经过 `promptMasker` 再写盘。规则是部分脱敏而非安全边界，但包含高熵兜底：未命中任何规则前缀的高熵疑似密钥默认替换为 `[MASKED:high_entropy:<fingerprint>]`，并触发限频告警与 `suspected_secret=true`（两类记录都告警）。候选 token 先剥离 CJK 前后缀和边缘标点、再提取连续 ASCII 片段判定，避免“中文句子 + 密钥”整体豁免；URL token 不整体豁免，其中高熵的 query 参数值（如 `X-Amz-Signature`）单独替换为 `[MASKED:url_param:<fingerprint>]`；代码片段、多级文件路径不受影响。记录携带以下可复核元字段：
+
+- `prompt_hash` / `hash_key_id`：`user_prompt_observed` 的去重 hash 是带独立密钥的 HMAC-SHA256（非原文普通 hash），防止低熵敏感文本被离线字典枚举。未配置 `ENCRYPTION_KEY` 时密钥为进程随机值，`hash_key_id` 带 `ephemeral-` 前缀，提示跨进程不可关联；
+- `mask_key_id`：脱敏指纹密钥的 id，同一密钥下的指纹可跨请求关联；
+- `entity_fingerprints`：部分遮蔽的 PII（手机号/身份证/邮箱）额外保留的 HMAC 指纹，用于跨请求实体关联，展示值保持人类可读（如 `135****78`）；
+- `skill_path`：写入前将 `/home/<user>`、`/Users/<user>`、`C:\Users\<user>` 前缀归一化为 `$HOME`，避免客户端用户名落盘。
 
 
 ### 9.3 排除规则
@@ -474,7 +501,7 @@ skill_newly_injected_count / skill_reinjected_count
 
 ### 12.1 落盘边界
 
-本项目面向工作用途，明文记录不以隐私脱敏为目标。SKILL、`system-reminder` 注入明文和员工 Prompt 明文均写入 `prompt-log` 的独立 transport，并沿用其访问控制；telemetry 仍然不含任何明文。
+本项目面向工作用途，明文记录不以隐私脱敏为目标，但所有落盘正文仍先经过 `promptMasker` 的规则型部分脱敏（含高熵兜底替换，见 §9.2.1）。SKILL、`system-reminder` 注入正文和员工 Prompt 均写入 `prompt-log` 的独立 transport，并沿用其访问控制；telemetry 仍然不含任何正文。
 
 以下内容默认不落盘，原因是减少无关信息、控制日志体积并避免为非目标数据增加解析和 schema 设计；这不是基于隐私禁止，未来若有明确审计需求可以单独扩展：
 
@@ -515,7 +542,9 @@ analyzeSkillInjection(requestBody, previousState)
 // skillRecords: 待落盘的 newly_injected / re_injected SKILL 或 system-reminder 明文片段数组
 
 classifyPromptSource(textBlock)
-// → 'human' | 'skill_injection' | 'system_reminder' | 'tool_result' | 'unknown_meta'
+// → 'human' | 'skill_injection' | 'system_reminder' | 'unknown_meta'（analyzer 侧兼容口径）
+// promptSourceClassifier.classifyPromptSource(text)
+// → 'human' | 'skill' | 'system' | 'suggestion' | 'recap' | 'auto_classifier' | 'unknown'
 ```
 
 职责划分与调用顺序：
