@@ -9,6 +9,7 @@ const {
   parseInvokedSkills,
   parseCommandMarkers
 } = require('../src/utils/skillPromptAnalyzer')
+const { AgentContextResolver } = require('../src/utils/agentContext')
 
 const SESSION_A = '11111111-1111-4111-8111-111111111111'
 
@@ -493,6 +494,165 @@ Code review body text
 
     expect(third.summary.system_reminder_newly_injected_count).toBe(0)
     expect(third.summary.system_reminder_reinjected_count).toBe(1)
+  })
+
+  it('父子代理共享根 session 时状态按 agent_context_id 隔离，不串线', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const skillText =
+      '<system-reminder><command-message>linter</command-message><skill-format>true</skill-format>Body</system-reminder>'
+
+    const parentRequest = {
+      system: 'parent system prompt',
+      tools: [{ name: 'Read' }],
+      messages: [
+        { role: 'user', content: 'parent task' },
+        { role: 'user', content: [{ type: 'text', text: skillText }] }
+      ]
+    }
+    const subagentRequest = {
+      system: 'subagent system prompt',
+      messages: [{ role: 'user', content: 'subagent task' }]
+    }
+
+    const parentCtx = { agentContextId: 'parent-ctx-0001' }
+    const subagentCtx = { agentContextId: 'subagent-ctx-0002' }
+
+    // parent-1: 新注入
+    const r1 = analyzer.analyze(parentRequest, sessionInfo(), 'key-1', parentCtx)
+    expect(r1.summary.skill_newly_injected_count).toBe(1)
+    // subagent-1: 独立上下文，不影响 parent 状态
+    analyzer.analyze(subagentRequest, sessionInfo(), 'key-1', subagentCtx)
+    // parent-2: 与 parent-1 完全相同 → carried_over，而非 re_injected
+    const r3 = analyzer.analyze(parentRequest, sessionInfo(), 'key-1', parentCtx)
+    expect(r3.summary.skill_newly_injected_count).toBe(0)
+    expect(r3.summary.skill_reinjected_count).toBe(0)
+    expect(r3.skillRecords).toHaveLength(0)
+
+    // 无 agentContextId 时回退 session 级状态（旧请求 2 与请求 3 串线的场景）
+    const r4 = analyzer.analyze(parentRequest, sessionInfo(), 'key-1', null)
+    expect(r4.summary.skill_newly_injected_count).toBe(1)
+  })
+
+  it('回归：压缩替换首条用户消息后，Skill rehydrate 仍可识别（resolver alias）', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const resolver = new AgentContextResolver({ cacheSize: 8 })
+    const scopeKey = 'resolver-scope-compression'
+    const config = {
+      system: 'main system prompt',
+      tools: [{ name: 'Read' }, { name: 'Edit' }]
+    }
+
+    const originalSkill = `<system-reminder>
+<command-message>reviewer</command-message>
+<skill-format>true</skill-format>
+Code review body text
+</system-reminder>`
+    const rehydratedSkill = `<system-reminder>
+The following skills were invoked in this session:
+
+### Skill: reviewer
+Path: /skills/reviewer/SKILL.md
+
+Code review body text
+</system-reminder>`
+
+    // 请求 1：原始注入（首条消息是真实员工 Prompt）
+    const ctx1 = resolver.resolve(
+      {
+        ...config,
+        messages: [
+          { role: 'user', content: 'fix the test' },
+          { role: 'user', content: [{ type: 'text', text: originalSkill }] }
+        ]
+      },
+      scopeKey
+    )
+    analyzer.analyze(
+      {
+        ...config,
+        messages: [
+          { role: 'user', content: 'fix the test' },
+          { role: 'user', content: [{ type: 'text', text: originalSkill }] }
+        ]
+      },
+      sessionInfo(),
+      'key-1',
+      ctx1
+    )
+
+    // 请求 2：压缩后首条消息被 continuation summary 替换，skill 以恢复结构重现
+    const compressedMessages = [
+      {
+        role: 'user',
+        content:
+          'This session is being continued from a previous conversation that ran out of context. Summary of analysis so far...'
+      },
+      { role: 'user', content: [{ type: 'text', text: rehydratedSkill }] }
+    ]
+    const ctx2 = resolver.resolve({ ...config, messages: compressedMessages }, scopeKey)
+    // alias 迁移生效：压缩前后是同一个叶级上下文
+    expect(ctx2.agentContextId).toBe(ctx1.agentContextId)
+
+    const result = analyzer.analyze(
+      { ...config, messages: compressedMessages },
+      sessionInfo(),
+      'key-1',
+      ctx2
+    )
+
+    expect(result.summary.skill_reinjected_count).toBe(1)
+    expect(result.summary.skill_rehydrated).toBe(true)
+    expect(result.summary.skill_newly_injected_count).toBe(0)
+    expect(result.skillRecords[0]).toMatchObject({
+      skill_name: 'reviewer',
+      skill_injection_kind: 're_injected',
+      skill_rehydrated: true
+    })
+  })
+
+  it('回归：同配置兄弟 A、B 都登记后，B 压缩不得复用 A 的 SKILL 状态', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const resolver = new AgentContextResolver({ cacheSize: 8 })
+    const scopeKey = 'resolver-scope-sibling-skill'
+    const config = {
+      system: 'shared subagent system',
+      tools: [{ name: 'Grep' }]
+    }
+    const skillText =
+      '<system-reminder><command-message>linter</command-message><skill-format>true</skill-format>Body</system-reminder>'
+
+    // A 登记并注入 SKILL；B 登记自己的首消息分支
+    const ctxA = resolver.resolve(
+      { ...config, messages: [{ role: 'user', content: 'task A' }] },
+      scopeKey
+    )
+    analyzer.analyze(
+      { ...config, messages: [{ role: 'user', content: [{ type: 'text', text: skillText }] }] },
+      sessionInfo(),
+      'key-1',
+      ctxA
+    )
+    resolver.resolve({ ...config, messages: [{ role: 'user', content: 'task B' }] }, scopeKey)
+
+    // B 压缩：独立新分支，其 SKILL 实例必须按新上下文判定（newly_injected），
+    // 而不是继承 A 的活跃状态被判 carried_over
+    const bCompressed = {
+      ...config,
+      messages: [
+        {
+          role: 'user',
+          content:
+            'This session is being continued from a previous conversation. Summary of task B analysis...'
+        },
+        { role: 'user', content: [{ type: 'text', text: skillText }] }
+      ]
+    }
+    const ctxBCompressed = resolver.resolve(bCompressed, scopeKey)
+    expect(ctxBCompressed.agentContextId).not.toBe(ctxA.agentContextId)
+
+    const result = analyzer.analyze(bCompressed, sessionInfo(), 'key-1', ctxBCompressed)
+    expect(result.summary.skill_newly_injected_count).toBe(1)
+    expect(result.summary.skill_reinjected_count).toBe(0)
   })
 
   it('__proto__ 等特殊 Skill 名称不会污染状态表', () => {

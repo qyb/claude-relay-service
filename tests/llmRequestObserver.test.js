@@ -9,8 +9,37 @@ jest.mock('../src/utils/logger', () => ({
 
 jest.mock('../src/utils/promptLogger', () => {
   const crypto = require('crypto')
+  // 与真实 extractLatestUserMessageText 同语义：只读最后一条 user 消息，
+  // 没有顶层 text block（tool_result-only）时返回 null，不跨消息回溯
+  const extractLatestUserMessageText = (body) => {
+    const messages = body?.messages
+    if (!Array.isArray(messages)) {
+      return null
+    }
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i]
+      if (message?.role !== 'user') {
+        continue
+      }
+      if (typeof message.content === 'string') {
+        return message.content.trim() ? message.content : null
+      }
+      if (!Array.isArray(message.content)) {
+        return null
+      }
+      for (let j = message.content.length - 1; j >= 0; j -= 1) {
+        const block = message.content[j]
+        if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+          return block.text
+        }
+      }
+      return null
+    }
+    return null
+  }
   return {
     recordRequest: jest.fn(),
+    extractLatestUserMessageText: jest.fn(extractLatestUserMessageText),
     // 与真实 buildPromptSessionKey 保持一致的构造方式
     buildPromptSessionKey: (apiKeyId, clientSessionId) => {
       if (
@@ -137,6 +166,160 @@ describe('LLM request observation lifecycle', () => {
     sessionHelper.extractClientSessionId.mockReturnValue(SESSION_INFO)
   })
 
+  it('P0 端到端：主上下文与 Auto 上下文交错时目的正确、SKILL 状态不串线', () => {
+    logger.isPromptLogEnabled.mockReturnValue(true)
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    // 独立 session，避免与其它用例共享目的分类器的上下文注册表
+    const sessionInfo = {
+      clientSessionId: '99999999-9999-4999-8999-999999999999',
+      source: 'header',
+      stickySessionKey: '99999999-9999-4999-8999-999999999999'
+    }
+    sessionHelper.extractClientSessionId.mockReturnValue(sessionInfo)
+
+    const parentBody = {
+      model: 'claude-sonnet-test',
+      stream: false,
+      system: [{ type: 'text', text: 'parent system prompt' }],
+      tools: [{ name: 'Read' }, { name: 'Edit' }],
+      messages: [
+        { role: 'user', content: 'parent task' },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: '<system-reminder><command-message>linter</command-message><skill-format>true</skill-format>Body</system-reminder>'
+            }
+          ]
+        },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'continue the task' }
+      ]
+    }
+    const autoBody = {
+      model: 'claude-sonnet-test',
+      stream: false,
+      system: [{ type: 'text', text: 'classifier system prompt' }],
+      messages: [
+        { role: 'user', content: 'action under review' },
+        { role: 'user', content: '\nErr on the side of blocking. Stage 1 judge.' }
+      ]
+    }
+
+    const finish = (body, requestId) => {
+      const req = buildRequest({ requestId, body })
+      const res = new FakeResponse()
+      startLlmRequestObservation(req, res)
+      res.emit('finish')
+    }
+
+    finish(parentBody, 'parent-1')
+    finish(autoBody, 'auto-1')
+    finish(parentBody, 'parent-2')
+
+    expect(logger.telemetry).toHaveBeenCalledTimes(3)
+    const [parent1, auto1, parent2] = logger.telemetry.mock.calls.map((call) => call[0])
+
+    // 目的正确：主上下文 human，Auto 上下文 auto_classifier
+    expect(parent1.request_purpose).toBe('human')
+    expect(auto1).toMatchObject({
+      request_purpose: 'auto_classifier',
+      purpose_template_id: 'auto_stage1_block'
+    })
+    expect(parent2.request_purpose).toBe('human')
+
+    // 上下文隔离：Auto 与主上下文的 agent_context_id 不同，主上下文前后一致
+    expect(auto1.agent_context_id).not.toBe(parent1.agent_context_id)
+    expect(parent2.agent_context_id).toBe(parent1.agent_context_id)
+    expect(parent1.root_session_id).toBe(sessionInfo.clientSessionId)
+
+    // SKILL 增量状态不串线：parent-2 中的 SKILL 是 carried_over 而非 re_injected
+    expect(parent2).toMatchObject({
+      skill_newly_injected_count: 0,
+      skill_reinjected_count: 0
+    })
+    expect(parent2.skill_names).toContain('linter')
+  })
+
+  it('回归：tool_result-only 尾部的工具续跑请求判为 background，不错归因 human', () => {
+    logger.isPromptLogEnabled.mockReturnValue(true)
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const sessionInfo = {
+      clientSessionId: '88888888-8888-4888-8888-888888888888',
+      source: 'header',
+      stickySessionKey: '88888888-8888-4888-8888-888888888888'
+    }
+    sessionHelper.extractClientSessionId.mockReturnValue(sessionInfo)
+
+    const req = buildRequest({
+      requestId: 'tool-continuation-1',
+      body: {
+        model: 'claude-sonnet-test',
+        stream: false,
+        system: 'stable system',
+        tools: [{ name: 'Read' }],
+        messages: [
+          { role: 'user', content: 'fix the test' },
+          { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash' }] },
+          {
+            role: 'user',
+            content: [{ type: 'tool_result', tool_use_id: 't1', content: 'output' }]
+          }
+        ]
+      }
+    })
+    const res = new FakeResponse()
+    startLlmRequestObservation(req, res)
+    res.emit('finish')
+
+    // 严格提取器不回溯：latestUserText 为 null，purpose 走结构信号 background
+    expect(promptLogger.recordRequest).toHaveBeenCalledWith(
+      expect.anything(),
+      sessionInfo,
+      expect.any(Array),
+      expect.objectContaining({
+        request_purpose: 'background',
+        purpose_source: 'structure',
+        latestUserText: null
+      })
+    )
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      request_purpose: 'background',
+      purpose_source: 'structure'
+    })
+  })
+
+  it('回归：Prompt Log 与 telemetry 对同一请求携带一致且非空的 agent_context_id', () => {
+    logger.isPromptLogEnabled.mockReturnValue(true)
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const sessionInfo = {
+      clientSessionId: '77777777-7777-4777-8777-777777777777',
+      source: 'header',
+      stickySessionKey: '77777777-7777-4777-8777-777777777777'
+    }
+    sessionHelper.extractClientSessionId.mockReturnValue(sessionInfo)
+
+    const req = buildRequest({
+      requestId: 'ctx-consistency-1',
+      body: {
+        model: 'claude-sonnet-test',
+        stream: false,
+        system: 'stable system',
+        tools: [{ name: 'Read' }],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'human prompt' }] }]
+      }
+    })
+    const res = new FakeResponse()
+    startLlmRequestObservation(req, res)
+    res.emit('finish')
+
+    const purposeInfo = promptLogger.recordRequest.mock.calls[0][3]
+    const telemetryRecord = logger.telemetry.mock.calls[0][0]
+    expect(purposeInfo.agent_context_id).toMatch(/^[0-9a-f]{16}$/)
+    expect(telemetryRecord.agent_context_id).toBe(purposeInfo.agent_context_id)
+  })
+
   it('两个功能都关闭时不提取 session、不包装 response', () => {
     const req = buildRequest()
     const res = new FakeResponse()
@@ -162,7 +345,12 @@ describe('LLM request observation lifecycle', () => {
     expect(second).toBe(first)
     expect(sessionHelper.extractClientSessionId).toHaveBeenCalledTimes(1)
     expect(promptLogger.recordRequest).toHaveBeenCalledTimes(1)
-    expect(promptLogger.recordRequest).toHaveBeenCalledWith(req, SESSION_INFO, [])
+    expect(promptLogger.recordRequest).toHaveBeenCalledWith(
+      req,
+      SESSION_INFO,
+      [],
+      expect.objectContaining({ request_purpose: 'human', latestUserText: 'human prompt' })
+    )
   })
 
   it('session 提取失败时按无 session 继续，不阻断 Prompt 和 telemetry', () => {
@@ -184,7 +372,8 @@ describe('LLM request observation lifecycle', () => {
         source: 'none',
         stickySessionKey: null
       },
-      []
+      [],
+      expect.objectContaining({ request_purpose: 'human' })
     )
     expect(logger.telemetry).toHaveBeenCalledTimes(1)
     expect(logger.error).toHaveBeenCalledWith(
@@ -425,7 +614,12 @@ describe('LLM request observation lifecycle', () => {
 
     try {
       expect(() => startLlmRequestObservation(req, res)).not.toThrow()
-      expect(promptLogger.recordRequest).toHaveBeenCalledWith(req, SESSION_INFO, [])
+      expect(promptLogger.recordRequest).toHaveBeenCalledWith(
+        req,
+        SESSION_INFO,
+        [],
+        expect.objectContaining({ request_purpose: 'human' })
+      )
       res.emit('finish')
 
       expect(logger.telemetry).toHaveBeenCalledTimes(1)

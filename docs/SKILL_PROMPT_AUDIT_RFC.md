@@ -311,7 +311,7 @@ skill_rehydrated = true
 
 由于原始注入与恢复注入的标记格式可区分（见 3.3），该判定通常是强信号，不再需要 `unknown` 三态。
 
-已知限制（暂缓处理）：父代理与子代理可能共享根 session id，请求交错时后到的请求会覆盖 LRU 状态，导致父代理的延续被误判为 `re_injected`。在用真实日志验证该场景的实际发生率之前，`re_injected` / `skill_rehydrated` 不应用于员工级横向比较；修复方向是引入叶级上下文标识（如上下文指纹）并允许同一根 session 下并存多条状态分支。
+父代理与子代理共享根 session 的串线问题（v3 已修复）：2026-08-15 生产日志确认同一 `client_session_id` 内 79 工具主上下文与 0 工具 Auto 上下文交错 32 次，曾导致父代理延续被误判为 `re_injected`。自 v3 起，状态键为 `apiKeyId + rootSessionId + agentContextId`，`agentContextId` 由 system hash、tool schema hash 与首条用户消息指纹组合派生（见 `agentContext.js`），各上下文维护独立状态分支；客户端将来提供真实 agent ID 后可直接替换派生值。压缩会把首条用户消息替换为 continuation summary，因此 `agentContextId` 的首消息组件经 `AgentContextResolver` 在同 scope + 同 system/tool 配置内做 alias 迁移（单分支时；多兄弟分支时禁止 alias，见 §9.0），压缩前后落在同一状态分支，`re_injected`/`skill_rehydrated` 识别不因上下文 id 变化而丢失。
 
 状态说明：
 
@@ -367,6 +367,35 @@ SKILL 名称和路径在 `exact_marker` 或 `strong_pattern` 下直接保存清�
 ## 9. Prompt Log 变更
 
 `prompt-log` 记录明文的能力扩展到 SKILL 和 `system-reminder` 机器注入内容，同时与员工输入严格分离。
+
+### 9.0 请求目的与叶级上下文（P0-1 / P0-2）
+
+每个请求在 observer 入口判定 `request_purpose` 并派生 `agent_context_id`，两条链路（prompt-log 与 telemetry）都携带：
+
+```text
+request_purpose = human | auto_classifier | recap | suggestion
+                | skill_execution | subagent | background | unknown
+```
+
+判定优先级（`requestPurposeClassifier.js`，`purpose_rule_version`），并输出 `purpose_source` 标识本次判定走的是哪一级（`header` / `template` / `skill_marker` / `context_role` / `human_text` / `skill_instance` / `structure`），供消费方区分强信号与启发式：
+
+1. 客户端显式 header `x-crs-request-purpose`（枚举校验，未来的标准通道）→ `purpose_source=header`；
+2. 真实日志取证的机器模板指纹（auto stage-1/stage-2、stepped-away recap、suggestion mode、user-interrupted）；模板命中时 `prompt_source` 同步为对应机器来源（`auto_classifier`/`recap`/`suggestion`/`system`），避免 `request_purpose` 与 `prompt_source` 相互矛盾 → `template`；
+3. SKILL 执行标记 → `skill_execution`，`skill_marker`；
+4. 上下文角色：非主上下文 → `subagent`（依据 `agent_context_id`，无需读正文），`context_role`；
+5. 最新 user 文本为员工自然语言 → `human`，`human_text`（`[TODO]`/`[BUG]` 等研发前缀不误杀）；
+6. 无新人工文本但上下文中存在 SKILL 实例 → `skill_execution`，`skill_instance`；
+7. 结构信号：无新人工文本且 message_count > 1 → `background`（否则 `unknown`），`structure`。
+
+**输入口径**：purpose 判定只读取“最后一条 user 消息”的顶层文本块（`promptLogger.extractLatestUserMessageText`），不跨消息回溯。工具续跑请求的尾部 user 消息往往只含 `tool_result`，此时文本为 null，purpose 走 `background`/`skill_execution`——若回溯到历史人工 Prompt，会把每轮工具续跑的 token/cost 错归因为员工输入。
+
+**主上下文选举（临时启发式）**：在客户端提供真实 agent ID 之前，primary 角色由网关推断，不是确定性事实。规则：primary 在该 root session 内**首次**出现“可信 human 主上下文”（无模板命中、无 header 机器目的、文本为员工自然语言）时一次性固定，此后不再变更；命中模板的 Auto/recap/suggestion 请求不参与选举，避免 Auto 先到吞掉主上下文；也不按请求数重新挑选，避免高频子代理翻转角色。已知局限：不仅网关重启、多实例路由会错过主上下文的首个 human 请求，**父子请求本身并发或乱序也会让先到的自然语言子代理当选**，真正主上下文随后被判 `subagent`。因此选举与命中都输出 `agent_context_role_source`：`elected_primary`（本请求自我当选，低置信度）与 `registry_primary`（命中已固定注册表）；报表应将 `elected_primary` 的归类视为待确认，并尽快接入客户端真实 agent 标识。
+
+`agent_context_id` = SHA-256(`system_prompt_hash | tool_schema_hash | first_user_message_hash`) 前 16 hex（`agentContext.js`）。身份分层：system + tool schema 是稳定主身份；首条用户消息只是同配置兄弟上下文的辅助分支。三个组件指纹均用 `hmacKeyring` 的独立用途密钥（`agent-context:v1`）计算 HMAC——固定系统提示词、工具 schema 与低熵 Prompt 一样可被普通 SHA 前缀的离线字典枚举，防护口径必须一致——并输出 `context_key_id`（`ek-` 为配置密钥，`ephemeral-` 为进程随机密钥），密钥轮换后按它分组比较。上下文压缩会把首条消息替换为 continuation summary，`AgentContextResolver` 在同 scope（apiKey + root session）同 system/tool 配置内维护分支登记：summary 首消息在配置下**只登记过一个分支**时回退到该分支（alias 迁移），保证压缩前后 `agent_context_id` 稳定、SKILL 增量状态链与 rehydrate 识别不被打断；**已登记多个分支**（同配置兄弟上下文 A、B）时无证据指向哪个分支，禁止 alias 到 canonical，退化为以 summary 自身指纹为独立新分支——宁可让压缩后状态重置（`carried_over` 退化为 `newly_injected`），也不把 B 的请求与 SKILL 状态串到 A。scope 不可用时退化为无状态派生。
+
+purpose 分类器的上下文注册表按 `apiKeyId + rootSessionId` 的哈希范围隔离（不同 API Key 复用相同 session id 时互不影响），并对每个 root session 的上下文计数设置上限（64，超量淘汰计数最少的非 primary 条目），防止首条消息变化、动态 system/tool 或大量子代理造成状态膨胀。生产日志已验证 79 工具主上下文与 0 工具 Auto 上下文据此完全可分。telemetry 记录增加 `root_session_id`、`agent_context_id`、`context_fingerprint`、`context_key_id`、`parent_gateway_request_id`（预留，网关侧无法可靠获得父子关系，报表不应按它做关联）、`request_purpose`、`purpose_rule_version`、`purpose_source`、`purpose_template_id`、`agent_context_role`、`agent_context_role_source`。
+
+落盘分流：只有 `request_purpose=human` 写 `user_prompt_observed`（明文 + 脱敏）；其余目的写 `machine_prompt_observed`（schema v3，仅 `template_id`/`prompt_hash`/`prompt_length` 等结构化统计，无正文）。注意 `machine_prompt_observed` 按 session + 文本哈希去重，适合减少日志量，**不能**用于统计真实机器调用次数；调用次数、token、成本必须以 telemetry 的逐请求 `request_purpose` 为准。2026-08-15 日志回放：83 条旧“员工”记录中 49 human、16 auto_classifier、15 skill_execution、3 recap——机器污染从 41% 降为 0。
 
 ### 9.1 Prompt 来源分类
 

@@ -292,8 +292,10 @@ function getUsageFields(usage) {
   }
 }
 
-function createTelemetryContext(req, sessionInfo, skillSummary = null) {
+function createTelemetryContext(req, sessionInfo, skillSummary = null, requestMeta = {}) {
   const startTimeMs = Date.now()
+  const agentContext = requestMeta?.agentContext || {}
+  const purposeInfo = requestMeta?.purposeInfo || {}
   return {
     finalized: false,
     startTimeMs,
@@ -312,6 +314,16 @@ function createTelemetryContext(req, sessionInfo, skillSummary = null) {
     clientSessionId: sessionInfo?.clientSessionId ?? null,
     sessionIdSource: sessionInfo?.source ?? null,
     stickySessionKey: sessionInfo?.stickySessionKey ?? null,
+    // P0-1/P0-2：请求目的与叶级上下文标识（由 observer 在入口派生）
+    requestPurpose: purposeInfo.request_purpose ?? 'unknown',
+    purposeRuleVersion: purposeInfo.purpose_rule_version ?? null,
+    purposeSource: purposeInfo.purpose_source ?? null,
+    purposeTemplateId: purposeInfo.template_id ?? null,
+    agentContextId: agentContext.agentContextId ?? null,
+    contextFingerprint: agentContext.contextFingerprint ?? null,
+    contextKeyId: agentContext.contextKeyId ?? null,
+    agentContextRole: purposeInfo.agent_context_role ?? null,
+    agentContextRoleSource: purposeInfo.agent_context_role_source ?? null,
     requestSummary: summarizeRequestForTelemetry(req?.body, req?.headers),
     skillSummary: skillSummary || null
   }
@@ -433,6 +445,18 @@ function finalizeTelemetry(context, outcome = {}) {
     client_session_id: context.clientSessionId,
     session_id_source: context.sessionIdSource,
     sticky_session_key: context.stickySessionKey,
+    root_session_id: context.clientSessionId,
+    agent_context_id: context.agentContextId,
+    context_fingerprint: context.contextFingerprint,
+    context_key_id: context.contextKeyId,
+    // 客户端将来提供真实父子关系时填充；当前网关侧无法可靠获得
+    parent_gateway_request_id: null,
+    request_purpose: context.requestPurpose,
+    purpose_rule_version: context.purposeRuleVersion,
+    purpose_source: context.purposeSource,
+    purpose_template_id: context.purposeTemplateId,
+    agent_context_role: context.agentContextRole,
+    agent_context_role_source: context.agentContextRoleSource,
     ...context.requestSummary,
     ...skillFields,
     route: context.route,

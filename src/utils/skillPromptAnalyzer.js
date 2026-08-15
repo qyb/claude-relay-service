@@ -4,6 +4,11 @@
  * 识别 Claude Code 注入的 SKILL 文本标记，进行三级置信度判定与增量对比分类，
  * 统计大小，生成 telemetry 摘要与待落盘明文记录。
  *
+ * 状态键为 apiKeyId + rootSessionId + agentContextId（v3）：同一根 session 下
+ * 的父代理、子代理、Auto 分类器上下文各自维护独立状态，互不覆盖。
+ * agentContextId 由 system/tool_schema/首条用户消息指纹派生
+ * （见 agentContext.js），缺失时回退到 session 级状态。
+ *
  * 指标口径（v2）：
  * - skill_* 计数只覆盖 SKILL 实例（command marker / 恢复结构 / 强结构），
  *   通用 <system-reminder> 一律走 system_reminder_* 独立字段；
@@ -16,7 +21,7 @@ const LRUCache = require('./lruCache')
 const { buildPromptSessionKey } = require('./promptLogger')
 const { classifyPromptSource: classifyMachinePromptSource } = require('./promptSourceClassifier')
 
-const RULE_VERSION = 2
+const RULE_VERSION = 3
 const MAX_SKILL_NAME_LENGTH = 128
 const MAX_SKILL_PATH_LENGTH = 128
 const MAX_SKILL_BODY_CHARS = 512 * 1024
@@ -89,6 +94,26 @@ function hashContent(content) {
     return null
   }
   return crypto.createHash('sha256').update(content).digest('hex')
+}
+
+/**
+ * SKILL 增量状态键：session 级 key + 叶级上下文 id。
+ * 同一根 session 内父/子代理与 Auto 上下文请求交错时，各自的状态分支
+ * 互不覆盖（2026-08-15 生产日志：79 工具主上下文与 0 工具 Auto 上下文
+ * 32 次切换曾导致延续被误判为 re_injected）。
+ */
+function buildAgentStateKey(apiKeyId, clientSessionId, agentContextId) {
+  const base = buildPromptSessionKey(apiKeyId, clientSessionId)
+  if (!base) {
+    return null
+  }
+  if (typeof agentContextId !== 'string' || !agentContextId.trim()) {
+    return base
+  }
+  return crypto
+    .createHash('sha256')
+    .update(`${base}\u0000ctx:${agentContextId.trim()}`)
+    .digest('hex')
 }
 
 function mayContainSkillText(text) {
@@ -328,9 +353,10 @@ class SkillPromptAnalyzer {
    * @param {Object} requestBody
    * @param {Object} sessionInfo
    * @param {string|number} apiKeyId
+   * @param {Object|null} agentContextInfo - agentContext.js 派生的上下文信息
    * @returns {{ summary: Object, skillRecords: Array }}
    */
-  analyze(requestBody = {}, sessionInfo = {}, apiKeyId = null) {
+  analyze(requestBody = {}, sessionInfo = {}, apiKeyId = null, agentContextInfo = null) {
     const analysisStartedAt = Date.now()
     const detectedSkills = []
     let scannedChars = 0
@@ -402,8 +428,12 @@ class SkillPromptAnalyzer {
     }
     const cappedSkills = detectedSkills.slice(0, MAX_SKILL_ITEMS)
 
-    // 3. 增量对比
-    const sessionKey = buildPromptSessionKey(apiKeyId, sessionInfo?.clientSessionId)
+    // 3. 增量对比（状态按根 session + 叶级上下文隔离）
+    const sessionKey = buildAgentStateKey(
+      apiKeyId,
+      sessionInfo?.clientSessionId,
+      agentContextInfo?.agentContextId
+    )
     const previousState = sessionKey ? this.cache.get(sessionKey) : null
 
     let newlyInjectedCount = 0
@@ -672,6 +702,7 @@ const defaultSkillPromptAnalyzer = new SkillPromptAnalyzer()
 module.exports = defaultSkillPromptAnalyzer
 module.exports.SkillPromptAnalyzer = SkillPromptAnalyzer
 module.exports.RULE_VERSION = RULE_VERSION
+module.exports.buildAgentStateKey = buildAgentStateKey
 module.exports.classifyPromptSource = classifyPromptSource
 module.exports.extractSkillsFromText = extractSkillsFromText
 module.exports.parseInvokedSkills = parseInvokedSkills

@@ -18,7 +18,7 @@ const {
 } = require('./promptSourceClassifier')
 const { getPurposeKey, getKeyId } = require('./hmacKeyring')
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 const DEFAULT_CACHE_SIZE = 10000
 const DEFAULT_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const SUSPECTED_SECRET_WARN_INTERVAL_MS = 5 * 60 * 1000
@@ -49,6 +49,88 @@ function normalizeSkillPath(value) {
     normalized = normalized.replace(pattern, replacement)
   }
   return normalized.slice(0, MAX_SKILL_PATH_LENGTH)
+}
+
+/**
+ * 最新 user 文本（跨消息回溯版）。
+ * 仅用于机器记录的去重哈希兜底；request_purpose 判定必须用
+ * extractLatestUserMessageText，避免把工具续跑请求归因到历史人工 Prompt。
+ */
+function extractLatestUserText(requestBody) {
+  const messages = requestBody?.messages
+  if (!Array.isArray(messages)) {
+    return null
+  }
+
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    if (message?.role !== 'user') {
+      continue
+    }
+
+    const { content } = message
+    if (typeof content === 'string') {
+      if (content.trim()) {
+        return content
+      }
+      continue
+    }
+
+    if (!Array.isArray(content)) {
+      continue
+    }
+
+    for (let blockIndex = content.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = content[blockIndex]
+      if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+        return block.text
+      }
+    }
+  }
+
+  return null
+}
+
+/**
+ * 只读取最后一条 user 消息的最后一个非空顶层文本块（不跨消息回溯）。
+ *
+ * request_purpose 判定的专用提取器：工具续跑请求的最后一条 user 消息
+ * 往往只含 tool_result（或 tool_result 之后的 system-reminder），该消息
+ * 没有顶层 text block 时必须返回 null，让分类器走 background /
+ * skill_execution 分支，而不是回溯到历史人工 Prompt 把 token/cost
+ * 错归因为 human。
+ */
+function extractLatestUserMessageText(requestBody) {
+  const messages = requestBody?.messages
+  if (!Array.isArray(messages)) {
+    return null
+  }
+
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = messages[messageIndex]
+    if (message?.role !== 'user') {
+      continue
+    }
+
+    const { content } = message
+    if (typeof content === 'string') {
+      return content.trim() ? content : null
+    }
+    if (!Array.isArray(content)) {
+      return null
+    }
+
+    for (let blockIndex = content.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = content[blockIndex]
+      if (block?.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+        return block.text
+      }
+    }
+    // 最后一条 user 消息没有顶层 text block（tool_result-only）→ 不回溯
+    return null
+  }
+
+  return null
 }
 
 function extractLatestUserPrompt(requestBody) {
@@ -201,7 +283,7 @@ class PromptLogger {
       })
   }
 
-  recordRequest(req, sessionInfo = {}, skillRecords = []) {
+  recordRequest(req, sessionInfo = {}, skillRecords = [], purposeInfo = {}) {
     // 统一的“脱敏 → 高熵告警 → 写盘”路径，员工 Prompt 与 SKILL/reminder
     // 明文记录同样触发限频告警
     const writeMaskedRecord = (record) => {
@@ -247,8 +329,14 @@ class PromptLogger {
       }
     }
 
-    // 2. 提取并记录员工 Prompt（只有 human 分类才落盘）
-    const prompt = extractLatestUserPrompt(req?.body)
+    // 2. 按请求目的分流：human 写员工明文记录；机器目的（auto/recap/
+    //    suggestion/skill_execution/subagent/background）只写无正文的
+    //    结构化统计，不进入员工行为分析
+    const purpose = purposeInfo.request_purpose
+    const isHumanRecord = !purpose || purpose === 'human'
+    const prompt = isHumanRecord
+      ? extractLatestUserPrompt(req?.body)
+      : (purposeInfo.latestUserText ?? extractLatestUserMessageText(req?.body))
     const promptHash = hashPrompt(prompt, this.promptHashHmacKey)
     if (!prompt || !promptHash) {
       return { logged: false, duplicate: false, reason: 'no_prompt' }
@@ -260,9 +348,9 @@ class PromptLogger {
       return { logged: false, duplicate: true, reason: 'duplicate' }
     }
 
-    const record = {
+    const purposeRuleVersion = purposeInfo.purpose_rule_version ?? PROMPT_SOURCE_RULE_VERSION
+    const commonFields = {
       schema_version: SCHEMA_VERSION,
-      event_type: 'user_prompt_observed',
       timestamp: new Date().toISOString(),
       gateway_request_id: req?.requestId ?? null,
       api_key_record_id: req?.apiKey?.id ?? null,
@@ -272,13 +360,31 @@ class PromptLogger {
       route: req?.route?.path ?? req?.originalUrl?.split('?')[0] ?? null,
       model: req?.body?.model ?? null,
       message_count: Array.isArray(req?.body?.messages) ? req.body.messages.length : 0,
-      prompt_source: classifyPromptSource(prompt),
+      request_purpose: isHumanRecord ? 'human' : purpose,
+      purpose_rule_version: purposeRuleVersion,
+      purpose_source: purposeInfo.purpose_source ?? null,
+      prompt_source: purposeInfo.prompt_source ?? classifyPromptSource(prompt),
       prompt_source_rule_version: PROMPT_SOURCE_RULE_VERSION,
+      agent_context_id: purposeInfo.agent_context_id ?? null,
+      agent_context_role: purposeInfo.agent_context_role ?? null,
+      agent_context_role_source: purposeInfo.agent_context_role_source ?? null,
       prompt_hash: promptHash,
       hash_key_id: getPromptHashKeyId(this.promptHashHmacKey),
-      prompt_length: prompt.length,
-      prompt
+      prompt_length: prompt.length
     }
+
+    const record = isHumanRecord
+      ? {
+          ...commonFields,
+          event_type: 'user_prompt_observed',
+          prompt
+        }
+      : {
+          // 机器目的不落正文：只保留模板指纹与哈希统计
+          ...commonFields,
+          event_type: 'machine_prompt_observed',
+          template_id: purposeInfo.template_id ?? null
+        }
 
     let accepted = false
     try {
@@ -315,6 +421,8 @@ module.exports.PromptLogger = PromptLogger
 module.exports.SCHEMA_VERSION = SCHEMA_VERSION
 module.exports.buildPromptSessionKey = buildPromptSessionKey
 module.exports.extractLatestUserPrompt = extractLatestUserPrompt
+module.exports.extractLatestUserMessageText = extractLatestUserMessageText
+module.exports.extractLatestUserText = extractLatestUserText
 module.exports.hashPrompt = hashPrompt
 module.exports.isHumanPrompt = isHumanPrompt
 module.exports.maskPromptRecord = maskPromptRecord

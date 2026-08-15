@@ -304,6 +304,40 @@ describe('llmTelemetry finalization', () => {
     })
   })
 
+  it('上下文标识与请求目的字段完整透传', () => {
+    const context = createTelemetryContext(buildRequest(), buildSessionInfo(), null, {
+      agentContext: {
+        agentContextId: 'abc123def4567890',
+        contextFingerprint: 'sys:aaa|tools:bbb|first:ccc',
+        contextKeyId: 'ek-abcd1234'
+      },
+      purposeInfo: {
+        request_purpose: 'subagent',
+        purpose_rule_version: 1,
+        purpose_source: 'context_role',
+        template_id: null,
+        agent_context_role: 'secondary',
+        agent_context_role_source: 'registry_primary'
+      }
+    })
+
+    finalizeTelemetry(context, { eventType: 'llm_request_completed' })
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      root_session_id: SESSION_ID,
+      agent_context_id: 'abc123def4567890',
+      context_fingerprint: 'sys:aaa|tools:bbb|first:ccc',
+      context_key_id: 'ek-abcd1234',
+      parent_gateway_request_id: null,
+      request_purpose: 'subagent',
+      purpose_rule_version: 1,
+      purpose_source: 'context_role',
+      purpose_template_id: null,
+      agent_context_role: 'secondary',
+      agent_context_role_source: 'registry_primary'
+    })
+  })
+
   it('未知价格保留 cost=null 而不是 0，且 schema 版本为 2', () => {
     const context = createTelemetryContext(
       buildRequest({ body: { model: 'totally-unknown-model', stream: false } }),

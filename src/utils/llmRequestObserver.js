@@ -10,6 +10,8 @@ const { StringDecoder } = require('string_decoder')
 const logger = require('./logger')
 const promptLogger = require('./promptLogger')
 const sessionHelper = require('./sessionHelper')
+const { defaultAgentContextResolver } = require('./agentContext')
+const purposeClassifier = require('./requestPurposeClassifier')
 const {
   createTelemetryContext,
   finalizeTelemetry,
@@ -75,10 +77,12 @@ function mergeUsage(current, incoming) {
 }
 
 class LlmRequestObserver {
-  constructor(req, res, sessionInfo, telemetryEnabled, skillSummary = null) {
+  constructor(req, res, sessionInfo, telemetryEnabled, skillSummary = null, requestMeta = {}) {
     this.res = res
     this.telemetryEnabled = telemetryEnabled
-    this.context = telemetryEnabled ? createTelemetryContext(req, sessionInfo, skillSummary) : null
+    this.context = telemetryEnabled
+      ? createTelemetryContext(req, sessionInfo, skillSummary, requestMeta)
+      : null
     this.finishSeen = false
     this.usage = null
     this.responseSummary = null
@@ -412,17 +416,60 @@ function startLlmRequestObservation(req, res) {
   }
 
   let skillAnalysis = { summary: null, skillRecords: [] }
+  let agentContextInfo = { agentContextId: null, contextFingerprint: null }
+  let purposeInfo = null
+  let latestUserText = null
   if (promptLogEnabled || telemetryEnabled) {
     try {
-      skillAnalysis = skillPromptAnalyzer.analyze(req?.body, sessionInfo, req?.apiKey?.id)
+      // P0-2：先派生叶级上下文，分析器的增量状态按上下文隔离。
+      // resolver 在同 scope + 同 system/tool 配置内维护首条消息分支的
+      // alias 迁移，压缩后首条消息被 summary 替换时上下文 id 保持稳定
+      const contextScopeKey = promptLogger.buildPromptSessionKey(
+        req?.apiKey?.id,
+        sessionInfo.clientSessionId
+      )
+      agentContextInfo = defaultAgentContextResolver.resolve(req?.body, contextScopeKey)
+      skillAnalysis = skillPromptAnalyzer.analyze(
+        req?.body,
+        sessionInfo,
+        req?.apiKey?.id,
+        agentContextInfo
+      )
     } catch (error) {
       logger.error('Failed to analyze SKILL prompt injection:', error?.message || String(error))
+    }
+
+    try {
+      // P0-1：判定请求目的（header > 模板指纹 > 上下文角色 > 结构信号）。
+      // 只读最后一条 user 消息：尾部 tool_result-only 的工具续跑请求不能
+      // 回溯到历史人工 Prompt，否则 token/cost 会被错归因为 human
+      latestUserText = promptLogger.extractLatestUserMessageText(req?.body)
+      purposeInfo = purposeClassifier.classify({
+        headers: req?.headers,
+        latestUserText,
+        skillInstanceDetected:
+          Number.isInteger(skillAnalysis?.summary?.skill_injection_count) &&
+          skillAnalysis.summary.skill_injection_count > 0,
+        toolsOfferedCount: Array.isArray(req?.body?.tools) ? req.body.tools.length : 0,
+        messageCount: Array.isArray(req?.body?.messages) ? req.body.messages.length : 0,
+        rootSessionId: sessionInfo.clientSessionId,
+        apiKeyId: req?.apiKey?.id,
+        agentContextId: agentContextInfo.agentContextId
+      })
+    } catch (error) {
+      logger.error('Failed to classify request purpose:', error?.message || String(error))
     }
   }
 
   if (promptLogEnabled) {
     try {
-      promptLogger.recordRequest(req, sessionInfo, skillAnalysis.skillRecords)
+      promptLogger.recordRequest(req, sessionInfo, skillAnalysis.skillRecords, {
+        ...(purposeInfo || {}),
+        latestUserText,
+        // classifier 返回值不含该字段，显式附加保证 prompt-log 与 telemetry
+        // 对同一请求携带相同的 agent_context_id
+        agent_context_id: agentContextInfo.agentContextId
+      })
     } catch (error) {
       logger.error('Failed to record latest user Prompt:', error?.message || String(error))
     }
@@ -433,7 +480,8 @@ function startLlmRequestObservation(req, res) {
     res,
     sessionInfo,
     telemetryEnabled,
-    skillAnalysis.summary
+    skillAnalysis.summary,
+    { agentContext: agentContextInfo, purposeInfo: purposeInfo || {} }
   )
   if (req && typeof req === 'object') {
     Object.defineProperty(req, REQUEST_OBSERVER, {

@@ -6,6 +6,7 @@ jest.mock('../src/utils/logger', () => ({
 const {
   PromptLogger,
   buildPromptSessionKey,
+  extractLatestUserMessageText,
   extractLatestUserPrompt,
   hashPrompt,
   isHumanPrompt
@@ -114,6 +115,48 @@ describe('Prompt extraction', () => {
 
   it('没有普通用户文本时返回 null', () => {
     expect(extractLatestUserPrompt({ messages: [toolResult()] })).toBeNull()
+  })
+
+  describe('extractLatestUserMessageText（purpose 专用严格提取器）', () => {
+    it('tool_result-only 尾部返回 null，不回溯到历史人工 Prompt', () => {
+      expect(
+        extractLatestUserMessageText({
+          messages: [
+            userText('fix the test'),
+            { role: 'assistant', content: [{ type: 'tool_use', name: 'Bash' }] },
+            toolResult()
+          ]
+        })
+      ).toBeNull()
+    })
+
+    it('tool_result 后跟随 system-reminder 文本块时返回该 reminder 文本', () => {
+      const reminder = '<system-reminder>Runtime guidance</system-reminder>'
+      expect(
+        extractLatestUserMessageText({
+          messages: [
+            userText('fix the test'),
+            {
+              role: 'user',
+              content: [toolResult().content[0], { type: 'text', text: reminder }]
+            }
+          ]
+        })
+      ).toBe(reminder)
+    })
+
+    it('真正的新人工输入正常返回，字符串 content 的空文本返回 null', () => {
+      expect(
+        extractLatestUserMessageText({
+          messages: [userText('old'), userText('new human input')]
+        })
+      ).toBe('new human input')
+      expect(
+        extractLatestUserMessageText({
+          messages: [{ role: 'user', content: '   ' }]
+        })
+      ).toBeNull()
+    })
   })
 
   it('8. 最后一条 user 消息是 SKILL/system-reminder 注入时回退到更早的人工文本', () => {
@@ -299,7 +342,8 @@ describe('PromptLogger LRU retention', () => {
       model: 'claude-sonnet-test',
       prompt_source: 'human',
       prompt_source_rule_version: 3,
-      schema_version: 2
+      request_purpose: 'human',
+      schema_version: 3
     })
     // 测试环境未配置 ENCRYPTION_KEY，prompt hash 使用进程随机密钥（ephemeral-）
     expect(record.hash_key_id).toMatch(/^(ek|ephemeral)-[0-9a-f]{8}$/)
@@ -349,6 +393,58 @@ Run eslint on modified files
     })
     expect(JSON.stringify(recordsByType.skill_prompt_observed)).not.toContain('human prompt')
     expect(JSON.stringify(recordsByType.user_prompt_observed)).not.toContain('Run eslint')
+  })
+
+  it('机器目的写 machine_prompt_observed，无正文只有哈希统计', () => {
+    const writeRecord = jest.fn(() => true)
+    const promptLogger = new PromptLogger({ writeRecord })
+    const autoText = '\nErr on the side of blocking. Stage 1 does NOT apply user intent.'
+
+    const result = promptLogger.recordRequest(
+      buildRequest([userText(autoText)]),
+      sessionInfo(),
+      [],
+      {
+        request_purpose: 'auto_classifier',
+        purpose_rule_version: 1,
+        purpose_source: 'template',
+        template_id: 'auto_stage1_block',
+        agent_context_id: 'abc123def4567890',
+        agent_context_role: 'secondary',
+        agent_context_role_source: 'registry_primary',
+        prompt_source: 'auto_classifier',
+        latestUserText: autoText
+      }
+    )
+
+    expect(result).toMatchObject({ logged: true, duplicate: false })
+    expect(writeRecord).toHaveBeenCalledTimes(1)
+    const record = writeRecord.mock.calls[0][0]
+    expect(record).toMatchObject({
+      event_type: 'machine_prompt_observed',
+      request_purpose: 'auto_classifier',
+      purpose_rule_version: 1,
+      purpose_source: 'template',
+      template_id: 'auto_stage1_block',
+      agent_context_id: 'abc123def4567890',
+      agent_context_role: 'secondary',
+      agent_context_role_source: 'registry_primary',
+      prompt_source: 'auto_classifier',
+      schema_version: 3,
+      prompt_length: autoText.length
+    })
+    // 机器目的不落正文
+    expect(record.prompt).toBeUndefined()
+    expect(record.prompt_hash).toMatch(/^[0-9a-f]{64}$/)
+    expect(JSON.stringify(record)).not.toContain('Err on the side of blocking')
+
+    // 相同文本去重
+    const dup = promptLogger.recordRequest(buildRequest([userText(autoText)]), sessionInfo(), [], {
+      request_purpose: 'auto_classifier',
+      latestUserText: autoText
+    })
+    expect(dup).toMatchObject({ logged: false, duplicate: true })
+    expect(writeRecord).toHaveBeenCalledTimes(1)
   })
 
   it('isHumanPrompt 识别常见机器注入标记', () => {
