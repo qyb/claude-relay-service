@@ -60,14 +60,6 @@ const MODEL_PRICING = {
     output: 1.25,
     cacheWrite: 0.3,
     cacheRead: 0.03
-  },
-
-  // 默认定价（用于未知模型）
-  unknown: {
-    input: 3.0,
-    output: 15.0,
-    cacheWrite: 3.75,
-    cacheRead: 0.3
   }
 }
 
@@ -82,21 +74,27 @@ class CostCalculator {
    * @param {string} model - 模型名称
    * @returns {Object} 费用详情
    */
-  static calculateCost(usage, model = 'unknown') {
+  static calculateCost(usage, model = 'unknown', options = {}) {
     // 如果 usage 包含详细的 cache_creation 对象或是 1M 模型，使用 pricingService 来处理
     if (
       (usage.cache_creation && typeof usage.cache_creation === 'object') ||
       (model && model.includes('[1m]'))
     ) {
-      const result = pricingService.calculateCost(usage, model)
+      const result = pricingService.calculateCost(usage, model, options)
+      const resultPricing = result.pricing || {
+        input: 0,
+        output: 0,
+        cacheCreate: 0,
+        cacheRead: 0
+      }
       // 转换 pricingService 返回的格式到 costCalculator 的格式
       return {
         model,
         pricing: {
-          input: result.pricing.input * 1000000, // 转换为 per 1M tokens
-          output: result.pricing.output * 1000000,
-          cacheWrite: result.pricing.cacheCreate * 1000000,
-          cacheRead: result.pricing.cacheRead * 1000000
+          input: resultPricing.input * 1000000, // 转换为 per 1M tokens
+          output: resultPricing.output * 1000000,
+          cacheWrite: resultPricing.cacheCreate * 1000000,
+          cacheRead: resultPricing.cacheRead * 1000000
         },
         usingDynamicPricing: true,
         isLongContextRequest: result.isLongContextRequest || false,
@@ -127,12 +125,18 @@ class CostCalculator {
         },
         debug: {
           isOpenAIModel: model.includes('gpt') || model.includes('o1'),
-          hasCacheCreatePrice: !!result.pricing.cacheCreate,
+          hasCacheCreatePrice: !!resultPricing.cacheCreate,
           cacheCreateTokens: usage.cache_creation_input_tokens || 0,
-          cacheWritePriceUsed: result.pricing.cacheCreate * 1000000,
+          cacheWritePriceUsed: resultPricing.cacheCreate * 1000000,
           isLongContextModel: model && model.includes('[1m]'),
           isLongContextRequest: result.isLongContextRequest || false
-        }
+        },
+        hasPricing: result.hasPricing === true,
+        pricing_model: result.pricing_model || null,
+        provisionalPricing: result.provisionalPricing === true,
+        currency: result.currency || 'USD',
+        region: result.region || null,
+        source_currency: result.source_currency || null
       }
     }
 
@@ -143,9 +147,10 @@ class CostCalculator {
     const cacheReadTokens = usage.cache_read_input_tokens || 0
 
     // 优先使用动态价格服务
-    const pricingData = pricingService.getModelPricing(model)
+    const pricingData = pricingService.getModelPricing(model, { ...options, usage })
     let pricing
     let usingDynamicPricing = false
+    let hasPricing = false
 
     if (pricingData) {
       // 转换动态价格格式为内部格式
@@ -174,9 +179,24 @@ class CostCalculator {
         cacheRead: cacheReadPrice
       }
       usingDynamicPricing = true
+      hasPricing = true
     } else {
-      // 回退到静态价格
-      pricing = MODEL_PRICING[model] || MODEL_PRICING['unknown']
+      if (
+        !pricingData &&
+        (options.apiUrl ||
+          options.region ||
+          pricingService.getRegionalPricingCoverage(model) ||
+          pricingService.isRegionalModelName(model))
+      ) {
+        pricingService.recordMissingPricing(model, options, usage)
+      }
+      pricing = MODEL_PRICING[model] || {
+        input: 0,
+        output: 0,
+        cacheWrite: 0,
+        cacheRead: 0
+      }
+      hasPricing = Boolean(MODEL_PRICING[model])
     }
 
     // 计算各类型token的费用 (USD)
@@ -219,7 +239,13 @@ class CostCalculator {
         hasCacheCreatePrice: !!pricingData?.cache_creation_input_token_cost,
         cacheCreateTokens,
         cacheWritePriceUsed: pricing.cacheWrite
-      }
+      },
+      hasPricing,
+      pricing_model: pricingData?.pricing_model || null,
+      provisionalPricing: pricingData?.provisionalPricing === true,
+      currency: pricingData?.currency || 'USD',
+      region: pricingData?.region || null,
+      source_currency: pricingData?.source_currency || null
     }
   }
 
@@ -256,7 +282,14 @@ class CostCalculator {
         return gpt5Pricing
       }
     }
-    return MODEL_PRICING[model] || MODEL_PRICING['unknown']
+    return (
+      MODEL_PRICING[model] || {
+        input: 0,
+        output: 0,
+        cacheWrite: 0,
+        cacheRead: 0
+      }
+    )
   }
 
   /**

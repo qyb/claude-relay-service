@@ -7,6 +7,7 @@
 
 const crypto = require('crypto')
 const logger = require('./logger')
+const pricingService = require('../services/pricingService')
 
 const SCHEMA_VERSION = 1
 const MAX_TOOL_NAMES = 64
@@ -303,7 +304,9 @@ function createTelemetryContext(req, sessionInfo, skillSummary = null) {
     provider: null,
     accountId: null,
     accountType: null,
+    apiUrl: null,
     model: req?.body?.model ?? null,
+    requestedModel: req?.body?.model ?? null,
     stream: req?.body?.stream === true,
     clientSessionId: sessionInfo?.clientSessionId ?? null,
     sessionIdSource: sessionInfo?.source ?? null,
@@ -331,6 +334,28 @@ function finalizeTelemetry(context, outcome = {}) {
   const now = Date.now()
   const responseCompleted = outcome.responseCompleted ?? !isError
   const effectiveSkillSummary = outcome.skillSummary ?? context.skillSummary
+
+  let cost = outcome.cost ?? null
+  let hasPricing = null
+  let pricingModel = null
+  let pricingRegion = null
+  let provisionalPricing = false
+  if (cost === null && usageFields.usage_available) {
+    try {
+      const costResult = pricingService.calculateCost(
+        outcome.usage,
+        outcome.model ?? context.model,
+        { apiUrl: outcome.apiUrl ?? context.apiUrl }
+      )
+      cost = costResult.hasPricing ? costResult.totalCost : 0
+      hasPricing = costResult.hasPricing === true
+      pricingModel = costResult.pricing_model ?? null
+      pricingRegion = costResult.region ?? null
+      provisionalPricing = costResult.provisionalPricing === true
+    } catch (error) {
+      logger.warn?.(`⚠️ Failed to calculate telemetry cost: ${error.message}`)
+    }
+  }
 
   const skillFields = effectiveSkillSummary
     ? {
@@ -380,11 +405,17 @@ function finalizeTelemetry(context, outcome = {}) {
     provider: outcome.provider ?? context.provider,
     account_id: outcome.accountId ?? context.accountId,
     account_type: outcome.accountType ?? context.accountType,
+    api_url: outcome.apiUrl ?? context.apiUrl,
     model: outcome.model ?? context.model,
+    requested_model: context.requestedModel,
     stream: context.stream,
     ...responseSummary,
     ...usageFields,
-    cost: outcome.cost ?? null,
+    cost,
+    has_pricing: hasPricing,
+    pricing_model: pricingModel,
+    pricing_region: pricingRegion,
+    provisional_pricing: provisionalPricing,
     queue_latency_ms: outcome.queueLatencyMs ?? null,
     upstream_latency_ms: outcome.upstreamLatencyMs ?? null,
     ttft_ms: outcome.ttftMs ?? null,

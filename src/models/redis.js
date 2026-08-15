@@ -482,7 +482,8 @@ class RedisClient {
     model = 'unknown',
     ephemeral5mTokens = 0, // 新增：5分钟缓存 tokens
     ephemeral1hTokens = 0, // 新增：1小时缓存 tokens
-    isLongContextRequest = false // 新增：是否为 1M 上下文请求（超过200k）
+    isLongContextRequest = false, // 新增：是否为 1M 上下文请求（超过200k）
+    costUsd = 0
   ) {
     const key = `usage:${keyId}`
     const now = new Date()
@@ -588,6 +589,7 @@ class RedisClient {
     pipeline.hincrby(modelDaily, 'cacheReadTokens', finalCacheReadTokens)
     pipeline.hincrby(modelDaily, 'allTokens', totalTokens)
     pipeline.hincrby(modelDaily, 'requests', 1)
+    pipeline.hincrbyfloat(modelDaily, 'costUsd', Number(costUsd) || 0)
 
     // 按模型统计 - 每月
     pipeline.hincrby(modelMonthly, 'inputTokens', finalInputTokens)
@@ -596,6 +598,7 @@ class RedisClient {
     pipeline.hincrby(modelMonthly, 'cacheReadTokens', finalCacheReadTokens)
     pipeline.hincrby(modelMonthly, 'allTokens', totalTokens)
     pipeline.hincrby(modelMonthly, 'requests', 1)
+    pipeline.hincrbyfloat(modelMonthly, 'costUsd', Number(costUsd) || 0)
 
     // API Key级别的模型统计 - 每日
     pipeline.hincrby(keyModelDaily, 'inputTokens', finalInputTokens)
@@ -604,6 +607,7 @@ class RedisClient {
     pipeline.hincrby(keyModelDaily, 'cacheReadTokens', finalCacheReadTokens)
     pipeline.hincrby(keyModelDaily, 'allTokens', totalTokens)
     pipeline.hincrby(keyModelDaily, 'requests', 1)
+    pipeline.hincrbyfloat(keyModelDaily, 'costUsd', Number(costUsd) || 0)
     // 详细缓存类型统计
     pipeline.hincrby(keyModelDaily, 'ephemeral5mTokens', ephemeral5mTokens)
     pipeline.hincrby(keyModelDaily, 'ephemeral1hTokens', ephemeral1hTokens)
@@ -615,6 +619,7 @@ class RedisClient {
     pipeline.hincrby(keyModelMonthly, 'cacheReadTokens', finalCacheReadTokens)
     pipeline.hincrby(keyModelMonthly, 'allTokens', totalTokens)
     pipeline.hincrby(keyModelMonthly, 'requests', 1)
+    pipeline.hincrbyfloat(keyModelMonthly, 'costUsd', Number(costUsd) || 0)
     // 详细缓存类型统计
     pipeline.hincrby(keyModelMonthly, 'ephemeral5mTokens', ephemeral5mTokens)
     pipeline.hincrby(keyModelMonthly, 'ephemeral1hTokens', ephemeral1hTokens)
@@ -635,6 +640,7 @@ class RedisClient {
     pipeline.hincrby(modelHourly, 'cacheReadTokens', finalCacheReadTokens)
     pipeline.hincrby(modelHourly, 'allTokens', totalTokens)
     pipeline.hincrby(modelHourly, 'requests', 1)
+    pipeline.hincrbyfloat(modelHourly, 'costUsd', Number(costUsd) || 0)
 
     // API Key级别的模型统计 - 每小时
     pipeline.hincrby(keyModelHourly, 'inputTokens', finalInputTokens)
@@ -643,6 +649,7 @@ class RedisClient {
     pipeline.hincrby(keyModelHourly, 'cacheReadTokens', finalCacheReadTokens)
     pipeline.hincrby(keyModelHourly, 'allTokens', totalTokens)
     pipeline.hincrby(keyModelHourly, 'requests', 1)
+    pipeline.hincrbyfloat(keyModelHourly, 'costUsd', Number(costUsd) || 0)
 
     // 新增：系统级分钟统计
     pipeline.hincrby(systemMinuteKey, 'requests', 1)
@@ -681,7 +688,8 @@ class RedisClient {
     cacheCreateTokens = 0,
     cacheReadTokens = 0,
     model = 'unknown',
-    isLongContextRequest = false
+    isLongContextRequest = false,
+    costUsd = 0
   ) {
     const now = new Date()
     const today = getDateStringInTimezone(now)
@@ -725,6 +733,7 @@ class RedisClient {
       this.client.hincrby(accountKey, 'totalCacheReadTokens', finalCacheReadTokens),
       this.client.hincrby(accountKey, 'totalAllTokens', actualTotalTokens),
       this.client.hincrby(accountKey, 'totalRequests', 1),
+      this.client.hincrbyfloat(accountKey, 'costUsd', Number(costUsd) || 0),
 
       // 账户每日统计
       this.client.hincrby(accountDaily, 'tokens', coreTokens),
@@ -734,6 +743,7 @@ class RedisClient {
       this.client.hincrby(accountDaily, 'cacheReadTokens', finalCacheReadTokens),
       this.client.hincrby(accountDaily, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountDaily, 'requests', 1),
+      this.client.hincrbyfloat(accountDaily, 'costUsd', Number(costUsd) || 0),
 
       // 账户每月统计
       this.client.hincrby(accountMonthly, 'tokens', coreTokens),
@@ -743,6 +753,7 @@ class RedisClient {
       this.client.hincrby(accountMonthly, 'cacheReadTokens', finalCacheReadTokens),
       this.client.hincrby(accountMonthly, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountMonthly, 'requests', 1),
+      this.client.hincrbyfloat(accountMonthly, 'costUsd', Number(costUsd) || 0),
 
       // 账户每小时统计
       this.client.hincrby(accountHourly, 'tokens', coreTokens),
@@ -752,6 +763,7 @@ class RedisClient {
       this.client.hincrby(accountHourly, 'cacheReadTokens', finalCacheReadTokens),
       this.client.hincrby(accountHourly, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountHourly, 'requests', 1),
+      this.client.hincrbyfloat(accountHourly, 'costUsd', Number(costUsd) || 0),
 
       // 添加模型级别的数据到hourly键中，以支持会话窗口的统计
       this.client.hincrby(accountHourly, `model:${normalizedModel}:inputTokens`, finalInputTokens),
@@ -772,6 +784,11 @@ class RedisClient {
       ),
       this.client.hincrby(accountHourly, `model:${normalizedModel}:allTokens`, actualTotalTokens),
       this.client.hincrby(accountHourly, `model:${normalizedModel}:requests`, 1),
+      this.client.hincrbyfloat(
+        accountHourly,
+        `model:${normalizedModel}:costUsd`,
+        Number(costUsd) || 0
+      ),
 
       // 账户按模型统计 - 每日
       this.client.hincrby(accountModelDaily, 'inputTokens', finalInputTokens),
@@ -780,6 +797,7 @@ class RedisClient {
       this.client.hincrby(accountModelDaily, 'cacheReadTokens', finalCacheReadTokens),
       this.client.hincrby(accountModelDaily, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountModelDaily, 'requests', 1),
+      this.client.hincrbyfloat(accountModelDaily, 'costUsd', Number(costUsd) || 0),
 
       // 账户按模型统计 - 每月
       this.client.hincrby(accountModelMonthly, 'inputTokens', finalInputTokens),
@@ -788,6 +806,7 @@ class RedisClient {
       this.client.hincrby(accountModelMonthly, 'cacheReadTokens', finalCacheReadTokens),
       this.client.hincrby(accountModelMonthly, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountModelMonthly, 'requests', 1),
+      this.client.hincrbyfloat(accountModelMonthly, 'costUsd', Number(costUsd) || 0),
 
       // 账户按模型统计 - 每小时
       this.client.hincrby(accountModelHourly, 'inputTokens', finalInputTokens),
@@ -796,6 +815,7 @@ class RedisClient {
       this.client.hincrby(accountModelHourly, 'cacheReadTokens', finalCacheReadTokens),
       this.client.hincrby(accountModelHourly, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountModelHourly, 'requests', 1),
+      this.client.hincrbyfloat(accountModelHourly, 'costUsd', Number(costUsd) || 0),
 
       // 设置过期时间
       this.client.expire(accountDaily, 86400 * 32), // 32天过期
@@ -918,6 +938,8 @@ class RedisClient {
       const cacheReadTokens =
         parseInt(data.totalCacheReadTokens) || parseInt(data.cacheReadTokens) || 0
       const allTokens = parseInt(data.totalAllTokens) || parseInt(data.allTokens) || 0
+      const costUsd = parseFloat(data.costUsd)
+      const hasCostUsd = Number.isFinite(costUsd)
 
       const totalFromSeparate = inputTokens + outputTokens
       // 计算实际的总tokens（包含所有类型）
@@ -933,7 +955,9 @@ class RedisClient {
           cacheCreateTokens: 0, // 旧数据没有缓存token
           cacheReadTokens: 0,
           allTokens: tokens, // 对于旧数据，allTokens等于tokens
-          requests
+          requests,
+          costUsd: hasCostUsd ? costUsd : 0,
+          hasCostUsd
         }
       } else {
         // 新数据或无数据 - 统一使用allTokens作为tokens的值
@@ -944,7 +968,9 @@ class RedisClient {
           cacheCreateTokens,
           cacheReadTokens,
           allTokens: actualAllTokens,
-          requests
+          requests,
+          costUsd: hasCostUsd ? costUsd : 0,
+          hasCostUsd
         }
       }
     }
@@ -1143,12 +1169,20 @@ class RedisClient {
           cache_read_input_tokens: parseInt(modelUsage.cacheReadTokens || 0)
         }
 
-        // 使用CostCalculator计算费用
-        const costResult = CostCalculator.calculateCost(usage, model)
-        totalCost += costResult.costs.total
+        const storedCost = Number.parseFloat(modelUsage.costUsd)
+        let calculatedCost = 0
+        if (Number.isFinite(storedCost)) {
+          totalCost += storedCost
+        } else {
+          const costResult = CostCalculator.calculateCost(usage, model)
+          calculatedCost = costResult.costs.total
+          totalCost += calculatedCost
+        }
 
         logger.debug(
-          `💰 Account ${accountId} daily cost for model ${model}: $${costResult.costs.total}`
+          `💰 Account ${accountId} daily cost for model ${model}: $${
+            Number.isFinite(storedCost) ? storedCost : calculatedCost
+          }`
         )
       }
     }

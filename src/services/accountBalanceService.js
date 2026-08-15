@@ -616,8 +616,13 @@ class AccountBalanceService {
             cache_read_input_tokens: parseInt(data.cacheReadTokens || 0)
           }
 
-          const costResult = CostCalculator.calculateCost(usage, model)
-          totalCost += costResult.costs.total || 0
+          const storedCost = Number.parseFloat(data.costUsd)
+          if (Number.isFinite(storedCost)) {
+            totalCost += storedCost
+          } else {
+            const costResult = CostCalculator.calculateCost(usage, model)
+            totalCost += costResult.costs.total || 0
+          }
         }
 
         if (iterations >= maxIterations) {

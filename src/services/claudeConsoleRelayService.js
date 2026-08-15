@@ -149,6 +149,13 @@ class ClaudeConsoleRelayService {
       if (!account) {
         throw new Error('Claude Console Claude account not found')
       }
+      if (typeof options.onUpstreamDetails === 'function') {
+        options.onUpstreamDetails({
+          accountId,
+          accountType: 'claude-console',
+          apiUrl: account.apiUrl
+        })
+      }
 
       const autoProtectionDisabled = account.disableAutoProtection === true
 
@@ -478,7 +485,8 @@ class ClaudeConsoleRelayService {
         statusCode: response.status,
         headers: response.headers,
         body: responseBody,
-        accountId
+        accountId,
+        apiUrl: account.apiUrl
       }
     } catch (error) {
       // 处理特定错误
@@ -620,6 +628,13 @@ class ClaudeConsoleRelayService {
       account = await claudeConsoleAccountService.getAccount(accountId)
       if (!account) {
         throw new Error('Claude Console Claude account not found')
+      }
+      if (typeof options.onUpstreamDetails === 'function') {
+        options.onUpstreamDetails({
+          accountId,
+          accountType: 'claude-console',
+          apiUrl: account.apiUrl
+        })
       }
 
       logger.info(
@@ -1168,7 +1183,7 @@ class ClaudeConsoleRelayService {
                     JSON.stringify(collectedUsageData)
                   )
                   if (usageCallback && typeof usageCallback === 'function') {
-                    usageCallback({ ...collectedUsageData, accountId })
+                    usageCallback({ ...collectedUsageData, accountId, apiUrl: account.apiUrl })
                   }
                   finalUsageReported = true
                 }
@@ -1204,7 +1219,7 @@ class ClaudeConsoleRelayService {
                     `📊 [Console] Saving incomplete usage data via fallback: ${JSON.stringify(collectedUsageData)}`
                   )
                   if (usageCallback && typeof usageCallback === 'function') {
-                    usageCallback({ ...collectedUsageData, accountId })
+                    usageCallback({ ...collectedUsageData, accountId, apiUrl: account.apiUrl })
                   }
                   finalUsageReported = true
                 } else {

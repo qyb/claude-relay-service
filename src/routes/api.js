@@ -500,7 +500,8 @@ async function handleMessagesRequest(req, res) {
                 input_tokens: inputTokens,
                 output_tokens: outputTokens,
                 cache_creation_input_tokens: cacheCreateTokens,
-                cache_read_input_tokens: cacheReadTokens
+                cache_read_input_tokens: cacheReadTokens,
+                api_url: usageData.apiUrl || null
               }
 
               // 如果有详细的缓存创建数据，添加到 usage 对象中
@@ -515,7 +516,8 @@ async function handleMessagesRequest(req, res) {
                 .observeUpstream({
                   accountId: usageAccountId ?? accountId,
                   accountType,
-                  model: usageData.model || requestedModel
+                  model: usageData.model || requestedModel,
+                  apiUrl: usageData.apiUrl
                 })
                 .observeUsage(usageObject)
 
@@ -606,7 +608,8 @@ async function handleMessagesRequest(req, res) {
                 input_tokens: inputTokens,
                 output_tokens: outputTokens,
                 cache_creation_input_tokens: cacheCreateTokens,
-                cache_read_input_tokens: cacheReadTokens
+                cache_read_input_tokens: cacheReadTokens,
+                api_url: usageData.apiUrl || null
               }
 
               // 如果有详细的缓存创建数据，添加到 usage 对象中
@@ -621,7 +624,8 @@ async function handleMessagesRequest(req, res) {
                 .observeUpstream({
                   accountId: usageAccountId ?? accountId,
                   accountType,
-                  model: usageData.model || requestedModel
+                  model: usageData.model || requestedModel,
+                  apiUrl: usageData.apiUrl
                 })
                 .observeUsage(usageObject)
 
@@ -785,7 +789,8 @@ async function handleMessagesRequest(req, res) {
                 input_tokens: inputTokens,
                 output_tokens: outputTokens,
                 cache_creation_input_tokens: cacheCreateTokens,
-                cache_read_input_tokens: cacheReadTokens
+                cache_read_input_tokens: cacheReadTokens,
+                api_url: usageData.apiUrl || null
               }
 
               // 如果有详细的缓存创建数据，添加到 usage 对象中
@@ -800,7 +805,8 @@ async function handleMessagesRequest(req, res) {
                 .observeUpstream({
                   accountId: usageAccountId ?? accountId,
                   accountType,
-                  model: usageData.model || requestedModel
+                  model: usageData.model || requestedModel,
+                  apiUrl: usageData.apiUrl
                 })
                 .observeUsage(usageObject)
 
@@ -1173,7 +1179,8 @@ async function handleMessagesRequest(req, res) {
       requestObservation.observeUpstream({
         accountId: response.accountId ?? accountId,
         accountType,
-        upstreamStatusCode: response.statusCode
+        upstreamStatusCode: response.statusCode,
+        apiUrl: response.apiUrl
       })
 
       // 🔍 检查客户端连接是否仍然有效
@@ -1229,7 +1236,8 @@ async function handleMessagesRequest(req, res) {
             cacheCreateTokens,
             cacheReadTokens,
             model,
-            responseAccountId
+            responseAccountId,
+            { apiUrl: response.apiUrl }
           )
 
           await queueRateLimitUpdate(

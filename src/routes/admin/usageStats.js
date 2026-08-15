@@ -30,6 +30,18 @@ const accountTypeNames = {
   unknown: '未知渠道'
 }
 
+const withStoredAggregateCost = (costData, storedCost) => {
+  if (!Number.isFinite(storedCost)) {
+    return costData
+  }
+
+  return {
+    ...costData,
+    costs: { ...costData.costs, total: storedCost },
+    formatted: { ...costData.formatted, total: CostCalculator.formatCost(storedCost) }
+  }
+}
+
 const resolveAccountByPlatform = async (accountId, platform) => {
   const serviceMap = {
     claude: claudeAccountService,
@@ -182,17 +194,6 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
       bedrock: 'bedrock'
     }
 
-    const fallbackModelMap = {
-      claude: 'claude-3-5-sonnet-20241022',
-      'claude-console': 'claude-3-5-sonnet-20241022',
-      openai: 'gpt-4o-mini-2024-07-18',
-      'openai-responses': 'gpt-4o-mini-2024-07-18',
-      gemini: 'gemini-1.5-flash',
-      'gemini-api': 'gemini-2.0-flash',
-      droid: 'unknown',
-      bedrock: 'us.anthropic.claude-3-5-sonnet-20241022-v2:0'
-    }
-
     // 获取账户信息以获取创建时间
     let accountData = null
     let accountCreatedAt = null
@@ -236,7 +237,6 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
     }
 
     const client = redis.getClientSafe()
-    const fallbackModel = fallbackModelMap[platform] || 'unknown'
     const daysCount = Math.min(Math.max(parseInt(days, 10) || 30, 1), 60)
 
     // 获取概览统计数据
@@ -277,8 +277,13 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
           cache_read_input_tokens: parseInt(modelData.cacheReadTokens) || 0
         }
 
-        const costResult = CostCalculator.calculateCost(usage, modelName)
-        summedCost += costResult.costs.total
+        const storedCost = Number.parseFloat(modelData.costUsd)
+        if (Number.isFinite(storedCost)) {
+          summedCost += storedCost
+        } else {
+          const costResult = CostCalculator.calculateCost(usage, modelName)
+          summedCost += costResult.costs.total
+        }
       }
 
       return summedCost
@@ -310,15 +315,9 @@ router.get('/accounts/:accountId/usage-history', authenticateAdmin, async (req, 
 
       let cost = await sumModelCostsForDay(dateKey)
 
-      if (cost === 0 && allTokens > 0) {
-        const fallbackUsage = {
-          input_tokens: inputTokens,
-          output_tokens: outputTokens,
-          cache_creation_input_tokens: cacheCreateTokens,
-          cache_read_input_tokens: cacheReadTokens
-        }
-        const fallbackResult = CostCalculator.calculateCost(fallbackUsage, fallbackModel)
-        cost = fallbackResult.costs.total
+      const storedDailyCost = Number.parseFloat(dailyData?.costUsd)
+      if (Number.isFinite(storedDailyCost)) {
+        cost = storedDailyCost
       }
 
       const normalizedCost = Math.round(cost * 1_000_000) / 1_000_000
@@ -508,8 +507,13 @@ router.get('/usage-trend', authenticateAdmin, async (req, res) => {
               cache_creation_input_tokens: modelCacheCreateTokens,
               cache_read_input_tokens: modelCacheReadTokens
             }
-            const modelCostResult = CostCalculator.calculateCost(modelUsage, model)
-            hourCost += modelCostResult.costs.total
+            const storedCost = Number.parseFloat(data.costUsd)
+            if (Number.isFinite(storedCost)) {
+              hourCost += storedCost
+            } else {
+              const modelCostResult = CostCalculator.calculateCost(modelUsage, model)
+              hourCost += modelCostResult.costs.total
+            }
           }
         }
 
@@ -622,8 +626,13 @@ router.get('/usage-trend', authenticateAdmin, async (req, res) => {
               cache_creation_input_tokens: modelCacheCreateTokens,
               cache_read_input_tokens: modelCacheReadTokens
             }
-            const modelCostResult = CostCalculator.calculateCost(modelUsage, model)
-            dayCost += modelCostResult.costs.total
+            const storedCost = Number.parseFloat(data.costUsd)
+            if (Number.isFinite(storedCost)) {
+              dayCost += storedCost
+            } else {
+              const modelCostResult = CostCalculator.calculateCost(modelUsage, model)
+              dayCost += modelCostResult.costs.total
+            }
           }
         }
 
@@ -764,7 +773,9 @@ router.get('/api-keys/:keyId/model-stats', authenticateAdmin, async (req, res) =
               outputTokens: 0,
               cacheCreateTokens: 0,
               cacheReadTokens: 0,
-              allTokens: 0
+              allTokens: 0,
+              costUsd: 0,
+              hasCostUsd: false
             })
           }
 
@@ -775,6 +786,11 @@ router.get('/api-keys/:keyId/model-stats', authenticateAdmin, async (req, res) =
           stats.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
           stats.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
           stats.allTokens += parseInt(data.allTokens) || 0
+          const storedCost = Number.parseFloat(data.costUsd)
+          if (Number.isFinite(storedCost)) {
+            stats.costUsd += storedCost
+            stats.hasCostUsd = true
+          }
         }
       }
     }
@@ -791,7 +807,10 @@ router.get('/api-keys/:keyId/model-stats', authenticateAdmin, async (req, res) =
       }
 
       // 使用CostCalculator计算费用
-      const costData = CostCalculator.calculateCost(usage, model)
+      const costData = withStoredAggregateCost(
+        CostCalculator.calculateCost(usage, model),
+        stats.hasCostUsd ? stats.costUsd : NaN
+      )
 
       modelStats.push({
         model,
@@ -844,8 +863,10 @@ router.get('/api-keys/:keyId/model-stats', authenticateAdmin, async (req, res) =
               cache_read_input_tokens: usageData.cacheReadTokens || 0
             }
 
-            // 对于汇总数据，使用默认模型计算费用
-            const costData = CostCalculator.calculateCost(usage, 'claude-3-5-sonnet-20241022')
+            const costData = withStoredAggregateCost(
+              CostCalculator.calculateCost(usage, 'unknown'),
+              Number.parseFloat(usageData.costUsd)
+            )
 
             modelStats.push({
               model: '总体使用 (历史数据)',
@@ -1036,13 +1057,6 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
       accountIdSet.add(account.id)
     }
 
-    const fallbackModelByGroup = {
-      claude: 'claude-3-5-sonnet-20241022',
-      openai: 'gpt-4o-mini-2024-07-18',
-      gemini: 'gemini-1.5-flash'
-    }
-    const fallbackModel = fallbackModelByGroup[group] || 'unknown'
-
     const client = redis.getClientSafe()
     const trendData = []
     const accountCostTotals = new Map()
@@ -1071,8 +1085,13 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
           cache_read_input_tokens: parseInt(modelData.cacheReadTokens) || 0
         }
 
-        const costResult = CostCalculator.calculateCost(usage, modelName)
-        totalCost += costResult.costs.total
+        const storedCost = Number.parseFloat(modelData.costUsd)
+        if (Number.isFinite(storedCost)) {
+          totalCost += storedCost
+        } else {
+          const costResult = CostCalculator.calculateCost(usage, modelName)
+          totalCost += costResult.costs.total
+        }
       }
 
       return totalCost
@@ -1140,15 +1159,9 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
 
           let cost = await sumModelCosts(accountId, 'hourly', hourKey)
 
-          if (cost === 0 && allTokens > 0) {
-            const fallbackUsage = {
-              input_tokens: inputTokens,
-              output_tokens: outputTokens,
-              cache_creation_input_tokens: cacheCreateTokens,
-              cache_read_input_tokens: cacheReadTokens
-            }
-            const fallbackResult = CostCalculator.calculateCost(fallbackUsage, fallbackModel)
-            cost = fallbackResult.costs.total
+          const storedHourlyCost = Number.parseFloat(data.costUsd)
+          if (Number.isFinite(storedHourlyCost)) {
+            cost = storedHourlyCost
           }
 
           const formattedCost = CostCalculator.formatCost(cost)
@@ -1211,15 +1224,9 @@ router.get('/account-usage-trend', authenticateAdmin, async (req, res) => {
 
           let cost = await sumModelCosts(accountId, 'daily', dateStr)
 
-          if (cost === 0 && allTokens > 0) {
-            const fallbackUsage = {
-              input_tokens: inputTokens,
-              output_tokens: outputTokens,
-              cache_creation_input_tokens: cacheCreateTokens,
-              cache_read_input_tokens: cacheReadTokens
-            }
-            const fallbackResult = CostCalculator.calculateCost(fallbackUsage, fallbackModel)
-            cost = fallbackResult.costs.total
+          const storedDailyCost = Number.parseFloat(data.costUsd)
+          if (Number.isFinite(storedDailyCost)) {
+            cost = storedDailyCost
           }
 
           const formattedCost = CostCalculator.formatCost(cost)
@@ -1347,7 +1354,8 @@ router.get('/api-keys-usage-trend', authenticateAdmin, async (req, res) => {
               inputTokens,
               outputTokens,
               cacheCreateTokens,
-              cacheReadTokens
+              cacheReadTokens,
+              costUsd: Number.parseFloat(data.costUsd)
             })
           }
         }
@@ -1375,9 +1383,12 @@ router.get('/api-keys-usage-trend', authenticateAdmin, async (req, res) => {
               cache_read_input_tokens: parseInt(modelData.cacheReadTokens) || 0
             }
 
-            const costResult = CostCalculator.calculateCost(usage, model)
             const currentCost = apiKeyCostMap.get(apiKeyId) || 0
-            apiKeyCostMap.set(apiKeyId, currentCost + costResult.costs.total)
+            const storedCost = Number.parseFloat(modelData.costUsd)
+            const modelCost = Number.isFinite(storedCost)
+              ? storedCost
+              : CostCalculator.calculateCost(usage, model).costs.total
+            apiKeyCostMap.set(apiKeyId, currentCost + modelCost)
           }
         }
 
@@ -1389,16 +1400,9 @@ router.get('/api-keys-usage-trend', authenticateAdmin, async (req, res) => {
           let finalCost = cost
           let formattedCost = CostCalculator.formatCost(cost)
 
-          if (cost === 0 && data.tokens > 0) {
-            const usage = {
-              input_tokens: data.inputTokens,
-              output_tokens: data.outputTokens,
-              cache_creation_input_tokens: data.cacheCreateTokens,
-              cache_read_input_tokens: data.cacheReadTokens
-            }
-            const fallbackResult = CostCalculator.calculateCost(usage, 'claude-3-5-sonnet-20241022')
-            finalCost = fallbackResult.costs.total
-            formattedCost = fallbackResult.formatted.total
+          if (cost === 0 && data.tokens > 0 && Number.isFinite(data.costUsd)) {
+            finalCost = data.costUsd
+            formattedCost = CostCalculator.formatCost(finalCost)
           }
 
           hourData.apiKeys[apiKeyId] = {
@@ -1458,7 +1462,8 @@ router.get('/api-keys-usage-trend', authenticateAdmin, async (req, res) => {
               inputTokens,
               outputTokens,
               cacheCreateTokens,
-              cacheReadTokens
+              cacheReadTokens,
+              costUsd: Number.parseFloat(data.costUsd)
             })
           }
         }
@@ -1486,9 +1491,12 @@ router.get('/api-keys-usage-trend', authenticateAdmin, async (req, res) => {
               cache_read_input_tokens: parseInt(modelData.cacheReadTokens) || 0
             }
 
-            const costResult = CostCalculator.calculateCost(usage, model)
             const currentCost = apiKeyCostMap.get(apiKeyId) || 0
-            apiKeyCostMap.set(apiKeyId, currentCost + costResult.costs.total)
+            const storedCost = Number.parseFloat(modelData.costUsd)
+            const modelCost = Number.isFinite(storedCost)
+              ? storedCost
+              : CostCalculator.calculateCost(usage, model).costs.total
+            apiKeyCostMap.set(apiKeyId, currentCost + modelCost)
           }
         }
 
@@ -1500,16 +1508,9 @@ router.get('/api-keys-usage-trend', authenticateAdmin, async (req, res) => {
           let finalCost = cost
           let formattedCost = CostCalculator.formatCost(cost)
 
-          if (cost === 0 && data.tokens > 0) {
-            const usage = {
-              input_tokens: data.inputTokens,
-              output_tokens: data.outputTokens,
-              cache_creation_input_tokens: data.cacheCreateTokens,
-              cache_read_input_tokens: data.cacheReadTokens
-            }
-            const fallbackResult = CostCalculator.calculateCost(usage, 'claude-3-5-sonnet-20241022')
-            finalCost = fallbackResult.costs.total
-            formattedCost = fallbackResult.formatted.total
+          if (cost === 0 && data.tokens > 0 && Number.isFinite(data.costUsd)) {
+            finalCost = data.costUsd
+            formattedCost = CostCalculator.formatCost(finalCost)
           }
 
           dayData.apiKeys[apiKeyId] = {
@@ -1647,7 +1648,9 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
                 inputTokens: 0,
                 outputTokens: 0,
                 cacheCreateTokens: 0,
-                cacheReadTokens: 0
+                cacheReadTokens: 0,
+                costUsd: 0,
+                hasCostUsd: false
               })
             }
 
@@ -1656,6 +1659,11 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
             modelUsage.outputTokens += parseInt(data.outputTokens) || 0
             modelUsage.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
             modelUsage.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
+            const storedCost = Number.parseFloat(data.costUsd)
+            if (Number.isFinite(storedCost)) {
+              modelUsage.costUsd += storedCost
+              modelUsage.hasCostUsd = true
+            }
           }
         }
       }
@@ -1671,7 +1679,10 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
           cache_read_input_tokens: usage.cacheReadTokens
         }
 
-        const costResult = CostCalculator.calculateCost(usageData, model)
+        const costResult = withStoredAggregateCost(
+          CostCalculator.calculateCost(usageData, model),
+          usage.hasCostUsd ? usage.costUsd : NaN
+        )
         totalCosts.inputCost += costResult.costs.input
         totalCosts.outputCost += costResult.costs.output
         totalCosts.cacheCreateCost += costResult.costs.cacheWrite
@@ -1738,7 +1749,9 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
                 inputTokens: 0,
                 outputTokens: 0,
                 cacheCreateTokens: 0,
-                cacheReadTokens: 0
+                cacheReadTokens: 0,
+                costUsd: 0,
+                hasCostUsd: false
               })
             }
 
@@ -1747,6 +1760,11 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
             modelUsage.outputTokens += parseInt(data.outputTokens) || 0
             modelUsage.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
             modelUsage.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
+            const storedCost = Number.parseFloat(data.costUsd)
+            if (Number.isFinite(storedCost)) {
+              modelUsage.costUsd += storedCost
+              modelUsage.hasCostUsd = true
+            }
           }
         }
 
@@ -1761,7 +1779,10 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
             cache_read_input_tokens: usage.cacheReadTokens
           }
 
-          const costResult = CostCalculator.calculateCost(usageData, model)
+          const costResult = withStoredAggregateCost(
+            CostCalculator.calculateCost(usageData, model),
+            usage.hasCostUsd ? usage.costUsd : NaN
+          )
           totalCosts.inputCost += costResult.costs.input
           totalCosts.outputCost += costResult.costs.output
           totalCosts.cacheCreateCost += costResult.costs.cacheWrite
@@ -1800,8 +1821,10 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
               cache_read_input_tokens: apiKey.usage.total.cacheReadTokens || 0
             }
 
-            // 使用加权平均价格计算（基于当前活跃模型的价格分布）
-            const costResult = CostCalculator.calculateCost(usage, 'claude-3-5-haiku-20241022')
+            const costResult = withStoredAggregateCost(
+              CostCalculator.calculateCost(usage, 'unknown'),
+              Number.parseFloat(apiKey.usage.total.costUsd)
+            )
             totalCosts.inputCost += costResult.costs.input
             totalCosts.outputCost += costResult.costs.output
             totalCosts.cacheCreateCost += costResult.costs.cacheWrite
@@ -1856,7 +1879,10 @@ router.get('/usage-costs', authenticateAdmin, async (req, res) => {
           cache_read_input_tokens: parseInt(data.cacheReadTokens) || 0
         }
 
-        const costResult = CostCalculator.calculateCost(usage, model)
+        const costResult = withStoredAggregateCost(
+          CostCalculator.calculateCost(usage, model),
+          Number.parseFloat(data.costUsd)
+        )
 
         // 累加总费用
         totalCosts.inputCost += costResult.costs.input
@@ -2002,7 +2028,9 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
       output_tokens: record.outputTokens || 0,
       cache_creation_input_tokens: record.cacheCreateTokens || 0,
       cache_read_input_tokens: record.cacheReadTokens || 0,
-      cache_creation: record.cacheCreation || record.cache_creation || null
+      cache_creation: record.cacheCreation || record.cache_creation || null,
+      api_url: record.apiUrl || record.api_url || null,
+      pricing_region: record.pricingRegion || record.pricing_region || null
     })
 
     const withinRange = (record) => {
@@ -2061,7 +2089,10 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
 
     for (const record of filteredRecords) {
       const usage = toUsageObject(record)
-      const costData = CostCalculator.calculateCost(usage, record.model || 'unknown')
+      const costData = CostCalculator.calculateCost(usage, record.model || 'unknown', {
+        apiUrl: usage.api_url,
+        region: usage.pricing_region
+      })
       const computedCost =
         typeof record.cost === 'number' ? record.cost : costData?.costs?.total || 0
       const totalTokens =
@@ -2118,7 +2149,10 @@ router.get('/api-keys/:keyId/usage-records', authenticateAdmin, async (req, res)
     const enrichedRecords = []
     for (const record of pageRecords) {
       const usage = toUsageObject(record)
-      const costData = CostCalculator.calculateCost(usage, record.model || 'unknown')
+      const costData = CostCalculator.calculateCost(usage, record.model || 'unknown', {
+        apiUrl: usage.api_url,
+        region: usage.pricing_region
+      })
       const computedCost =
         typeof record.cost === 'number' ? record.cost : costData?.costs?.total || 0
       const totalTokens =
@@ -2299,7 +2333,9 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
       output_tokens: record.outputTokens || 0,
       cache_creation_input_tokens: record.cacheCreateTokens || 0,
       cache_read_input_tokens: record.cacheReadTokens || 0,
-      cache_creation: record.cacheCreation || record.cache_creation || null
+      cache_creation: record.cacheCreation || record.cache_creation || null,
+      api_url: record.apiUrl || record.api_url || null,
+      pricing_region: record.pricingRegion || record.pricing_region || null
     })
 
     const withinRange = (record) => {
@@ -2403,7 +2439,10 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
 
     for (const record of filteredRecords) {
       const usage = toUsageObject(record)
-      const costData = CostCalculator.calculateCost(usage, record.model || 'unknown')
+      const costData = CostCalculator.calculateCost(usage, record.model || 'unknown', {
+        apiUrl: usage.api_url,
+        region: usage.pricing_region
+      })
       const computedCost =
         typeof record.cost === 'number' ? record.cost : costData?.costs?.total || 0
       const totalTokens =
@@ -2432,7 +2471,10 @@ router.get('/accounts/:accountId/usage-records', authenticateAdmin, async (req, 
     const enrichedRecords = []
     for (const record of pageRecords) {
       const usage = toUsageObject(record)
-      const costData = CostCalculator.calculateCost(usage, record.model || 'unknown')
+      const costData = CostCalculator.calculateCost(usage, record.model || 'unknown', {
+        apiUrl: usage.api_url,
+        region: usage.pricing_region
+      })
       const computedCost =
         typeof record.cost === 'number' ? record.cost : costData?.costs?.total || 0
       const totalTokens =

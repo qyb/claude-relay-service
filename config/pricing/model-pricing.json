@@ -1,0 +1,260 @@
+{
+  "version": "2026.08.15",
+  "reporting_currency": "USD",
+  "sources": {
+    "cn": "https://bigmodel.cn/pricing",
+    "intl": "https://docs.z.ai/guides/overview/pricing"
+  },
+  "exchange_rates": {
+    "CNY": {
+      "to_reporting": 0.1483,
+      "checked_at": "2026-08-15"
+    },
+    "USD": {
+      "to_reporting": 1,
+      "checked_at": "2026-08-15"
+    }
+  },
+  "pricing_aliases": {
+    "glm-5.3": "glm-5.2"
+  },
+  "redirects": {
+    "glm-4.5-air": "glm-4.7",
+    "claude-sonnet-4": "glm-4.7",
+    "glm-5": "glm-5.2",
+    "glm-5.1": "glm-5.2"
+  },
+  "models": {
+    "glm-5.2": {
+      "cn": {
+        "currency": "CNY",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": 0,
+          "status": "limited_time_free"
+        },
+        "tiers": [
+          {
+            "when": {},
+            "input": 8,
+            "cached": 2,
+            "output": 28
+          }
+        ]
+      },
+      "intl": {
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": 0,
+          "status": "limited_time_free"
+        },
+        "tiers": [
+          {
+            "when": {},
+            "input": 1.4,
+            "cached": 0.26,
+            "output": 4.4
+          }
+        ]
+      }
+    },
+    "glm-5-turbo": {
+      "cn": {
+        "currency": "CNY",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": 0,
+          "status": "limited_time_free"
+        },
+        "tiers": [
+          {
+            "when": {
+              "input_length": {
+                "gte": 0,
+                "lt": 32,
+                "unit": "k_tokens"
+              }
+            },
+            "input": 5,
+            "cached": 1.2,
+            "output": 22
+          },
+          {
+            "when": {
+              "input_length": {
+                "gte": 32,
+                "unit": "k_tokens"
+              }
+            },
+            "input": 7,
+            "cached": 1.8,
+            "output": 26
+          }
+        ]
+      },
+      "intl": {
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": 0,
+          "status": "limited_time_free"
+        },
+        "tiers": [
+          {
+            "when": {},
+            "input": 1.2,
+            "cached": 0.24,
+            "output": 4
+          }
+        ]
+      }
+    },
+    "glm-4.7": {
+      "cn": {
+        "currency": "CNY",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": 0,
+          "status": "limited_time_free"
+        },
+        "tiers": [
+          {
+            "when": {
+              "input_length": {
+                "gte": 0,
+                "lt": 32,
+                "unit": "k_tokens"
+              },
+              "output_length": {
+                "gte": 0,
+                "lt": 0.2,
+                "unit": "m_tokens"
+              }
+            },
+            "input": 2,
+            "cached": 0.4,
+            "output": 8
+          },
+          {
+            "when": {
+              "input_length": {
+                "gte": 0,
+                "lt": 32,
+                "unit": "k_tokens"
+              },
+              "output_length": {
+                "gte": 0.2,
+                "unit": "m_tokens"
+              }
+            },
+            "input": 3,
+            "cached": 0.6,
+            "output": 14
+          },
+          {
+            "when": {
+              "input_length": {
+                "gte": 32,
+                "lt": 200,
+                "unit": "k_tokens"
+              }
+            },
+            "input": 4,
+            "cached": 0.8,
+            "output": 16
+          }
+        ]
+      },
+      "intl": {
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": 0,
+          "status": "limited_time_free"
+        },
+        "tiers": [
+          {
+            "when": {},
+            "input": 0.6,
+            "cached": 0.11,
+            "output": 2.2
+          }
+        ]
+      }
+    },
+    "glm-4.5-air": {
+      "cn": {
+        "currency": "CNY",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": 0,
+          "status": "limited_time_free"
+        },
+        "tiers": [
+          {
+            "when": {
+              "input_length": {
+                "gte": 0,
+                "lt": 32,
+                "unit": "k_tokens"
+              },
+              "output_length": {
+                "gte": 0,
+                "lt": 0.2,
+                "unit": "m_tokens"
+              }
+            },
+            "input": 0.8,
+            "cached": 0.16,
+            "output": 2
+          },
+          {
+            "when": {
+              "input_length": {
+                "gte": 0,
+                "lt": 32,
+                "unit": "k_tokens"
+              },
+              "output_length": {
+                "gte": 0.2,
+                "unit": "m_tokens"
+              }
+            },
+            "input": 0.8,
+            "cached": 0.16,
+            "output": 6
+          },
+          {
+            "when": {
+              "input_length": {
+                "gte": 32,
+                "lt": 128,
+                "unit": "k_tokens"
+              }
+            },
+            "input": 1.2,
+            "cached": 0.24,
+            "output": 8
+          }
+        ]
+      },
+      "intl": {
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": 0,
+          "status": "limited_time_free"
+        },
+        "tiers": [
+          {
+            "when": {},
+            "input": 0.2,
+            "cached": 0.03,
+            "output": 1.1
+          }
+        ]
+      }
+    }
+  }
+}

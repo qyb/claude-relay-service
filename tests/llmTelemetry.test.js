@@ -1,5 +1,7 @@
 jest.mock('../src/utils/logger', () => ({
-  telemetry: jest.fn()
+  telemetry: jest.fn(),
+  warn: jest.fn(),
+  debug: jest.fn()
 }))
 
 const logger = require('../src/utils/logger')
@@ -275,6 +277,30 @@ describe('llmTelemetry finalization', () => {
       stop_reason: 'tool_use',
       tool_use_count: 2,
       parallel_tool_use_detected: true
+    })
+  })
+
+  it('按实际上游区域模型回填美元成本并保留请求模型', () => {
+    const context = createTelemetryContext(
+      buildRequest({ body: { model: 'glm-5.3', stream: false } }),
+      buildSessionInfo()
+    )
+
+    finalizeTelemetry(context, {
+      eventType: 'llm_request_completed',
+      model: 'glm-5.3',
+      apiUrl: 'https://api.z.ai/api/anthropic',
+      usage: { input_tokens: 1000000, output_tokens: 0 }
+    })
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      model: 'glm-5.3',
+      requested_model: 'glm-5.3',
+      api_url: 'https://api.z.ai/api/anthropic',
+      cost: 1.4,
+      has_pricing: true,
+      pricing_model: 'glm-5.2',
+      pricing_region: 'intl',
+      provisional_pricing: true
     })
   })
 

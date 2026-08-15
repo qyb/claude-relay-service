@@ -94,6 +94,9 @@ class CcrRelayService {
       if (!account) {
         throw new Error('CCR account not found')
       }
+      if (typeof options.onUpstreamDetails === 'function') {
+        options.onUpstreamDetails({ accountId, accountType: 'ccr', apiUrl: account.apiUrl })
+      }
 
       logger.info(
         `📤 Processing CCR API request for key: ${apiKeyData.name || apiKeyData.id}, account: ${account.name} (${accountId})`
@@ -312,7 +315,8 @@ class CcrRelayService {
         statusCode: response.status,
         headers: response.headers,
         body: responseBody,
-        accountId
+        accountId,
+        apiUrl: account.apiUrl
       }
     } catch (error) {
       // 处理特定错误
@@ -436,6 +440,9 @@ class CcrRelayService {
       account = await ccrAccountService.getAccount(accountId)
       if (!account) {
         throw new Error('CCR account not found')
+      }
+      if (typeof options.onUpstreamDetails === 'function') {
+        options.onUpstreamDetails({ accountId, accountType: 'ccr', apiUrl: account.apiUrl })
       }
 
       logger.info(
@@ -775,7 +782,12 @@ class CcrRelayService {
               try {
                 logger.debug(`📊 Collected usage data: ${JSON.stringify(collectedUsage)}`)
                 // 在 usage 回调中包含模型信息
-                usageCallback({ ...collectedUsage, accountId, model: body.model })
+                usageCallback({
+                  ...collectedUsage,
+                  accountId,
+                  model: body.model,
+                  apiUrl: account.apiUrl
+                })
               } catch (err) {
                 logger.error('❌ Error in usage callback:', err)
               }

@@ -9,6 +9,18 @@ const { createClaudeTestPayload } = require('../utils/testPayloadHelper')
 
 const router = express.Router()
 
+const withStoredAggregateCost = (costData, storedCost) => {
+  if (!Number.isFinite(storedCost)) {
+    return costData
+  }
+
+  return {
+    ...costData,
+    costs: { ...costData.costs, total: storedCost },
+    formatted: { ...costData.formatted, total: CostCalculator.formatCost(storedCost) }
+  }
+}
+
 // 🏠 重定向页面请求到新版 admin-spa
 router.get('/', (req, res) => {
   res.redirect(301, '/admin-next/api-stats')
@@ -242,7 +254,9 @@ router.post('/api/user-stats', async (req, res) => {
                 inputTokens: 0,
                 outputTokens: 0,
                 cacheCreateTokens: 0,
-                cacheReadTokens: 0
+                cacheReadTokens: 0,
+                costUsd: 0,
+                hasCostUsd: false
               })
             }
 
@@ -251,6 +265,11 @@ router.post('/api/user-stats', async (req, res) => {
             modelUsage.outputTokens += parseInt(data.outputTokens) || 0
             modelUsage.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
             modelUsage.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
+            const storedCost = Number.parseFloat(data.costUsd)
+            if (Number.isFinite(storedCost)) {
+              modelUsage.costUsd += storedCost
+              modelUsage.hasCostUsd = true
+            }
           }
         }
 
@@ -263,22 +282,22 @@ router.post('/api/user-stats', async (req, res) => {
             cache_read_input_tokens: usage.cacheReadTokens
           }
 
-          const costResult = CostCalculator.calculateCost(usageData, model)
-          totalCost += costResult.costs.total
+          if (usage.hasCostUsd) {
+            totalCost += usage.costUsd
+          } else {
+            const costResult = CostCalculator.calculateCost(usageData, model)
+            totalCost += costResult.costs.total
+          }
         }
 
         // 如果没有模型级别的详细数据，回退到总体数据计算
-        if (modelUsageMap.size === 0 && fullKeyData.usage?.total?.allTokens > 0) {
+        if (
+          modelUsageMap.size === 0 &&
+          fullKeyData.usage?.total?.allTokens > 0 &&
+          fullKeyData.usage.total.hasCostUsd
+        ) {
           const usage = fullKeyData.usage.total
-          const costUsage = {
-            input_tokens: usage.inputTokens || 0,
-            output_tokens: usage.outputTokens || 0,
-            cache_creation_input_tokens: usage.cacheCreateTokens || 0,
-            cache_read_input_tokens: usage.cacheReadTokens || 0
-          }
-
-          const costResult = CostCalculator.calculateCost(costUsage, 'claude-3-5-sonnet-20241022')
-          totalCost = costResult.costs.total
+          totalCost = usage.costUsd
         }
 
         formattedCost = CostCalculator.formatCost(totalCost)
@@ -286,18 +305,10 @@ router.post('/api/user-stats', async (req, res) => {
     } catch (error) {
       logger.warn(`Failed to calculate cost for key ${keyId}:`, error)
       // 回退到简单计算
-      if (fullKeyData.usage?.total?.allTokens > 0) {
+      if (fullKeyData.usage?.total?.allTokens > 0 && fullKeyData.usage.total.hasCostUsd) {
         const usage = fullKeyData.usage.total
-        const costUsage = {
-          input_tokens: usage.inputTokens || 0,
-          output_tokens: usage.outputTokens || 0,
-          cache_creation_input_tokens: usage.cacheCreateTokens || 0,
-          cache_read_input_tokens: usage.cacheReadTokens || 0
-        }
-
-        const costResult = CostCalculator.calculateCost(costUsage, 'claude-3-5-sonnet-20241022')
-        totalCost = costResult.costs.total
-        formattedCost = costResult.formatted.total
+        totalCost = usage.costUsd
+        formattedCost = CostCalculator.formatCost(totalCost)
       }
     }
 
@@ -741,7 +752,9 @@ router.post('/api/batch-model-stats', async (req, res) => {
                 outputTokens: 0,
                 cacheCreateTokens: 0,
                 cacheReadTokens: 0,
-                allTokens: 0
+                allTokens: 0,
+                costUsd: 0,
+                hasCostUsd: false
               })
             }
 
@@ -752,6 +765,11 @@ router.post('/api/batch-model-stats', async (req, res) => {
             modelUsage.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
             modelUsage.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
             modelUsage.allTokens += parseInt(data.allTokens) || 0
+            const storedCost = Number.parseFloat(data.costUsd)
+            if (Number.isFinite(storedCost)) {
+              modelUsage.costUsd += storedCost
+              modelUsage.hasCostUsd = true
+            }
           }
         }
       })
@@ -767,7 +785,10 @@ router.post('/api/batch-model-stats', async (req, res) => {
         cache_read_input_tokens: usage.cacheReadTokens
       }
 
-      const costData = CostCalculator.calculateCost(usageData, model)
+      const costData = withStoredAggregateCost(
+        CostCalculator.calculateCost(usageData, model),
+        usage.hasCostUsd ? usage.costUsd : NaN
+      )
 
       modelStats.push({
         model,
@@ -978,7 +999,10 @@ router.post('/api/user-model-stats', async (req, res) => {
           cache_read_input_tokens: parseInt(data.cacheReadTokens) || 0
         }
 
-        const costData = CostCalculator.calculateCost(usage, model)
+        const costData = withStoredAggregateCost(
+          CostCalculator.calculateCost(usage, model),
+          Number.parseFloat(data.costUsd)
+        )
 
         modelStats.push({
           model,

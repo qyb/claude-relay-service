@@ -7,9 +7,20 @@ const claudeAccountService = require('../../services/claudeAccountService')
 const redis = require('../../models/redis')
 const { authenticateAdmin } = require('../../middleware/auth')
 const logger = require('../../utils/logger')
+const pricingService = require('../../services/pricingService')
 const config = require('../../../config/config')
 
 const router = express.Router()
+
+router.get('/pricing/missing-counts', authenticateAdmin, (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      counts: pricingService.getMissingPricingCounts(),
+      pricing: pricingService.getStatus()
+    }
+  })
+})
 
 // ==================== Claude Code Headers 管理 ====================
 

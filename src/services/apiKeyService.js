@@ -985,7 +985,8 @@ class ApiKeyService {
     cacheCreateTokens = 0,
     cacheReadTokens = 0,
     model = 'unknown',
-    accountId = null
+    accountId = null,
+    options = {}
   ) {
     try {
       const totalTokens = inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens
@@ -999,7 +1000,8 @@ class ApiKeyService {
           cache_creation_input_tokens: cacheCreateTokens,
           cache_read_input_tokens: cacheReadTokens
         },
-        model
+        model,
+        options
       )
 
       // 检查是否为 1M 上下文请求
@@ -1020,7 +1022,8 @@ class ApiKeyService {
         model,
         0, // ephemeral5mTokens - 暂时为0，后续处理
         0, // ephemeral1hTokens - 暂时为0，后续处理
-        isLongContextRequest
+        isLongContextRequest,
+        costInfo.costs.total
       )
 
       // 记录费用统计
@@ -1050,7 +1053,8 @@ class ApiKeyService {
             cacheCreateTokens,
             cacheReadTokens,
             model,
-            isLongContextRequest
+            isLongContextRequest,
+            costInfo.costs.total
           )
           logger.database(
             `📊 Recorded account usage: ${accountId} - ${totalTokens} tokens (API Key: ${keyId})`
@@ -1068,6 +1072,10 @@ class ApiKeyService {
         timestamp: new Date().toISOString(),
         model,
         accountId: accountId || null,
+        apiUrl: options.apiUrl || null,
+        pricingRegion: costInfo.region || null,
+        pricingModel: costInfo.pricing_model || null,
+        provisionalPricing: costInfo.provisionalPricing === true,
         inputTokens,
         outputTokens,
         cacheCreateTokens,
@@ -1147,14 +1155,18 @@ class ApiKeyService {
           logger.warn('⚠️ PricingService not initialized, initializing now...')
           await pricingService.initialize()
         }
-        costInfo = pricingService.calculateCost(usageObject, model)
+        costInfo = pricingService.calculateCost(usageObject, model, {
+          apiUrl: usageObject.api_url
+        })
 
         // 验证计算结果
         if (!costInfo || typeof costInfo.totalCost !== 'number') {
           logger.error(`❌ Invalid cost calculation result for model ${model}:`, costInfo)
           // 使用 CostCalculator 作为后备
           const CostCalculator = require('../utils/costCalculator')
-          const fallbackCost = CostCalculator.calculateCost(usageObject, model)
+          const fallbackCost = CostCalculator.calculateCost(usageObject, model, {
+            apiUrl: usageObject.api_url
+          })
           if (fallbackCost && fallbackCost.costs && fallbackCost.costs.total > 0) {
             logger.warn(
               `⚠️ Using fallback cost calculation for ${model}: $${fallbackCost.costs.total}`
@@ -1174,7 +1186,9 @@ class ApiKeyService {
         // 使用 CostCalculator 作为后备
         try {
           const CostCalculator = require('../utils/costCalculator')
-          const fallbackCost = CostCalculator.calculateCost(usageObject, model)
+          const fallbackCost = CostCalculator.calculateCost(usageObject, model, {
+            apiUrl: usageObject.api_url
+          })
           if (fallbackCost && fallbackCost.costs && fallbackCost.costs.total > 0) {
             logger.warn(
               `⚠️ Using fallback cost calculation for ${model}: $${fallbackCost.costs.total}`
@@ -1210,7 +1224,8 @@ class ApiKeyService {
         model,
         ephemeral5mTokens, // 传递5分钟缓存 tokens
         ephemeral1hTokens, // 传递1小时缓存 tokens
-        costInfo.isLongContextRequest || false // 传递 1M 上下文请求标记
+        costInfo.isLongContextRequest || false, // 传递 1M 上下文请求标记
+        costInfo.totalCost
       )
 
       // 记录费用统计
@@ -1260,7 +1275,8 @@ class ApiKeyService {
             cacheCreateTokens,
             cacheReadTokens,
             model,
-            costInfo.isLongContextRequest || false
+            costInfo.isLongContextRequest || false,
+            costInfo.totalCost
           )
           logger.database(
             `📊 Recorded account usage: ${accountId} - ${totalTokens} tokens (API Key: ${keyId})`
@@ -1277,6 +1293,10 @@ class ApiKeyService {
         model,
         accountId: accountId || null,
         accountType: accountType || null,
+        apiUrl: usageObject.api_url || null,
+        pricingRegion: costInfo.region || null,
+        pricingModel: costInfo.pricing_model || null,
+        provisionalPricing: costInfo.provisionalPricing === true,
         inputTokens,
         outputTokens,
         cacheCreateTokens,

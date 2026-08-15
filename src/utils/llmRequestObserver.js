@@ -85,6 +85,7 @@ class LlmRequestObserver {
     this.provider = null
     this.accountId = null
     this.accountType = null
+    this.apiUrl = null
     this.model = req?.body?.model ?? null
     this.upstreamRequestId = null
     this.queueRequestId = null
@@ -110,6 +111,7 @@ class LlmRequestObserver {
   observeUpstream(details = {}) {
     this.accountId = details.accountId ?? this.accountId
     this.accountType = details.accountType ?? this.accountType
+    this.apiUrl = details.apiUrl ?? this.apiUrl
     this.provider = details.provider ?? providerForAccountType(details.accountType) ?? this.provider
     this.model = details.model ?? this.model
     this.queueRequestId = details.queueRequestId ?? this.queueRequestId
@@ -371,6 +373,7 @@ class LlmRequestObserver {
       provider: this.provider,
       accountId: this.accountId,
       accountType: this.accountType,
+      apiUrl: this.apiUrl,
       model: this.model,
       upstreamRequestId: this.upstreamRequestId,
       queueRequestId: this.queueRequestId,

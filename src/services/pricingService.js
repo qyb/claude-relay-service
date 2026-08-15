@@ -18,7 +18,13 @@ class PricingService {
       'model_prices_and_context_window.json'
     )
     this.localHashFile = path.join(this.dataDir, 'model_pricing.sha256')
+    this.regionalPricingFile = path.join(process.cwd(), 'config', 'pricing', 'model-pricing.json')
     this.pricingData = null
+    this.regionalPricingData = null
+    this.regionalPricingLoadError = null
+    this.regionalPricingMtimeMs = null
+    this.regionalPricingLoadErrorMtimeMs = null
+    this.missingPricingCounts = new Map()
     this.lastUpdated = null
     this.updateInterval = 24 * 60 * 60 * 1000 // 24小时
     this.hashCheckInterval = 10 * 60 * 1000 // 10分钟哈希校验
@@ -385,7 +391,301 @@ class PricingService {
   }
 
   // 获取模型价格信息
-  getModelPricing(modelName) {
+  loadRegionalPricingData() {
+    let mtimeMs = null
+    try {
+      const { mtimeMs: fileMtimeMs } = fs.statSync(this.regionalPricingFile)
+      mtimeMs = fileMtimeMs
+    } catch (_error) {
+      mtimeMs = null
+    }
+
+    if (this.regionalPricingData && this.regionalPricingMtimeMs === mtimeMs) {
+      return this.regionalPricingData
+    }
+    if (this.regionalPricingLoadError && this.regionalPricingLoadErrorMtimeMs === mtimeMs) {
+      return null
+    }
+
+    try {
+      const data = fs.readFileSync(this.regionalPricingFile, 'utf8')
+      const parsed = JSON.parse(data)
+      this.validateRegionalPricingData(parsed)
+      this.regionalPricingData = parsed
+      this.regionalPricingMtimeMs = mtimeMs
+      this.regionalPricingLoadError = null
+      this.regionalPricingLoadErrorMtimeMs = null
+      return parsed
+    } catch (error) {
+      this.regionalPricingLoadError = error
+      this.regionalPricingLoadErrorMtimeMs = mtimeMs
+      logger.error(`❌ Failed to load regional pricing data: ${error.message}`)
+      return null
+    }
+  }
+
+  validateRegionalPricingData(data) {
+    if (!data || typeof data !== 'object') {
+      throw new Error('Regional pricing data must be an object')
+    }
+    if (data.reporting_currency !== 'USD') {
+      throw new Error('Regional pricing reporting_currency must be USD')
+    }
+    if (!data.exchange_rates || typeof data.exchange_rates !== 'object') {
+      throw new Error('Regional pricing exchange_rates are required')
+    }
+    if (!data.models || typeof data.models !== 'object') {
+      throw new Error('Regional pricing models are required')
+    }
+
+    for (const [modelName, modelPricing] of Object.entries(data.models)) {
+      if (!modelPricing || typeof modelPricing !== 'object') {
+        throw new Error(`Regional pricing model ${modelName} must be an object`)
+      }
+      for (const [region, regionPricing] of Object.entries(modelPricing)) {
+        if (!regionPricing || typeof regionPricing !== 'object') {
+          throw new Error(`Regional pricing ${modelName}.${region} must be an object`)
+        }
+        if (typeof regionPricing.currency !== 'string') {
+          throw new Error(`Regional pricing ${modelName}.${region} currency is required`)
+        }
+        const exchangeRate = data.exchange_rates[regionPricing.currency]?.to_reporting
+        if (typeof exchangeRate !== 'number' || !Number.isFinite(exchangeRate)) {
+          throw new Error(`Missing exchange rate for ${regionPricing.currency}`)
+        }
+        if (!Array.isArray(regionPricing.tiers) || regionPricing.tiers.length === 0) {
+          throw new Error(`Regional pricing ${modelName}.${region} tiers are required`)
+        }
+
+        for (const tier of regionPricing.tiers) {
+          for (const field of ['input', 'cached', 'output']) {
+            if (
+              typeof tier?.[field] !== 'number' ||
+              !Number.isFinite(tier[field]) ||
+              tier[field] < 0
+            ) {
+              throw new Error(`Invalid ${field} price for ${modelName}.${region}`)
+            }
+          }
+          for (const condition of [tier?.when?.input_length, tier?.when?.output_length]) {
+            if (!condition) {
+              continue
+            }
+            if (condition.unit && !['tokens', 'k_tokens', 'm_tokens'].includes(condition.unit)) {
+              throw new Error(`Invalid tier unit for ${modelName}.${region}`)
+            }
+            const lower = this.normalizeTierBound(condition.gte, condition.unit)
+            const upper = this.normalizeTierBound(condition.lt, condition.unit)
+            if (lower !== null && upper !== null && lower >= upper) {
+              throw new Error(`Invalid tier range for ${modelName}.${region}`)
+            }
+          }
+        }
+
+        for (let i = 0; i < regionPricing.tiers.length; i += 1) {
+          for (let j = i + 1; j < regionPricing.tiers.length; j += 1) {
+            if (this.tiersOverlap(regionPricing.tiers[i], regionPricing.tiers[j])) {
+              throw new Error(`Overlapping tiers for ${modelName}.${region}`)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  tiersOverlap(left, right) {
+    const rangesOverlap = (leftCondition, rightCondition) => {
+      const leftLower = this.normalizeTierBound(leftCondition?.gte, leftCondition?.unit)
+      const leftUpper = this.normalizeTierBound(leftCondition?.lt, leftCondition?.unit)
+      const rightLower = this.normalizeTierBound(rightCondition?.gte, rightCondition?.unit)
+      const rightUpper = this.normalizeTierBound(rightCondition?.lt, rightCondition?.unit)
+      const lower = Math.max(leftLower ?? -Infinity, rightLower ?? -Infinity)
+      const upper = Math.min(leftUpper ?? Infinity, rightUpper ?? Infinity)
+      return lower < upper
+    }
+
+    return (
+      rangesOverlap(left?.when?.input_length, right?.when?.input_length) &&
+      rangesOverlap(left?.when?.output_length, right?.when?.output_length)
+    )
+  }
+
+  getRegionForApiUrl(apiUrl) {
+    if (!apiUrl || typeof apiUrl !== 'string') {
+      return null
+    }
+
+    try {
+      const hostname = new URL(apiUrl).hostname.toLowerCase()
+      if (hostname === 'open.bigmodel.cn') {
+        return 'cn'
+      }
+      if (hostname === 'api.z.ai') {
+        return 'intl'
+      }
+    } catch (_error) {
+      return null
+    }
+
+    return null
+  }
+
+  normalizeTierBound(value, unit) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return null
+    }
+    if (unit === 'k_tokens') {
+      return value * 1000
+    }
+    if (unit === 'm_tokens') {
+      return value * 1000000
+    }
+    return value
+  }
+
+  matchesTierCondition(value, condition) {
+    if (!condition || typeof condition !== 'object') {
+      return true
+    }
+
+    const normalizedValue = Number.isFinite(value) ? value : null
+    if (normalizedValue === null) {
+      return false
+    }
+
+    const lower = this.normalizeTierBound(condition.gte, condition.unit)
+    const upper = this.normalizeTierBound(condition.lt, condition.unit)
+    if (lower !== null && normalizedValue < lower) {
+      return false
+    }
+    if (upper !== null && normalizedValue >= upper) {
+      return false
+    }
+    return true
+  }
+
+  selectRegionalTier(regionPricing, usage = {}) {
+    const tiers = Array.isArray(regionPricing?.tiers) ? regionPricing.tiers : []
+    if (tiers.length === 0) {
+      return null
+    }
+
+    const inputLength =
+      (usage.input_tokens || 0) +
+      (usage.cache_creation_input_tokens || 0) +
+      (usage.cache_read_input_tokens || 0)
+    const outputLength = usage.output_tokens
+    const matches = tiers.filter((tier) => {
+      const when = tier?.when || {}
+      return (
+        this.matchesTierCondition(inputLength, when.input_length) &&
+        this.matchesTierCondition(outputLength, when.output_length)
+      )
+    })
+
+    return matches.length === 1 ? matches[0] : null
+  }
+
+  getRegionalModelPricing(modelName, options = {}) {
+    const regionalData = this.loadRegionalPricingData()
+    const region = options.region || this.getRegionForApiUrl(options.apiUrl)
+    if (!regionalData || !region || !modelName) {
+      return null
+    }
+
+    const models = regionalData.models || {}
+    let pricingModel = modelName
+    let provisionalPricing = false
+    if (!models[pricingModel] && regionalData.pricing_aliases?.[modelName]) {
+      pricingModel = regionalData.pricing_aliases[modelName]
+      provisionalPricing = true
+    }
+
+    const regionPricing = models[pricingModel]?.[region]
+    const tier = this.selectRegionalTier(regionPricing, options.usage)
+    if (!regionPricing || !tier) {
+      if (provisionalPricing) {
+        logger.warn(
+          `⚠️ No regional tier found for provisional pricing alias ${modelName} -> ${pricingModel}`
+        )
+      }
+      return null
+    }
+
+    const exchangeRate = regionalData.exchange_rates?.[regionPricing.currency]?.to_reporting
+    if (typeof exchangeRate !== 'number' || !Number.isFinite(exchangeRate)) {
+      logger.warn(`⚠️ No exchange rate found for regional currency ${regionPricing.currency}`)
+      return null
+    }
+
+    const pricePerToken = (pricePerMillion) => (Number(pricePerMillion) * exchangeRate) / 1000000
+
+    return {
+      input_cost_per_token: pricePerToken(tier.input),
+      output_cost_per_token: pricePerToken(tier.output),
+      cache_creation_input_token_cost: 0,
+      cache_read_input_token_cost: pricePerToken(tier.cached),
+      litellm_provider: 'zhipu',
+      currency: regionalData.reporting_currency,
+      source_currency: regionPricing.currency,
+      region,
+      pricing_model: pricingModel,
+      provisionalPricing,
+      tier
+    }
+  }
+
+  getRegionalPricingCoverage(modelName) {
+    const regionalData = this.loadRegionalPricingData()
+    if (!regionalData || !modelName) {
+      return null
+    }
+
+    const models = regionalData.models || {}
+    if (Object.prototype.hasOwnProperty.call(models, modelName)) {
+      return { pricingModel: modelName, provisionalPricing: false }
+    }
+
+    const pricingModel = regionalData.pricing_aliases?.[modelName]
+    if (pricingModel && Object.prototype.hasOwnProperty.call(models, pricingModel)) {
+      return { pricingModel, provisionalPricing: true }
+    }
+
+    return null
+  }
+
+  isRegionalModelName(modelName) {
+    return typeof modelName === 'string' && modelName.toLowerCase().startsWith('glm-')
+  }
+
+  recordMissingPricing(modelName, options = {}, usage = {}) {
+    const region = options.region || this.getRegionForApiUrl(options.apiUrl) || 'unknown'
+    const key = `${region}:${modelName || 'unknown'}`
+    const count = (this.missingPricingCounts.get(key) || 0) + 1
+    this.missingPricingCounts.set(key, count)
+    logger.warn(
+      `⚠️ Missing pricing for model ${modelName || 'unknown'} in region ${region} ` +
+        `(input=${usage.input_tokens || 0}, output=${usage.output_tokens || 0}, count=${count})`
+    )
+  }
+
+  // 获取模型价格信息
+  getModelPricing(modelName, options = {}) {
+    const regionalCoverage = this.getRegionalPricingCoverage(modelName)
+    const regionalPricing = this.getRegionalModelPricing(modelName, options)
+    if (regionalPricing) {
+      return regionalPricing
+    }
+    if (regionalCoverage || this.isRegionalModelName(modelName)) {
+      logger.warn(
+        `⚠️ Regional pricing unavailable for covered model ${modelName} ` +
+          `(pricing_model=${regionalCoverage?.pricingModel || modelName}, region=${
+            options.region || this.getRegionForApiUrl(options.apiUrl) || 'unknown'
+          })`
+      )
+      return null
+    }
+
     if (!this.pricingData || !modelName) {
       return null
     }
@@ -452,6 +752,10 @@ class PricingService {
       return pricing
     }
 
+    if (pricing.litellm_provider !== 'anthropic') {
+      return pricing
+    }
+
     // 如果缺少缓存价格，根据输入价格计算（缓存创建价格通常是输入价格的1.25倍，缓存读取是0.1倍）
     if (!pricing.cache_creation_input_token_cost && pricing.input_cost_per_token) {
       pricing.cache_creation_input_token_cost = pricing.input_cost_per_token * 1.25
@@ -497,7 +801,7 @@ class PricingService {
   }
 
   // 计算使用费用
-  calculateCost(usage, modelName) {
+  calculateCost(usage, modelName, options = {}) {
     // 检查是否为 1M 上下文模型
     const isLongContextModel = modelName && modelName.includes('[1m]')
     let isLongContextRequest = false
@@ -529,9 +833,12 @@ class PricingService {
       }
     }
 
-    const pricing = this.getModelPricing(modelName)
+    const pricing = this.getModelPricing(modelName, { ...options, usage })
 
     if (!pricing && !useLongContextPricing) {
+      if (options.apiUrl || options.region || this.getRegionalPricingCoverage(modelName)) {
+        this.recordMissingPricing(modelName, options, usage)
+      }
       return {
         inputCost: 0,
         outputCost: 0,
@@ -541,7 +848,12 @@ class PricingService {
         ephemeral1hCost: 0,
         totalCost: 0,
         hasPricing: false,
-        isLongContextRequest: false
+        isLongContextRequest: false,
+        pricing: null,
+        pricing_model: null,
+        provisionalPricing: false,
+        region: null,
+        source_currency: null
       }
     }
 
@@ -608,6 +920,11 @@ class PricingService {
       totalCost: inputCost + outputCost + cacheCreateCost + cacheReadCost,
       hasPricing: true,
       isLongContextRequest,
+      pricing_model: pricing?.pricing_model || modelName,
+      provisionalPricing: pricing?.provisionalPricing === true,
+      currency: pricing?.currency || 'USD',
+      region: pricing?.region || null,
+      source_currency: pricing?.source_currency || null,
       pricing: {
         input: useLongContextPricing
           ? (
@@ -651,10 +968,20 @@ class PricingService {
       initialized: this.pricingData !== null,
       lastUpdated: this.lastUpdated,
       modelCount: this.pricingData ? Object.keys(this.pricingData).length : 0,
+      regionalPricingLoaded: this.regionalPricingData !== null,
+      regionalPricingLoadError: this.regionalPricingLoadError?.message || null,
       nextUpdate: this.lastUpdated
         ? new Date(this.lastUpdated.getTime() + this.updateInterval)
         : null
     }
+  }
+
+  getMissingPricingCounts() {
+    return Object.fromEntries(
+      [...this.missingPricingCounts.entries()]
+        .sort(([, left], [, right]) => right - left)
+        .map(([key, count]) => [key, count])
+    )
   }
 
   // 强制更新价格数据
