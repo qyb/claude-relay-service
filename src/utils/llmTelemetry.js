@@ -149,6 +149,7 @@ function detectHarness(headers = {}) {
   const userAgent = getHeader(headers, 'user-agent') || ''
   const patterns = [
     { regex: /^claude-cli\/([a-zA-Z0-9.-]+)/i, id: 'claude-code' },
+    { regex: /^zcode\/([a-zA-Z0-9.-]+)(?:\s|$)/i, id: 'zcode' },
     { regex: /^codex_cli_rs\/([a-zA-Z0-9.-]+)/i, id: 'codex-cli' },
     { regex: /^codex_vscode\/([a-zA-Z0-9.-]+)/i, id: 'codex-vscode' },
     { regex: /^factory-cli\/([a-zA-Z0-9.-]+)/i, id: 'droid' }

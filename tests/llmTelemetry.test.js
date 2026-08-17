@@ -65,6 +65,17 @@ describe('llmTelemetry summaries', () => {
     })
   })
 
+  it.each([
+    'ZCode/3.6.5 ai-sdk/provider-utils/4.0.27 runtime/node.js/24',
+    'ZCode/3.6.5 ai/6.0.193 ai-sdk/provider-utils/4.0.27 runtime/node.js/24'
+  ])('从 ZCode User-Agent 识别 harness 与版本: %s', (userAgent) => {
+    expect(detectHarness({ 'user-agent': userAgent })).toEqual({
+      harness_id: 'zcode',
+      harness_version: '3.6.5',
+      harness_source: 'user_agent'
+    })
+  })
+
   it('显式 harness header 优先于 User-Agent', () => {
     expect(
       detectHarness({
