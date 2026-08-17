@@ -5,6 +5,7 @@ const redis = require('../models/redis')
 const logger = require('../utils/logger')
 const config = require('../../config/config')
 const LRUCache = require('../utils/lruCache')
+const { recordUpstreamTelemetry } = require('../utils/llmTelemetry')
 
 class ClaudeConsoleAccountService {
   constructor() {
@@ -482,7 +483,8 @@ class ClaudeConsoleAccountService {
   }
 
   // 🚫 标记账号为限流状态
-  async markAccountRateLimited(accountId, rateLimitResetTimestamp = null) {
+  // context.suppressionId：调度器生成的摘除标识，用于串联 detected/suppressed/recovered 事件
+  async markAccountRateLimited(accountId, rateLimitResetTimestamp = null, context = {}) {
     try {
       const client = redis.getClientSafe()
       const account = await this.getAccount(accountId)
@@ -499,14 +501,18 @@ class ClaudeConsoleAccountService {
         return { success: true, skipped: true }
       }
 
+      const suppressedAt = new Date().toISOString()
       const updates = {
-        rateLimitedAt: new Date().toISOString(),
+        rateLimitedAt: suppressedAt,
         rateLimitStatus: 'limited',
         isActive: 'false', // 禁用账户
         schedulable: 'false', // 停止调度，与其他平台保持一致
-        errorMessage: `Rate limited at ${new Date().toISOString()}`,
+        errorMessage: `Rate limited at ${suppressedAt}`,
         // 使用独立的限流自动停止标记
         rateLimitAutoStopped: 'true'
+      }
+      if (context.suppressionId) {
+        updates.rateLimitStateId = context.suppressionId
       }
 
       // 如果提供了准确的重置时间戳（秒）
@@ -557,7 +563,11 @@ class ClaudeConsoleAccountService {
       logger.warn(
         `🚫 Claude Console account marked as rate limited: ${account.name} (${accountId})`
       )
-      return { success: true }
+      // 供调度器补全 account_suppressed 事件的预期恢复信息
+      const expectedRecoveryAt =
+        updates.rateLimitEndAt ??
+        new Date(Date.now() + (account.rateLimitDuration || 60) * 60 * 1000).toISOString()
+      return { success: true, rateLimitedAt: suppressedAt, expectedRecoveryAt }
     } catch (error) {
       logger.error(`❌ Failed to mark Claude Console account as rate limited: ${accountId}`, error)
       throw error
@@ -565,20 +575,32 @@ class ClaudeConsoleAccountService {
   }
 
   // ✅ 移除账号的限流状态
-  async removeAccountRateLimit(accountId) {
+  // options.recoverySource：timer_expired / upstream_reset_time / successful_inflight_response / manual
+  async removeAccountRateLimit(accountId, options = {}) {
     try {
       const client = redis.getClientSafe()
       const accountKey = `${this.ACCOUNT_KEY_PREFIX}${accountId}`
 
-      // 获取账户当前状态和额度信息
-      const [currentStatus, quotaStoppedAt] = await client.hmget(
-        accountKey,
-        'status',
-        'quotaStoppedAt'
-      )
+      // 获取账户当前状态和额度信息（恢复事件需要摘除开始时刻与 suppression_id）
+      const [currentStatus, quotaStoppedAt, rateLimitedAt, rateLimitEndAt, rateLimitStateId] =
+        await client.hmget(
+          accountKey,
+          'status',
+          'quotaStoppedAt',
+          'rateLimitedAt',
+          'rateLimitEndAt',
+          'rateLimitStateId'
+        )
+      const wasRateLimited = Boolean(rateLimitedAt)
 
       // 删除限流相关字段（包括 rateLimitEndAt）
-      await client.hdel(accountKey, 'rateLimitedAt', 'rateLimitStatus', 'rateLimitEndAt')
+      await client.hdel(
+        accountKey,
+        'rateLimitedAt',
+        'rateLimitStatus',
+        'rateLimitEndAt',
+        'rateLimitStateId'
+      )
 
       // 根据不同情况决定是否恢复账户
       if (currentStatus === 'rate_limited') {
@@ -624,6 +646,31 @@ class ClaudeConsoleAccountService {
         logger.success(`✅ Rate limit removed for Claude Console account: ${accountId}`)
       }
 
+      // 恢复事件：实际摘除时长与恢复来源可直接审计（提前恢复/竞态均可见）
+      if (wasRateLimited) {
+        const actualRecoveryAt = new Date()
+        let actualSuppressionSeconds = null
+        if (rateLimitedAt) {
+          const startedAt = new Date(rateLimitedAt)
+          if (!Number.isNaN(startedAt.getTime())) {
+            actualSuppressionSeconds = Math.max(
+              0,
+              Math.round((actualRecoveryAt - startedAt) / 1000)
+            )
+          }
+        }
+        recordUpstreamTelemetry('account_recovered', {
+          gatewayRequestId: options.gatewayRequestId ?? null,
+          accountId,
+          accountType: 'claude-console',
+          recoverySource: options.recoverySource ?? 'manual',
+          expectedRecoveryAt: rateLimitEndAt ?? null,
+          actualRecoveryAt: actualRecoveryAt.toISOString(),
+          actualSuppressionSeconds,
+          suppressionId: rateLimitStateId ?? rateLimitedAt ?? null
+        })
+      }
+
       return { success: true }
     } catch (error) {
       logger.error(`❌ Failed to remove rate limit for Claude Console account: ${accountId}`, error)
@@ -655,7 +702,9 @@ class ClaudeConsoleAccountService {
           const resetTime = new Date(account.rateLimitEndAt)
           if (!Number.isNaN(resetTime.getTime())) {
             if (now >= resetTime) {
-              await this.removeAccountRateLimit(accountId)
+              await this.removeAccountRateLimit(accountId, {
+                recoverySource: 'upstream_reset_time'
+              })
               return false
             }
             return true
@@ -674,7 +723,7 @@ class ClaudeConsoleAccountService {
               : 60
 
           if (minutesSinceRateLimit >= rateLimitDuration) {
-            await this.removeAccountRateLimit(accountId)
+            await this.removeAccountRateLimit(accountId, { recoverySource: 'timer_expired' })
             return false
           }
 

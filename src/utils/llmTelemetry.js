@@ -14,13 +14,57 @@ const { detectHarness } = require('./harnessDetector')
 const SCHEMA_VERSION = 2
 const MAX_TOOL_NAMES = 64
 const MAX_TOOL_NAME_LENGTH = 128
+const MAX_MESSAGE_TEMPLATE_LENGTH = 256
 const VALID_EVENT_TYPES = new Set([
   'llm_request_completed',
   'llm_request_error',
   'account_failover',
-  'sticky_session_lifecycle'
+  'sticky_session_lifecycle',
+  'account_rate_limit_detected',
+  'account_suppressed',
+  'account_recovered',
+  'upstream_attempt'
 ])
-const UPSTREAM_EVENT_TYPES = new Set(['account_failover', 'sticky_session_lifecycle'])
+const UPSTREAM_EVENT_TYPES = new Set([
+  'account_failover',
+  'sticky_session_lifecycle',
+  'account_rate_limit_detected',
+  'account_suppressed',
+  'account_recovered',
+  'upstream_attempt'
+])
+// 账号级生命周期事件允许只携带 account_id 作为关联键（定时器/人工恢复没有请求上下文）
+const ACCOUNT_SCOPED_EVENT_TYPES = new Set(['account_suppressed', 'account_recovered'])
+
+// 请求失败阶段：区分账号选择、排队、上游 HTTP、上游流中、relay 传输与客户端断开
+const FAILURE_STAGES = [
+  'account_selection',
+  'queue',
+  'upstream_http',
+  'upstream_stream',
+  'relay',
+  'client_disconnect'
+]
+
+// 账号恢复来源（稳定枚举，见 docs/UPSTREAM_TELEMETRY_DESIGN.md 6.1）
+const RECOVERY_SOURCES = [
+  'timer_expired',
+  'upstream_reset_time',
+  'successful_inflight_response',
+  'manual',
+  'service_restart',
+  'quota_refresh'
+]
+
+// 调度失败的稳定错误码 → 失败阶段映射（供 observer 分类 failure_stage）
+const SCHEDULING_ERROR_CODES = new Set([
+  'ALL_ACCOUNTS_RATE_LIMITED',
+  'NO_ELIGIBLE_ACCOUNT',
+  'MODEL_NOT_SUPPORTED',
+  'CLAUDE_DEDICATED_RATE_LIMITED',
+  'SESSION_BINDING_ACCOUNT_UNAVAILABLE',
+  'CONSOLE_ACCOUNT_CONCURRENCY_FULL'
+])
 
 function sanitizeToken(value, maxLength) {
   if (typeof value !== 'string') {
@@ -34,6 +78,113 @@ function normalizeStatusCode(value) {
   return Number.isInteger(value) && value >= 100 && value <= 999 ? value : null
 }
 
+/**
+ * 上游错误消息 → 脱敏模板：数字、UUID、十六进制串等可变部分替换为占位符，
+ * 保留中文等正文文本（智谱 1302 的消息模板因此可直接落盘）。
+ * 不落原始消息：模板用于聚类同构错误，不能反推任何请求特定信息。
+ */
+function sanitizeMessageTemplate(message, maxLength = MAX_MESSAGE_TEMPLATE_LENGTH) {
+  if (typeof message !== 'string') {
+    return null
+  }
+  const templated = message
+    // 控制字符与换行统一为空格，避免日志注入
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    // UUID / 8 位以上十六进制串（request-id 片段等）→ <id>
+    .replace(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g, '<id>')
+    .replace(/\b[0-9a-fA-F]{8,}\b/g, '<id>')
+    // 连续数字（时间戳、数值）→ <n>
+    .replace(/\d+/g, '<n>')
+    // 连续空白折叠
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!templated) {
+    return null
+  }
+  return templated.length > maxLength ? templated.slice(0, maxLength) : templated
+}
+
+/**
+ * 从上游错误响应体提取脱敏的错误码与消息模板。
+ * 兼容 Anthropic ({error:{type,code,message}}) 与智谱 ({"error":{"code":"1302","message":"[1302][...][...]"}})。
+ */
+function extractUpstreamErrorFields(responseBody) {
+  let data = responseBody
+  if (Buffer.isBuffer(data)) {
+    try {
+      data = data.toString('utf-8')
+    } catch (_) {
+      return {}
+    }
+  }
+  if (typeof data === 'string') {
+    try {
+      data = JSON.parse(data)
+    } catch (_) {
+      return {}
+    }
+  }
+  if (!data || typeof data !== 'object' || !data.error || typeof data.error !== 'object') {
+    return {}
+  }
+  const fields = {}
+  if (data.error.code !== undefined && data.error.code !== null) {
+    fields.upstreamErrorCode = sanitizeToken(String(data.error.code), 64)
+  }
+  if (data.error.type !== undefined && data.error.type !== null) {
+    fields.upstreamErrorType = sanitizeToken(String(data.error.type), 128)
+  }
+  if (typeof data.error.message === 'string' && data.error.message) {
+    const template = sanitizeMessageTemplate(data.error.message)
+    if (template) {
+      fields.upstreamMessageTemplate = template
+    }
+  }
+  return fields
+}
+
+/**
+ * 依据错误码/错误类型/上游状态推导失败阶段。
+ * 返回 null 表示无法判定（如请求成功）。
+ */
+function classifyFailureStage({ errorCode, errorType, upstreamStatusCode, clientDisconnected }) {
+  if (clientDisconnected) {
+    return 'client_disconnect'
+  }
+  if (errorCode === 'queue_timeout' || errorType === 'queue_timeout') {
+    return 'queue'
+  }
+  if (errorCode && SCHEDULING_ERROR_CODES.has(errorCode)) {
+    return 'account_selection'
+  }
+  if (errorType === 'client_disconnected') {
+    return 'client_disconnect'
+  }
+  if (errorType === 'upstream_stream_error' || errorType === 'upstream_stream') {
+    return 'upstream_stream'
+  }
+  if (Number.isInteger(upstreamStatusCode) && upstreamStatusCode >= 400) {
+    return 'upstream_http'
+  }
+  return 'relay'
+}
+
+function normalizeIsoTimestamp(value) {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString()
+  }
+  if (typeof value !== 'string' || !value) {
+    return null
+  }
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? null : date.toISOString()
+}
+
+function normalizeNonNegativeNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
 function recordUpstreamTelemetry(eventType, fields = {}) {
   if (!UPSTREAM_EVENT_TYPES.has(eventType)) {
     return false
@@ -41,7 +192,18 @@ function recordUpstreamTelemetry(eventType, fields = {}) {
 
   const gatewayRequestId = sanitizeToken(fields.gatewayRequestId, 128)
   const sessionHash = sanitizeToken(fields.sessionHash, 128)
-  if (!gatewayRequestId && !sessionHash) {
+  const accountId = sanitizeToken(fields.accountId, 256)
+  if (eventType === 'upstream_attempt') {
+    // 逐次 attempt 必须挂在具体请求下才能还原 retry/failover 链
+    if (!gatewayRequestId) {
+      return false
+    }
+  } else if (ACCOUNT_SCOPED_EVENT_TYPES.has(eventType)) {
+    // 账号级事件：定时器/人工恢复没有请求与会话上下文，account_id 即关联键
+    if (!gatewayRequestId && !sessionHash && !accountId) {
+      return false
+    }
+  } else if (!gatewayRequestId && !sessionHash) {
     return false
   }
 
@@ -57,13 +219,77 @@ function recordUpstreamTelemetry(eventType, fields = {}) {
         ...commonFields,
         gateway_request_id: gatewayRequestId,
         session_hash: sessionHash,
-        account_id: sanitizeToken(fields.accountId, 256),
+        account_id: accountId,
         account_type: sanitizeToken(fields.accountType, 128),
         reason: sanitizeToken(fields.reason, 64),
         upstream_status_code: normalizeStatusCode(fields.upstreamStatusCode),
-        sticky_deleted: fields.stickyDeleted === true
+        upstream_error_code: sanitizeToken(fields.upstreamErrorCode, 64),
+        upstream_message_template: sanitizeMessageTemplate(fields.upstreamMessageTemplate),
+        sticky_deleted: fields.stickyDeleted === true,
+        affected_session_count: normalizeNonNegativeNumber(fields.affectedSessionCount),
+        expected_recovery_at: normalizeIsoTimestamp(fields.expectedRecoveryAt)
       })
     )
+  }
+
+  if (eventType === 'account_rate_limit_detected') {
+    return Boolean(
+      logger.telemetry({
+        ...commonFields,
+        gateway_request_id: gatewayRequestId,
+        session_hash: sessionHash,
+        account_id: accountId,
+        account_type: sanitizeToken(fields.accountType, 128),
+        upstream_status_code: normalizeStatusCode(fields.upstreamStatusCode),
+        upstream_error_code: sanitizeToken(fields.upstreamErrorCode, 64),
+        upstream_message_template: sanitizeMessageTemplate(fields.upstreamMessageTemplate),
+        upstream_request_id: sanitizeToken(fields.upstreamRequestId, 256),
+        // suppression_id 用于把 detected/suppressed/recovered 三个事件串成一次摘除
+        suppression_id: sanitizeToken(fields.suppressionId, 128),
+        reset_timestamp: normalizeIsoTimestamp(
+          fields.resetTimestamp ? new Date(fields.resetTimestamp * 1000) : null
+        )
+      })
+    )
+  }
+
+  if (eventType === 'account_suppressed') {
+    return Boolean(
+      logger.telemetry({
+        ...commonFields,
+        gateway_request_id: gatewayRequestId,
+        session_hash: sessionHash,
+        account_id: accountId,
+        account_type: sanitizeToken(fields.accountType, 128),
+        reason: sanitizeToken(fields.reason, 64),
+        configured_duration_seconds: normalizeNonNegativeNumber(fields.configuredDurationSeconds),
+        expected_recovery_at: normalizeIsoTimestamp(fields.expectedRecoveryAt),
+        suppression_id: sanitizeToken(fields.suppressionId, 128),
+        affected_session_count: normalizeNonNegativeNumber(fields.affectedSessionCount)
+      })
+    )
+  }
+
+  if (eventType === 'account_recovered') {
+    return Boolean(
+      logger.telemetry({
+        ...commonFields,
+        gateway_request_id: gatewayRequestId,
+        session_hash: sessionHash,
+        account_id: accountId,
+        account_type: sanitizeToken(fields.accountType, 128),
+        recovery_source: sanitizeToken(fields.recoverySource, 64),
+        expected_recovery_at: normalizeIsoTimestamp(fields.expectedRecoveryAt),
+        actual_recovery_at:
+          normalizeIsoTimestamp(fields.actualRecoveryAt) ?? commonFields.timestamp,
+        actual_suppression_seconds: normalizeNonNegativeNumber(fields.actualSuppressionSeconds),
+        suppression_id: sanitizeToken(fields.suppressionId, 128)
+      })
+    )
+  }
+
+  if (eventType === 'upstream_attempt') {
+    return recordUpstreamAttempt(fields, { gatewayRequestId })
   }
 
   return Boolean(
@@ -71,12 +297,84 @@ function recordUpstreamTelemetry(eventType, fields = {}) {
       ...commonFields,
       gateway_request_id: gatewayRequestId,
       session_hash: sessionHash,
-      account_id: sanitizeToken(fields.accountId, 256),
+      account_id: accountId,
       account_type: sanitizeToken(fields.accountType, 128),
       action: sanitizeToken(fields.action, 32),
       ttl_seconds:
         Number.isInteger(fields.ttlSeconds) && fields.ttlSeconds >= 0 ? fields.ttlSeconds : null,
       reason: sanitizeToken(fields.reason, 64)
+    })
+  )
+}
+
+function calculateCostFields(usage, model, apiUrl) {
+  const result = pricingService.calculateCost(usage, model, { apiUrl })
+  return {
+    cost: result.hasPricing ? result.totalCost : null,
+    hasPricing: result.hasPricing === true
+  }
+}
+
+/**
+ * 逐次真实上游尝试事件（v2）。每次 attempt 结束时立即落盘，
+ * 不等请求终态，长流式请求的重试链也能完整还原。
+ */
+function recordUpstreamAttempt(fields = {}, { gatewayRequestId } = {}) {
+  if (!gatewayRequestId) {
+    return false
+  }
+
+  const usage = fields.usage && typeof fields.usage === 'object' ? fields.usage : null
+  const usageFields = getUsageFields(usage)
+  let cost = null
+  let hasPricing = null
+  if (usageFields.usage_available) {
+    try {
+      const { cost: attemptCost, hasPricing: attemptHasPricing } = calculateCostFields(
+        usage,
+        fields.model ?? null,
+        fields.apiUrl ?? null
+      )
+      cost = attemptCost
+      hasPricing = attemptHasPricing
+    } catch (error) {
+      logger.warn?.(`⚠️ Failed to calculate upstream_attempt cost: ${error.message}`)
+    }
+  }
+
+  const attemptNumber =
+    Number.isInteger(fields.attemptNumber) && fields.attemptNumber > 0 ? fields.attemptNumber : null
+
+  return Boolean(
+    logger.telemetry({
+      schema_version: SCHEMA_VERSION,
+      event_type: 'upstream_attempt',
+      timestamp: new Date().toISOString(),
+      gateway_request_id: gatewayRequestId,
+      attempt_number: attemptNumber,
+      attempt_id:
+        sanitizeToken(fields.attemptId, 160) ??
+        (attemptNumber ? `${gatewayRequestId}#a${attemptNumber}` : null),
+      account_id: sanitizeToken(fields.accountId, 256),
+      account_type: sanitizeToken(fields.accountType, 128),
+      provider: sanitizeToken(fields.provider, 64),
+      model: sanitizeToken(fields.model, 160),
+      queue_request_id: sanitizeToken(fields.queueRequestId, 128),
+      queue_wait_ms: normalizeNonNegativeNumber(fields.queueWaitMs),
+      upstream_latency_ms: normalizeNonNegativeNumber(fields.upstreamLatencyMs),
+      upstream_status_code: normalizeStatusCode(fields.upstreamStatusCode),
+      success: fields.success === true,
+      upstream_error_type: sanitizeToken(fields.upstreamErrorType, 128),
+      upstream_error_code: sanitizeToken(fields.upstreamErrorCode, 64),
+      upstream_message_template: sanitizeMessageTemplate(fields.upstreamMessageTemplate),
+      upstream_request_id: sanitizeToken(fields.upstreamRequestId, 256),
+      input_tokens: usageFields.input_tokens,
+      output_tokens: usageFields.output_tokens,
+      cache_creation_input_tokens: usageFields.cache_creation_input_tokens,
+      cache_read_input_tokens: usageFields.cache_read_input_tokens,
+      usage_available: usageFields.usage_available,
+      cost,
+      has_pricing: hasPricing
     })
   )
 }
@@ -469,8 +767,20 @@ function finalizeTelemetry(context, outcome = {}) {
     total_latency_ms: outcome.totalLatencyMs ?? now - context.startTimeMs,
     attempt_count: outcome.attemptCount ?? 1,
     retry_reason: sanitizeToken(outcome.retryReason, 128),
+    // 三层状态拆分：client=客户端实际收到、gateway=网关决定返回、upstream=真实上游响应。
+    // 旧 status_code 等于 client_status_code，兼容期保留，消费方应迁移到新字段
+    client_status_code: outcome.clientStatusCode ?? outcome.statusCode ?? null,
+    gateway_status_code: outcome.gatewayStatusCode ?? outcome.statusCode ?? null,
     status_code: outcome.statusCode ?? null,
     upstream_status_code: outcome.upstreamStatusCode ?? null,
+    failure_stage: FAILURE_STAGES.includes(outcome.failureStage)
+      ? outcome.failureStage
+      : isError
+        ? classifyFailureStage(outcome.failureContext || {})
+        : null,
+    upstream_error_type: sanitizeToken(outcome.upstreamErrorType, 128),
+    upstream_error_code: sanitizeToken(outcome.upstreamErrorCode, 64),
+    upstream_message_template: sanitizeMessageTemplate(outcome.upstreamMessageTemplate),
     response_completed: responseCompleted,
     client_disconnected: outcome.clientDisconnected === true,
     error_type: isError ? sanitizeToken(outcome.errorType, 128) : null,
@@ -483,12 +793,18 @@ function finalizeTelemetry(context, outcome = {}) {
 
 module.exports = {
   SCHEMA_VERSION,
+  FAILURE_STAGES,
+  RECOVERY_SOURCES,
+  SCHEDULING_ERROR_CODES,
+  classifyFailureStage,
   createTelemetryContext,
   detectHarness,
+  extractUpstreamErrorFields,
   finalizeTelemetry,
   hashValue,
   normalizeToolNames,
   recordUpstreamTelemetry,
+  sanitizeMessageTemplate,
   stableSerialize,
   summarizeRequestForTelemetry,
   summarizeResponseForTelemetry

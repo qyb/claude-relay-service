@@ -6,6 +6,7 @@ const config = require('../../config/config')
 const { parseVendorPrefixedModel } = require('../utils/modelHelper')
 const userMessageQueueService = require('./userMessageQueueService')
 const { isStreamWritable } = require('../utils/streamHelper')
+const { extractUpstreamErrorFields } = require('../utils/llmTelemetry')
 
 class CcrRelayService {
   constructor() {
@@ -229,6 +230,8 @@ class CcrRelayService {
         '📤 Sending request to CCR API with headers:',
         JSON.stringify(requestConfig.headers, null, 2)
       )
+      // 逐次 attempt 计时起点（CCR 非流式每请求单次上游尝试）
+      const attemptStartedAt = Date.now()
       const response = await axios(requestConfig)
 
       // 📬 请求已发送成功，立即释放队列锁（无需等待响应处理完成）
@@ -269,6 +272,9 @@ class CcrRelayService {
       // 检查错误状态并相应处理
       if (response.status === 401) {
         logger.warn(`🚫 Unauthorized error detected for CCR account ${accountId}`)
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails({ upstreamStatusCode: response.status })
+        }
         await unifiedClaudeScheduler.markAccountUnauthorized(
           accountId,
           'ccr',
@@ -277,6 +283,16 @@ class CcrRelayService {
         )
       } else if (response.status === 429) {
         logger.warn(`🚫 Rate limit detected for CCR account ${accountId}`)
+        // 429 错误详情（状态码/错误码/消息模板）回传 observer 与生命周期事件
+        const upstreamErrorDetails = {
+          upstreamStatusCode: response.status,
+          upstreamRequestId:
+            response.headers?.['request-id'] ?? response.headers?.['x-request-id'] ?? null,
+          ...extractUpstreamErrorFields(response.data)
+        }
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails(upstreamErrorDetails)
+        }
         // 收到429先检查是否因为超过了手动配置的每日额度
         await ccrAccountService.checkQuotaUsage(accountId).catch((err) => {
           logger.error('❌ Failed to check quota after 429 error:', err)
@@ -287,16 +303,31 @@ class CcrRelayService {
           'ccr',
           options.sessionHash,
           null,
-          options.gatewayRequestId
+          options.gatewayRequestId,
+          upstreamErrorDetails
         )
       } else if (response.status === 529) {
         logger.warn(`🚫 Overload error detected for CCR account ${accountId}`)
         await ccrAccountService.markAccountOverloaded(accountId)
+      } else if (response.status >= 400) {
+        // 其他上游错误：状态码与脱敏错误详情仍回传 observer
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails({
+            upstreamStatusCode: response.status,
+            upstreamErrorBody: response.data,
+            upstreamRequestId:
+              response.headers?.['request-id'] ?? response.headers?.['x-request-id'] ?? null
+          })
+        }
       } else if (response.status === 200 || response.status === 201) {
         // 如果请求成功，检查并移除错误状态
         const isRateLimited = await ccrAccountService.isAccountRateLimited(accountId)
         if (isRateLimited) {
-          await ccrAccountService.removeAccountRateLimit(accountId)
+          // 并行在途请求成功触发提前恢复：记录恢复来源与触发请求，竞态可直接审计
+          await ccrAccountService.removeAccountRateLimit(accountId, {
+            recoverySource: 'successful_inflight_response',
+            gatewayRequestId: options.gatewayRequestId
+          })
         }
         const isOverloaded = await ccrAccountService.isAccountOverloaded(accountId)
         if (isOverloaded) {
@@ -310,6 +341,34 @@ class CcrRelayService {
       const responseBody =
         typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
       logger.debug(`[DEBUG] Final response body to return: ${responseBody}`)
+
+      // 逐次 attempt 事件（v2）：CCR 非流式为单次上游尝试
+      if (typeof options.onAttempt === 'function') {
+        let attemptUsage = null
+        if (response.status >= 200 && response.status < 300) {
+          try {
+            const parsed = JSON.parse(responseBody)
+            if (parsed?.usage && typeof parsed.usage === 'object') {
+              attemptUsage = parsed.usage
+            }
+          } catch (_) {
+            // 非 JSON 响应体没有 usage
+          }
+        }
+        options.onAttempt({
+          accountId,
+          accountType: 'ccr',
+          model: requestBody.model ?? null,
+          queueRequestId,
+          upstreamLatencyMs: Date.now() - attemptStartedAt,
+          upstreamStatusCode: response.status,
+          success: response.status >= 200 && response.status < 300,
+          upstreamRequestId:
+            response.headers?.['request-id'] ?? response.headers?.['x-request-id'] ?? null,
+          usage: attemptUsage,
+          apiUrl: account.apiUrl
+        })
+      }
 
       return {
         statusCode: response.status,
@@ -608,6 +667,8 @@ class CcrRelayService {
       }
 
       // 发送请求
+      // 逐次 attempt 计时起点（CCR 流式每请求单次上游尝试）
+      const streamAttemptStartedAt = Date.now()
       const request = axios(requestConfig)
 
       // 注意：使用 .then(async ...) 模式处理响应
@@ -622,6 +683,8 @@ class CcrRelayService {
             logger.error(
               `❌ CCR API returned error status: ${response.status} | Account: ${account?.name || accountId}`
             )
+            // 错误体先累积，end 时提取脱敏错误详情并记录 attempt
+            let ccrStreamErrorData = ''
 
             if (response.status === 401) {
               await unifiedClaudeScheduler.markAccountUnauthorized(
@@ -636,7 +699,8 @@ class CcrRelayService {
                 'ccr',
                 requestOptions.sessionHash,
                 null,
-                requestOptions.gatewayRequestId
+                requestOptions.gatewayRequestId,
+                { upstreamStatusCode: response.status }
               )
               // 检查是否因为超过每日额度
               ccrAccountService.checkQuotaUsage(accountId).catch((err) => {
@@ -664,12 +728,36 @@ class CcrRelayService {
 
             // 直接透传错误数据，不进行包装
             response.data.on('data', (chunk) => {
+              ccrStreamErrorData += chunk.toString()
               if (isStreamWritable(responseStream)) {
                 responseStream.write(chunk)
               }
             })
 
             response.data.on('end', () => {
+              // 真实上游错误详情回传 observer 与 attempt 事件
+              const upstreamErrorDetails = {
+                upstreamStatusCode: response.status,
+                upstreamRequestId:
+                  response.headers?.['request-id'] ?? response.headers?.['x-request-id'] ?? null,
+                ...extractUpstreamErrorFields(ccrStreamErrorData)
+              }
+              if (typeof requestOptions.onUpstreamDetails === 'function') {
+                requestOptions.onUpstreamDetails(upstreamErrorDetails)
+              }
+              if (typeof requestOptions.onAttempt === 'function') {
+                requestOptions.onAttempt({
+                  accountId,
+                  accountType: 'ccr',
+                  model: body.model ?? null,
+                  upstreamLatencyMs: Date.now() - streamAttemptStartedAt,
+                  upstreamStatusCode: response.status,
+                  success: false,
+                  upstreamErrorBody: ccrStreamErrorData,
+                  upstreamRequestId: upstreamErrorDetails.upstreamRequestId,
+                  apiUrl: account.apiUrl
+                })
+              }
               if (isStreamWritable(responseStream)) {
                 responseStream.end()
               }
@@ -694,7 +782,11 @@ class CcrRelayService {
           // 成功响应，检查并移除错误状态
           ccrAccountService.isAccountRateLimited(accountId).then((isRateLimited) => {
             if (isRateLimited) {
-              ccrAccountService.removeAccountRateLimit(accountId)
+              // 并行在途请求成功触发提前恢复：记录恢复来源与触发请求，竞态可直接审计
+              ccrAccountService.removeAccountRateLimit(accountId, {
+                recoverySource: 'successful_inflight_response',
+                gatewayRequestId: requestOptions.gatewayRequestId
+              })
             }
           })
           ccrAccountService.isAccountOverloaded(accountId).then((isOverloaded) => {
@@ -792,6 +884,20 @@ class CcrRelayService {
               } catch (err) {
                 logger.error('❌ Error in usage callback:', err)
               }
+            }
+
+            // 成功 attempt 事件：携带该次真实上游调用的 usage 与延迟
+            if (typeof requestOptions.onAttempt === 'function') {
+              requestOptions.onAttempt({
+                accountId,
+                accountType: 'ccr',
+                model: body.model ?? null,
+                upstreamLatencyMs: Date.now() - streamAttemptStartedAt,
+                upstreamStatusCode: 200,
+                success: true,
+                usage: Object.keys(collectedUsage).length > 0 ? collectedUsage : null,
+                apiUrl: account.apiUrl
+              })
             }
 
             if (isStreamWritable(responseStream)) {

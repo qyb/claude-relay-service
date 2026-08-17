@@ -7,12 +7,15 @@ jest.mock('../src/utils/logger', () => ({
 const logger = require('../src/utils/logger')
 const {
   SCHEMA_VERSION,
+  classifyFailureStage,
   createTelemetryContext,
   detectHarness,
+  extractUpstreamErrorFields,
   finalizeTelemetry,
   hashValue,
   normalizeToolNames,
   recordUpstreamTelemetry,
+  sanitizeMessageTemplate,
   summarizeRequestForTelemetry,
   summarizeResponseForTelemetry
 } = require('../src/utils/llmTelemetry')
@@ -383,6 +386,150 @@ describe('llmTelemetry finalization', () => {
     expect(context.finalized).toBe(false)
     expect(logger.telemetry).not.toHaveBeenCalled()
   })
+
+  it('三层状态码拆分：client/gateway/upstream 独立字段，旧 status_code 保留', () => {
+    const context = createTelemetryContext(buildRequest(), buildSessionInfo())
+
+    finalizeTelemetry(context, {
+      eventType: 'llm_request_error',
+      statusCode: 429,
+      clientStatusCode: 429,
+      gatewayStatusCode: 429,
+      upstreamStatusCode: 429,
+      failureStage: 'account_selection',
+      upstreamErrorCode: 'ALL_ACCOUNTS_RATE_LIMITED'
+    })
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      client_status_code: 429,
+      gateway_status_code: 429,
+      status_code: 429,
+      upstream_status_code: 429,
+      failure_stage: 'account_selection'
+    })
+  })
+
+  it('网关合成错误不冒充上游状态：upstream_status_code 保持 null', () => {
+    const context = createTelemetryContext(buildRequest(), buildSessionInfo())
+
+    finalizeTelemetry(context, {
+      eventType: 'llm_request_error',
+      statusCode: 500,
+      gatewayStatusCode: 500,
+      failureContext: { errorCode: 'NO_ELIGIBLE_ACCOUNT', errorType: 'Error' }
+    })
+
+    const record = logger.telemetry.mock.calls[0][0]
+    expect(record).toMatchObject({
+      gateway_status_code: 500,
+      upstream_status_code: null,
+      failure_stage: 'account_selection'
+    })
+  })
+
+  it('上游错误脱敏字段透传且错误码被清洗', () => {
+    const context = createTelemetryContext(buildRequest(), buildSessionInfo())
+
+    finalizeTelemetry(context, {
+      eventType: 'llm_request_error',
+      statusCode: 429,
+      upstreamStatusCode: 429,
+      failureStage: 'upstream_http',
+      upstreamErrorType: 'rate_limit_error',
+      upstreamErrorCode: '1302',
+      upstreamMessageTemplate: '您的账户已达到速率限制，请您控制请求频率'
+    })
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      failure_stage: 'upstream_http',
+      upstream_error_type: 'rate_limit_error',
+      upstream_error_code: '1302',
+      upstream_message_template: '您的账户已达到速率限制，请您控制请求频率'
+    })
+  })
+
+  it('成功请求不写 failure_stage', () => {
+    const context = createTelemetryContext(buildRequest(), buildSessionInfo())
+
+    finalizeTelemetry(context, { eventType: 'llm_request_completed', statusCode: 200 })
+
+    expect(logger.telemetry.mock.calls[0][0].failure_stage).toBeNull()
+  })
+})
+
+describe('llmTelemetry message template sanitizer', () => {
+  it('数字、UUID 与长十六进制串替换为占位符，中文正文保留', () => {
+    expect(
+      sanitizeMessageTemplate('[1302][您的账户已达到速率限制，请您控制请求频率][req-8f3a2b1c9d]')
+    ).toBe('[<n>][您的账户已达到速率限制，请您控制请求频率][req-<id>]')
+    expect(
+      sanitizeMessageTemplate(
+        '[1310][您已达到每周/每月使用上限，您的限额将在 2026-08-05 15:16:26 重置。][foo]'
+      )
+    ).toBe('[<n>][您已达到每周/每月使用上限，您的限额将在 <n>-<n>-<n> <n>:<n>:<n> 重置。][foo]')
+    expect(sanitizeMessageTemplate('error in block 12345678-1234-4123-8123-123456789abc')).toBe(
+      'error in block <id>'
+    )
+  })
+
+  it('控制字符折叠为空格，超长截断，非字符串返回 null', () => {
+    expect(sanitizeMessageTemplate('line1\nline2\t\ttab')).toBe('line<n> line<n> tab')
+    expect(sanitizeMessageTemplate('x'.repeat(400))).toHaveLength(256)
+    expect(sanitizeMessageTemplate(null)).toBeNull()
+    expect(sanitizeMessageTemplate('   ')).toBeNull()
+  })
+})
+
+describe('llmTelemetry upstream error extraction', () => {
+  it('提取智谱 1302 的错误码与消息模板', () => {
+    expect(
+      extractUpstreamErrorFields({
+        error: { code: '1302', message: '[1302][您的账户已达到速率限制，请您控制请求频率][r-1]' }
+      })
+    ).toEqual({
+      upstreamErrorCode: '1302',
+      upstreamMessageTemplate: '[<n>][您的账户已达到速率限制，请您控制请求频率][r-<n>]'
+    })
+  })
+
+  it('提取 Anthropic 错误 type/code，兼容字符串与 Buffer 输入', () => {
+    expect(
+      extractUpstreamErrorFields(
+        '{"error":{"type":"rate_limit_error","message":"Number of requests 42"}}'
+      )
+    ).toEqual({
+      upstreamErrorType: 'rate_limit_error',
+      upstreamMessageTemplate: 'Number of requests <n>'
+    })
+    expect(extractUpstreamErrorFields(Buffer.from('{"error":{"code":"429"}}'))).toEqual({
+      upstreamErrorCode: '429'
+    })
+  })
+
+  it('无法解析或不带 error 对象时返回空对象', () => {
+    expect(extractUpstreamErrorFields('not json')).toEqual({})
+    expect(extractUpstreamErrorFields({ message: 'no error field' })).toEqual({})
+    expect(extractUpstreamErrorFields(null)).toEqual({})
+  })
+})
+
+describe('llmTelemetry failure stage classification', () => {
+  it.each([
+    [{ errorCode: 'ALL_ACCOUNTS_RATE_LIMITED' }, 'account_selection'],
+    [{ errorCode: 'NO_ELIGIBLE_ACCOUNT' }, 'account_selection'],
+    [{ errorCode: 'MODEL_NOT_SUPPORTED' }, 'account_selection'],
+    [{ errorCode: 'CONSOLE_ACCOUNT_CONCURRENCY_FULL' }, 'account_selection'],
+    [{ errorCode: 'queue_timeout' }, 'queue'],
+    [{ errorType: 'queue_timeout' }, 'queue'],
+    [{ upstreamStatusCode: 429 }, 'upstream_http'],
+    [{ upstreamStatusCode: 500 }, 'upstream_http'],
+    [{ errorType: 'upstream_stream_error' }, 'upstream_stream'],
+    [{ errorType: 'client_disconnected' }, 'client_disconnect'],
+    [{ clientDisconnected: true }, 'client_disconnect'],
+    [{ errorCode: 'ECONNRESET', errorType: 'Error' }, 'relay']
+  ])('classifyFailureStage(%j) => %s', (input, expected) => {
+    expect(classifyFailureStage(input)).toBe(expected)
+  })
 })
 
 describe('upstream telemetry events', () => {
@@ -448,6 +595,131 @@ describe('upstream telemetry events', () => {
       })
     ).toBe(false)
     expect(logger.telemetry).toHaveBeenCalledTimes(1)
+  })
+
+  it('account_failover 携带上游错误详情、预期恢复时间与受影响会话数', () => {
+    recordUpstreamTelemetry('account_failover', {
+      sessionHash: 'hash-1',
+      accountId: 'account-1',
+      accountType: 'claude-console',
+      reason: 'rate_limit',
+      upstreamStatusCode: 429,
+      upstreamErrorCode: '1302',
+      upstreamMessageTemplate: '[<n>][您的账户已达到速率限制，请您控制请求频率][r-<n>]',
+      stickyDeleted: true,
+      expectedRecoveryAt: '2026-08-20T04:14:15.922Z',
+      affectedSessionCount: 4
+    })
+
+    expect(logger.telemetry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'account_failover',
+        upstream_error_code: '1302',
+        upstream_message_template: '[<n>][您的账户已达到速率限制，请您控制请求频率][r-<n>]',
+        expected_recovery_at: '2026-08-20T04:14:15.922Z',
+        affected_session_count: 4
+      })
+    )
+  })
+
+  it('账号生命周期事件：detected 携带上游详情，suppressed/recovered 允许仅 account_id 关联', () => {
+    recordUpstreamTelemetry('account_rate_limit_detected', {
+      gatewayRequestId: 'gateway-1',
+      sessionHash: 'hash-1',
+      accountId: 'account-1',
+      accountType: 'claude-console',
+      upstreamStatusCode: 429,
+      upstreamErrorCode: '1302',
+      suppressionId: '1755687600000',
+      resetTimestamp: 1755688500
+    })
+    expect(logger.telemetry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'account_rate_limit_detected',
+        upstream_error_code: '1302',
+        suppression_id: '1755687600000',
+        reset_timestamp: new Date(1755688500 * 1000).toISOString()
+      })
+    )
+
+    // 定时器/人工恢复没有请求上下文：account_id 单独作为关联键
+    expect(
+      recordUpstreamTelemetry('account_suppressed', {
+        accountId: 'account-1',
+        accountType: 'claude-console',
+        reason: 'rate_limit',
+        configuredDurationSeconds: 3600,
+        expectedRecoveryAt: '2026-08-20T04:14:15.922Z',
+        suppressionId: '1755687600000',
+        affectedSessionCount: 3
+      })
+    ).toBe(true)
+    expect(logger.telemetry).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        event_type: 'account_suppressed',
+        configured_duration_seconds: 3600,
+        affected_session_count: 3
+      })
+    )
+
+    expect(
+      recordUpstreamTelemetry('account_recovered', {
+        accountId: 'account-1',
+        accountType: 'claude-console',
+        recoverySource: 'successful_inflight_response',
+        expectedRecoveryAt: '2026-08-20T04:14:15.922Z',
+        actualRecoveryAt: '2026-08-20T03:14:19.922Z',
+        actualSuppressionSeconds: 4,
+        suppressionId: '1755687600000'
+      })
+    ).toBe(true)
+    expect(logger.telemetry).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        event_type: 'account_recovered',
+        recovery_source: 'successful_inflight_response',
+        actual_suppression_seconds: 4
+      })
+    )
+  })
+
+  it('upstream_attempt 必须挂在 gateway 请求下并按 usage 计算成本', () => {
+    expect(recordUpstreamTelemetry('upstream_attempt', { accountId: 'account-1' })).toBe(false)
+
+    recordUpstreamTelemetry('upstream_attempt', {
+      gatewayRequestId: 'gateway-1',
+      attemptNumber: 2,
+      accountId: 'account-1',
+      accountType: 'claude-console',
+      model: 'glm-5.3',
+      apiUrl: 'https://api.z.ai/api/anthropic',
+      queueRequestId: 'queue-1',
+      queueWaitMs: 120,
+      upstreamLatencyMs: 450,
+      upstreamStatusCode: 200,
+      success: true,
+      upstreamRequestId: 'req-1',
+      usage: { input_tokens: 1000000, output_tokens: 0 }
+    })
+
+    expect(logger.telemetry).toHaveBeenCalledTimes(1)
+    expect(logger.telemetry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'upstream_attempt',
+        gateway_request_id: 'gateway-1',
+        attempt_number: 2,
+        attempt_id: 'gateway-1#a2',
+        account_id: 'account-1',
+        queue_request_id: 'queue-1',
+        queue_wait_ms: 120,
+        upstream_latency_ms: 450,
+        upstream_status_code: 200,
+        success: true,
+        input_tokens: 1000000,
+        usage_available: true,
+        cost: 1.4,
+        has_pricing: true
+      })
+    )
   })
 })
 

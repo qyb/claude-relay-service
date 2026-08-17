@@ -355,6 +355,7 @@ async function handleMessagesRequest(req, res) {
         // 处理会话绑定账户不可用的错误
         if (error.code === 'SESSION_BINDING_ACCOUNT_UNAVAILABLE') {
           requestObservation.observeError(error)
+          requestObservation.observeGatewayStatus(403)
           const errorMessage = await claudeRelayConfigService.getSessionBindingErrorMessage()
           return res.status(403).json({
             error: {
@@ -365,6 +366,7 @@ async function handleMessagesRequest(req, res) {
         }
         if (error.code === 'CLAUDE_DEDICATED_RATE_LIMITED') {
           requestObservation.observeError(error)
+          requestObservation.observeGatewayStatus(403)
           const limitMessage = claudeRelayService._buildStandardRateLimitMessage(
             error.rateLimitEndAt
           )
@@ -380,6 +382,7 @@ async function handleMessagesRequest(req, res) {
         }
         if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
           requestObservation.observeError(error)
+          requestObservation.observeGatewayStatus(429)
           res.status(429)
           res.setHeader('Content-Type', 'application/json')
           if (error.retryAfterSeconds) {
@@ -558,7 +561,9 @@ async function handleMessagesRequest(req, res) {
           {
             gatewayRequestId: req.requestId,
             onUpstreamDetails: (details) => requestObservation.observeUpstream(details),
-            onRetry: (reason) => requestObservation.noteRetry(reason)
+            onRetry: (reason) => requestObservation.noteRetry(reason),
+            onAttempt: (details) => requestObservation.observeAttempt(details),
+            onQueue: (outcome) => requestObservation.observeQueue(outcome)
           }
         )
       } else if (accountType === 'claude-console') {
@@ -674,7 +679,9 @@ async function handleMessagesRequest(req, res) {
           {
             gatewayRequestId: req.requestId,
             sessionHash,
-            onUpstreamDetails: (details) => requestObservation.observeUpstream(details)
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details),
+            onAttempt: (details) => requestObservation.observeAttempt(details),
+            onQueue: (outcome) => requestObservation.observeQueue(outcome)
           }
         )
       } else if (accountType === 'bedrock') {
@@ -850,7 +857,9 @@ async function handleMessagesRequest(req, res) {
           {
             gatewayRequestId: req.requestId,
             sessionHash,
-            onUpstreamDetails: (details) => requestObservation.observeUpstream(details)
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details),
+            onAttempt: (details) => requestObservation.observeAttempt(details),
+            onQueue: (outcome) => requestObservation.observeQueue(outcome)
           }
         )
       }
@@ -999,6 +1008,7 @@ async function handleMessagesRequest(req, res) {
       } catch (error) {
         if (error.code === 'SESSION_BINDING_ACCOUNT_UNAVAILABLE') {
           requestObservation.observeError(error)
+          requestObservation.observeGatewayStatus(403)
           const errorMessage = await claudeRelayConfigService.getSessionBindingErrorMessage()
           return res.status(403).json({
             error: {
@@ -1009,6 +1019,7 @@ async function handleMessagesRequest(req, res) {
         }
         if (error.code === 'CLAUDE_DEDICATED_RATE_LIMITED') {
           requestObservation.observeError(error)
+          requestObservation.observeGatewayStatus(403)
           const limitMessage = claudeRelayService._buildStandardRateLimitMessage(
             error.rateLimitEndAt
           )
@@ -1019,6 +1030,7 @@ async function handleMessagesRequest(req, res) {
         }
         if (error.code === 'ALL_ACCOUNTS_RATE_LIMITED') {
           requestObservation.observeError(error)
+          requestObservation.observeGatewayStatus(429)
           if (error.retryAfterSeconds) {
             res.setHeader('Retry-After', String(error.retryAfterSeconds))
           }
@@ -1100,7 +1112,9 @@ async function handleMessagesRequest(req, res) {
           {
             gatewayRequestId: req.requestId,
             onUpstreamDetails: (details) => requestObservation.observeUpstream(details),
-            onRetry: (reason) => requestObservation.noteRetry(reason)
+            onRetry: (reason) => requestObservation.noteRetry(reason),
+            onAttempt: (details) => requestObservation.observeAttempt(details),
+            onQueue: (outcome) => requestObservation.observeQueue(outcome)
           }
         )
       } else if (accountType === 'claude-console') {
@@ -1118,7 +1132,9 @@ async function handleMessagesRequest(req, res) {
           {
             gatewayRequestId: req.requestId,
             sessionHash,
-            onUpstreamDetails: (details) => requestObservation.observeUpstream(details)
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details),
+            onAttempt: (details) => requestObservation.observeAttempt(details),
+            onQueue: (outcome) => requestObservation.observeQueue(outcome)
           }
         )
       } else if (accountType === 'bedrock') {
@@ -1172,7 +1188,9 @@ async function handleMessagesRequest(req, res) {
           {
             gatewayRequestId: req.requestId,
             sessionHash,
-            onUpstreamDetails: (details) => requestObservation.observeUpstream(details)
+            onUpstreamDetails: (details) => requestObservation.observeUpstream(details),
+            onAttempt: (details) => requestObservation.observeAttempt(details),
+            onQueue: (outcome) => requestObservation.observeQueue(outcome)
           }
         )
       }
@@ -1315,6 +1333,7 @@ async function handleMessagesRequest(req, res) {
           // 重试失败
           if (retryError.code === 'CONSOLE_ACCOUNT_CONCURRENCY_FULL') {
             requestObservation?.observeError(retryError)
+            requestObservation?.observeGatewayStatus(503)
             logger.error('❌ All Console accounts reached concurrency limit after retry')
             return res.status(503).json({
               error: 'service_unavailable',
@@ -1342,6 +1361,7 @@ async function handleMessagesRequest(req, res) {
       req._concurrencyRetryAttempted
     ) {
       requestObservation?.observeError(handledError)
+      requestObservation?.observeGatewayStatus(503)
       logger.error('❌ All Console accounts reached concurrency limit (retry already attempted)')
       if (!res.headersSent) {
         return res.status(503).json({
@@ -1389,6 +1409,7 @@ async function handleMessagesRequest(req, res) {
         errorType = 'Upstream hostname resolution failed'
       }
 
+      requestObservation?.observeGatewayStatus(statusCode)
       return res.status(statusCode).json({
         error: errorType,
         message: handledError.message || 'An unexpected error occurred',

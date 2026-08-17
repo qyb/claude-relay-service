@@ -10,6 +10,25 @@ class UnifiedOpenAIScheduler {
     this.SESSION_MAPPING_PREFIX = 'unified_openai_session_mapping:'
   }
 
+  // 🎲 按配置比例采样 sticky 命中（默认 0=不记录），与 Claude/Gemini 调度器口径一致
+  _recordStickyHit(sessionHash, accountId, accountType) {
+    try {
+      const appConfig = require('../../config/config')
+      const rate = appConfig.session?.stickyHitSampleRate || 0
+      if (rate > 0 && Math.random() < rate) {
+        recordUpstreamTelemetry('sticky_session_lifecycle', {
+          action: 'hit',
+          sessionHash,
+          accountId,
+          accountType,
+          reason: 'sampled_hit'
+        })
+      }
+    } catch (_) {
+      // 配置读取失败时静默跳过采样
+    }
+  }
+
   // 🔢 按优先级和最后使用时间排序账户（与 Claude/Gemini 调度保持一致）
   _sortAccountsByPriority(accounts) {
     return accounts.sort((a, b) => {
@@ -303,6 +322,7 @@ class UnifiedOpenAIScheduler {
           if (isAvailable) {
             // 🚀 智能会话续期（续期 unified 映射键，按配置）
             await this._extendSessionMappingTTL(sessionHash)
+            this._recordStickyHit(sessionHash, mappedAccount.accountId, mappedAccount.accountType)
             logger.info(
               `🎯 Using sticky session account: ${mappedAccount.accountId} (${mappedAccount.accountType}) for session ${sessionHash}`
             )
@@ -673,6 +693,13 @@ class UnifiedOpenAIScheduler {
 
       if (remainingTTL < threshold) {
         await client.expire(key, fullTTL)
+        // renewed 只在真实续期时记录（renewalThresholdMinutes 默认 0，事件量可控）
+        recordUpstreamTelemetry('sticky_session_lifecycle', {
+          action: 'renewed',
+          sessionHash,
+          ttlSeconds: fullTTL,
+          reason: 'threshold_renewal'
+        })
         logger.debug(
           `🔄 Renewed unified OpenAI session TTL: ${sessionHash} (was ${Math.round(remainingTTL / 60)}m, renewed to ${ttlHours}h)`
         )
@@ -712,6 +739,20 @@ class UnifiedOpenAIScheduler {
             : new Date(Date.now() + 3600000).toISOString() // 默认1小时
         })
       }
+
+      // 账号摘除生命周期事件（预期恢复时间按 resetsInSeconds 或 1 小时默认值）
+      const configuredDurationSeconds =
+        Number.isFinite(resetsInSeconds) && resetsInSeconds > 0 ? Math.trunc(resetsInSeconds) : 3600
+      recordUpstreamTelemetry('account_suppressed', {
+        gatewayRequestId,
+        sessionHash,
+        accountId,
+        accountType,
+        reason: 'rate_limit',
+        configuredDurationSeconds,
+        expectedRecoveryAt: new Date(Date.now() + configuredDurationSeconds * 1000).toISOString(),
+        suppressionId: String(Date.now())
+      })
 
       // 删除会话映射
       if (sessionHash) {
@@ -805,8 +846,26 @@ class UnifiedOpenAIScheduler {
   }
 
   // ✅ 移除账户的限流状态
-  async removeAccountRateLimit(accountId, accountType) {
+  // options.recoverySource：恢复来源（successful_inflight_response/manual 等）
+  async removeAccountRateLimit(accountId, accountType, options = {}) {
     try {
+      // 恢复事件需要摘除开始时刻：先读取账号当前限流字段
+      let suppressionStartedAt = null
+      let expectedRecoveryAt = null
+      try {
+        if (accountType === 'openai') {
+          const account = await openaiAccountService.getAccount(accountId)
+          suppressionStartedAt = account?.rateLimitedAt || null
+          expectedRecoveryAt = account?.rateLimitResetAt || null
+        } else if (accountType === 'openai-responses') {
+          const account = await openaiResponsesAccountService.getAccount(accountId)
+          suppressionStartedAt = account?.rateLimitedAt || null
+          expectedRecoveryAt = account?.rateLimitResetAt || null
+        }
+      } catch (readError) {
+        logger.debug(`⚠️ Failed to read OpenAI rate limit fields: ${readError?.message}`)
+      }
+
       if (accountType === 'openai') {
         await openaiAccountService.setAccountRateLimited(accountId, false)
       } else if (accountType === 'openai-responses') {
@@ -820,6 +879,24 @@ class UnifiedOpenAIScheduler {
           schedulable: 'true'
         })
         logger.info(`✅ Rate limit cleared for OpenAI-Responses account ${accountId}`)
+      }
+
+      if (suppressionStartedAt) {
+        const actualRecoveryAt = new Date()
+        const startedAt = new Date(suppressionStartedAt)
+        const actualSuppressionSeconds = Number.isNaN(startedAt.getTime())
+          ? null
+          : Math.max(0, Math.round((actualRecoveryAt - startedAt) / 1000))
+        recordUpstreamTelemetry('account_recovered', {
+          gatewayRequestId: options.gatewayRequestId ?? null,
+          accountId,
+          accountType,
+          recoverySource: options.recoverySource ?? 'manual',
+          expectedRecoveryAt,
+          actualRecoveryAt: actualRecoveryAt.toISOString(),
+          actualSuppressionSeconds,
+          suppressionId: suppressionStartedAt
+        })
       }
 
       return { success: true }
@@ -905,6 +982,7 @@ class UnifiedOpenAIScheduler {
             if (isAvailable) {
               // 🚀 智能会话续期（续期 unified 映射键，按配置）
               await this._extendSessionMappingTTL(sessionHash)
+              this._recordStickyHit(sessionHash, mappedAccount.accountId, mappedAccount.accountType)
               logger.info(
                 `🎯 Using sticky session account from group: ${mappedAccount.accountId} (${mappedAccount.accountType})`
               )

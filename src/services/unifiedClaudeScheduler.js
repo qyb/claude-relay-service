@@ -37,6 +37,48 @@ function isProAccount(info) {
 class UnifiedClaudeScheduler {
   constructor() {
     this.SESSION_MAPPING_PREFIX = 'unified_claude_session_mapping:'
+    // 账号 → 会话反向索引（ZSET，score=映射过期时刻），用于计算摘除波及的会话数
+    this.ACCOUNT_SESSIONS_PREFIX = 'unified_claude_account_sessions:'
+  }
+
+  // 🧮 计算当前仍映射在该账号上的会话数（摘除"连坐"半径），失败返回 null 不阻塞调度
+  async _countAffectedSessions(accountId, accountType) {
+    try {
+      const client = redis.getClientSafe()
+      const key = `${this.ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+      const nowSec = Math.floor(Date.now() / 1000)
+      // 先剪掉已过期成员，避免 TTL 过期会话虚增计数
+      await client.zremrangebyscore(key, '-inf', nowSec)
+      const count = await client.zcard(key)
+      return Number.isInteger(count) ? count : null
+    } catch (error) {
+      logger.debug(`⚠️ Failed to count affected sessions for ${accountId}:`, error?.message)
+      return null
+    }
+  }
+
+  // 🎲 按配置比例采样 sticky 命中（默认 0=不记录），用于验证续期收益且避免事件膨胀
+  _shouldSampleStickyHit() {
+    try {
+      const appConfig = require('../../config/config')
+      const rate = appConfig.session?.stickyHitSampleRate || 0
+      return rate > 0 && Math.random() < rate
+    } catch (_) {
+      return false
+    }
+  }
+
+  _recordStickyHit(sessionHash, accountId, accountType) {
+    if (!this._shouldSampleStickyHit()) {
+      return
+    }
+    recordUpstreamTelemetry('sticky_session_lifecycle', {
+      action: 'hit',
+      sessionHash,
+      accountId,
+      accountType,
+      reason: 'sampled_hit'
+    })
   }
 
   // 🔧 辅助方法：检查账户是否可调度（兼容字符串和布尔值）
@@ -404,6 +446,7 @@ class UnifiedClaudeScheduler {
             if (isAvailable) {
               // 🚀 智能会话续期：剩余时间少于14天时自动续期到15天（续期正确的 unified 映射键）
               await this._extendSessionMappingTTL(sessionHash)
+              this._recordStickyHit(sessionHash, mappedAccount.accountId, mappedAccount.accountType)
               logger.info(
                 `🎯 Using sticky session account: ${mappedAccount.accountId} (${mappedAccount.accountType}) for session ${sessionHash}`
               )
@@ -448,13 +491,17 @@ class UnifiedClaudeScheduler {
           throw error
         }
 
-        // 提供更详细的错误信息
+        // 提供更详细的错误信息（带稳定错误码，便于 telemetry 区分调度失败原因）
         if (effectiveModel) {
-          throw new Error(
+          const error = new Error(
             `No available Claude accounts support the requested model: ${effectiveModel}`
           )
+          error.code = 'MODEL_NOT_SUPPORTED'
+          throw error
         } else {
-          throw new Error('No available Claude accounts (neither official nor console)')
+          const error = new Error('No available Claude accounts (neither official nor console)')
+          error.code = 'NO_ELIGIBLE_ACCOUNT'
+          throw error
         }
       }
 
@@ -1364,6 +1411,15 @@ class UnifiedClaudeScheduler {
     const ttlHours = appConfig.session?.stickyTtlHours || 1
     const ttlSeconds = Math.max(1, Math.floor(ttlHours * 60 * 60))
     await client.setex(`${this.SESSION_MAPPING_PREFIX}${sessionHash}`, ttlSeconds, mappingData)
+    // 维护账号→会话反向索引（score=过期时刻），供摘除时计算 affected_session_count
+    try {
+      const indexKey = `${this.ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`
+      const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds
+      await client.zadd(indexKey, expiresAt, sessionHash)
+      await client.expire(indexKey, ttlSeconds)
+    } catch (indexError) {
+      logger.debug(`⚠️ Failed to update account session index: ${indexError?.message}`)
+    }
     recordUpstreamTelemetry('sticky_session_lifecycle', {
       action: 'set',
       sessionHash,
@@ -1394,11 +1450,21 @@ class UnifiedClaudeScheduler {
     } catch (_) {
       mapping = {}
     }
+    const accountId = details.accountId ?? mapping.accountId
+    const accountType = details.accountType ?? mapping.accountType
+    // 同步清理反向索引，避免计数虚增
+    if (accountId && accountType) {
+      try {
+        await client.zrem(`${this.ACCOUNT_SESSIONS_PREFIX}${accountType}:${accountId}`, sessionHash)
+      } catch (indexError) {
+        logger.debug(`⚠️ Failed to prune account session index: ${indexError?.message}`)
+      }
+    }
     recordUpstreamTelemetry('sticky_session_lifecycle', {
       action: 'deleted',
       sessionHash,
-      accountId: details.accountId ?? mapping.accountId,
-      accountType: details.accountType ?? mapping.accountType,
+      accountId,
+      accountType,
       reason: details.reason || 'account_error'
     })
     return true
@@ -1460,6 +1526,13 @@ class UnifiedClaudeScheduler {
 
       if (remainingTTL < threshold) {
         await client.expire(key, fullTTL)
+        // renewed 只在真实续期时记录（renewalThresholdMinutes 默认 0，事件量可控）
+        recordUpstreamTelemetry('sticky_session_lifecycle', {
+          action: 'renewed',
+          sessionHash,
+          ttlSeconds: fullTTL,
+          reason: 'threshold_renewal'
+        })
         logger.debug(
           `🔄 Renewed unified session TTL: ${sessionHash} (was ${Math.round(remainingTTL / 60)}m, renewed to ${ttlHours}h)`
         )
@@ -1487,6 +1560,22 @@ class UnifiedClaudeScheduler {
       const client = redis.getClientSafe()
       const key = `temp_unavailable:${accountType}:${accountId}`
       await client.setex(key, ttlSeconds, '1')
+
+      // temp_error 摘除依赖 Redis TTL 自动恢复，无法观测 recovered 事件（见设计文档 6.1 说明）
+      const suppressionId = String(Date.now())
+      const affectedSessionCount = await this._countAffectedSessions(accountId, accountType)
+      recordUpstreamTelemetry('account_suppressed', {
+        gatewayRequestId,
+        sessionHash,
+        accountId,
+        accountType,
+        reason: 'temp_error',
+        configuredDurationSeconds: ttlSeconds,
+        expectedRecoveryAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+        suppressionId,
+        affectedSessionCount
+      })
+
       if (sessionHash) {
         const stickyDeleted = await this._deleteSessionMapping(sessionHash, {
           reason: 'failover',
@@ -1499,7 +1588,8 @@ class UnifiedClaudeScheduler {
           accountType,
           reason: 'temp_error',
           stickyDeleted,
-          gatewayRequestId
+          gatewayRequestId,
+          affectedSessionCount
         })
       } else {
         recordUpstreamTelemetry('account_failover', {
@@ -1507,7 +1597,8 @@ class UnifiedClaudeScheduler {
           accountType,
           reason: 'temp_error',
           stickyDeleted: false,
-          gatewayRequestId
+          gatewayRequestId,
+          affectedSessionCount
         })
       }
       logger.warn(
@@ -1533,24 +1624,78 @@ class UnifiedClaudeScheduler {
   }
 
   // 🚫 标记账户为限流状态
+  // upstreamDetails：真实上游 429 的脱敏信息（状态码/错误码/消息模板/请求ID），由 relay 层提取
   async markAccountRateLimited(
     accountId,
     accountType,
     sessionHash = null,
     rateLimitResetTimestamp = null,
-    gatewayRequestId = null
+    gatewayRequestId = null,
+    upstreamDetails = {}
   ) {
     try {
+      const suppressionId = String(Date.now())
+      // 1️⃣ 检测事件：relay 观测到上游限流信号的瞬间，携带真实上游错误详情
+      recordUpstreamTelemetry('account_rate_limit_detected', {
+        gatewayRequestId,
+        sessionHash,
+        accountId,
+        accountType,
+        upstreamStatusCode: upstreamDetails.upstreamStatusCode ?? 429,
+        upstreamErrorCode: upstreamDetails.upstreamErrorCode ?? null,
+        upstreamMessageTemplate: upstreamDetails.upstreamMessageTemplate ?? null,
+        upstreamRequestId: upstreamDetails.upstreamRequestId ?? null,
+        suppressionId,
+        resetTimestamp: rateLimitResetTimestamp
+      })
+
+      // 2️⃣ 执行摘除，账号服务返回 suppressionId/摘除时刻/预期恢复时间
+      let markResult = { success: true }
       if (accountType === 'claude-official') {
-        await claudeAccountService.markAccountRateLimited(
-          accountId,
-          sessionHash,
-          rateLimitResetTimestamp
-        )
+        markResult =
+          (await claudeAccountService.markAccountRateLimited(
+            accountId,
+            sessionHash,
+            rateLimitResetTimestamp,
+            { suppressionId }
+          )) || {}
       } else if (accountType === 'claude-console') {
-        await claudeConsoleAccountService.markAccountRateLimited(accountId, rateLimitResetTimestamp)
+        markResult =
+          (await claudeConsoleAccountService.markAccountRateLimited(
+            accountId,
+            rateLimitResetTimestamp,
+            { suppressionId }
+          )) || {}
       } else if (accountType === 'ccr') {
-        await ccrAccountService.markAccountRateLimited(accountId)
+        markResult =
+          (await ccrAccountService.markAccountRateLimited(accountId, { suppressionId })) || {}
+      }
+
+      const expectedRecoveryAt = markResult.expectedRecoveryAt ?? null
+      const suppressedAt = markResult.rateLimitedAt ?? markResult.suppressedAt ?? null
+      let configuredDurationSeconds = null
+      if (expectedRecoveryAt && suppressedAt) {
+        const planned = (new Date(expectedRecoveryAt) - new Date(suppressedAt)) / 1000
+        if (Number.isFinite(planned) && planned >= 0) {
+          configuredDurationSeconds = Math.round(planned)
+        }
+      }
+
+      const affectedSessionCount = await this._countAffectedSessions(accountId, accountType)
+
+      // 3️⃣ 摘除事件：仅在实际生效时记录（账号关闭限流保护时 markResult.skipped=true）
+      if (!markResult.skipped) {
+        recordUpstreamTelemetry('account_suppressed', {
+          gatewayRequestId,
+          sessionHash,
+          accountId,
+          accountType,
+          reason: 'rate_limit',
+          configuredDurationSeconds,
+          expectedRecoveryAt,
+          suppressionId,
+          affectedSessionCount
+        })
       }
 
       // 删除会话映射
@@ -1565,16 +1710,26 @@ class UnifiedClaudeScheduler {
           accountId,
           accountType,
           reason: 'rate_limit',
+          upstreamStatusCode: upstreamDetails.upstreamStatusCode ?? null,
+          upstreamErrorCode: upstreamDetails.upstreamErrorCode ?? null,
+          upstreamMessageTemplate: upstreamDetails.upstreamMessageTemplate ?? null,
           stickyDeleted,
-          gatewayRequestId
+          gatewayRequestId,
+          expectedRecoveryAt,
+          affectedSessionCount
         })
       } else {
         recordUpstreamTelemetry('account_failover', {
           accountId,
           accountType,
           reason: 'rate_limit',
+          upstreamStatusCode: upstreamDetails.upstreamStatusCode ?? null,
+          upstreamErrorCode: upstreamDetails.upstreamErrorCode ?? null,
+          upstreamMessageTemplate: upstreamDetails.upstreamMessageTemplate ?? null,
           stickyDeleted: false,
-          gatewayRequestId
+          gatewayRequestId,
+          expectedRecoveryAt,
+          affectedSessionCount
         })
       }
 
@@ -1589,14 +1744,16 @@ class UnifiedClaudeScheduler {
   }
 
   // ✅ 移除账户的限流状态
-  async removeAccountRateLimit(accountId, accountType) {
+  // options.recoverySource：恢复来源（successful_inflight_response/timer_expired/upstream_reset_time/manual）
+  // options.gatewayRequestId：触发恢复的请求（审计"并行成功响应提前恢复"竞态）
+  async removeAccountRateLimit(accountId, accountType, options = {}) {
     try {
       if (accountType === 'claude-official') {
-        await claudeAccountService.removeAccountRateLimit(accountId)
+        await claudeAccountService.removeAccountRateLimit(accountId, options)
       } else if (accountType === 'claude-console') {
-        await claudeConsoleAccountService.removeAccountRateLimit(accountId)
+        await claudeConsoleAccountService.removeAccountRateLimit(accountId, options)
       } else if (accountType === 'ccr') {
-        await ccrAccountService.removeAccountRateLimit(accountId)
+        await ccrAccountService.removeAccountRateLimit(accountId, options)
       }
 
       return { success: true }
@@ -1658,6 +1815,17 @@ class UnifiedClaudeScheduler {
               accountType
             })
           : false
+        const affectedSessionCount = await this._countAffectedSessions(accountId, accountType)
+        // unauthorized 摘除无自动恢复时间，恢复来源为人工/令牌刷新（recovery 事件在管理侧触发）
+        recordUpstreamTelemetry('account_suppressed', {
+          gatewayRequestId,
+          sessionHash,
+          accountId,
+          accountType,
+          reason: 'unauthorized',
+          suppressionId: String(Date.now()),
+          affectedSessionCount
+        })
         recordUpstreamTelemetry('account_failover', {
           sessionHash,
           accountId,
@@ -1665,7 +1833,8 @@ class UnifiedClaudeScheduler {
           reason: 'unauthorized',
           upstreamStatusCode: 401,
           stickyDeleted,
-          gatewayRequestId
+          gatewayRequestId,
+          affectedSessionCount
         })
         logger.warn(`🚫 Account ${accountId} marked as unauthorized (${accountType})`)
       }
@@ -1711,6 +1880,16 @@ class UnifiedClaudeScheduler {
               accountType
             })
           : false
+        const affectedSessionCount = await this._countAffectedSessions(accountId, accountType)
+        recordUpstreamTelemetry('account_suppressed', {
+          gatewayRequestId,
+          sessionHash,
+          accountId,
+          accountType,
+          reason: 'blocked',
+          suppressionId: String(Date.now()),
+          affectedSessionCount
+        })
         recordUpstreamTelemetry('account_failover', {
           sessionHash,
           accountId,
@@ -1718,7 +1897,8 @@ class UnifiedClaudeScheduler {
           reason: 'blocked',
           upstreamStatusCode,
           stickyDeleted,
-          gatewayRequestId
+          gatewayRequestId,
+          affectedSessionCount
         })
         logger.warn(`🚫 Account ${accountId} marked as blocked (${accountType})`)
       }
@@ -1780,6 +1960,11 @@ class UnifiedClaudeScheduler {
               if (isAvailable) {
                 // 🚀 智能会话续期：续期 unified 映射键
                 await this._extendSessionMappingTTL(sessionHash)
+                this._recordStickyHit(
+                  sessionHash,
+                  mappedAccount.accountId,
+                  mappedAccount.accountType
+                )
                 logger.info(
                   `🎯 Using sticky session account from group: ${mappedAccount.accountId} (${mappedAccount.accountType}) for session ${sessionHash}`
                 )
@@ -1805,7 +1990,9 @@ class UnifiedClaudeScheduler {
       // 获取分组内的所有账户
       const memberIds = await accountGroupService.getGroupMembers(groupId)
       if (memberIds.length === 0) {
-        throw new Error(`Group ${group.name} has no members`)
+        const error = new Error(`Group ${group.name} has no members`)
+        error.code = 'NO_ELIGIBLE_ACCOUNT'
+        throw error
       }
 
       const availableAccounts = []
@@ -1910,7 +2097,9 @@ class UnifiedClaudeScheduler {
       }
 
       if (availableAccounts.length === 0) {
-        throw new Error(`No available accounts in group ${group.name}`)
+        const error = new Error(`No available accounts in group ${group.name}`)
+        error.code = 'NO_ELIGIBLE_ACCOUNT'
+        throw error
       }
 
       // 使用现有的优先级排序逻辑
@@ -1961,6 +2150,7 @@ class UnifiedClaudeScheduler {
           if (isAvailable) {
             // 🚀 智能会话续期：续期 unified 映射键
             await this._extendSessionMappingTTL(sessionHash)
+            this._recordStickyHit(sessionHash, mappedAccount.accountId, mappedAccount.accountType)
             logger.info(
               `🎯 Using sticky CCR session account: ${mappedAccount.accountId} for session ${sessionHash}`
             )
@@ -1988,9 +2178,11 @@ class UnifiedClaudeScheduler {
       const availableCcrAccounts = await this._getAvailableCcrAccounts(effectiveModel)
 
       if (availableCcrAccounts.length === 0) {
-        throw new Error(
+        const error = new Error(
           `No available CCR accounts support the requested model: ${effectiveModel || 'unspecified'}`
         )
+        error.code = 'MODEL_NOT_SUPPORTED'
+        throw error
       }
 
       // 3. 按优先级和最后使用时间排序

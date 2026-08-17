@@ -602,6 +602,159 @@ describe('LLM request observation lifecycle', () => {
     expect(JSON.stringify(record)).not.toContain('sensitive upstream message')
   })
 
+  it('SSE 流中错误标记 failure_stage=upstream_stream，与 upstream_http 区分', () => {
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const req = buildRequest()
+    const res = new FakeResponse()
+
+    startLlmRequestObservation(req, res)
+    res.end(sse({ type: 'error', error: { type: 'overloaded_error' } }))
+    res.emit('finish')
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      failure_stage: 'upstream_stream'
+    })
+  })
+
+  it('调度失败的稳定错误码推导 failure_stage=account_selection', () => {
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const req = buildRequest()
+    const res = new FakeResponse()
+    const observer = startLlmRequestObservation(req, res)
+
+    observer.observeError(
+      Object.assign(new Error('All available Claude accounts are rate limited'), {
+        code: 'ALL_ACCOUNTS_RATE_LIMITED'
+      })
+    )
+    observer.observeGatewayStatus(429)
+    res.statusCode = 429
+    res.emit('finish')
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      failure_stage: 'account_selection',
+      error_code: 'ALL_ACCOUNTS_RATE_LIMITED',
+      client_status_code: 429,
+      gateway_status_code: 429,
+      upstream_status_code: null
+    })
+  })
+
+  it('observeUpstream 从错误响应体提取脱敏上游错误码与消息模板', () => {
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const req = buildRequest()
+    const res = new FakeResponse()
+    const observer = startLlmRequestObservation(req, res)
+
+    observer.observeUpstream({
+      accountId: 'account-console-1',
+      accountType: 'claude-console',
+      upstreamStatusCode: 429,
+      upstreamErrorBody: {
+        error: {
+          code: '1302',
+          message: '[1302][您的账户已达到速率限制，请您控制请求频率][req-8f3a2b1c9d]'
+        }
+      }
+    })
+    res.emit('finish')
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      account_id: 'account-console-1',
+      upstream_status_code: 429,
+      failure_stage: 'upstream_http',
+      upstream_error_code: '1302',
+      upstream_message_template: '[<n>][您的账户已达到速率限制，请您控制请求频率][req-<id>]'
+    })
+  })
+
+  it('observeQueue：acquired 回填 queue_request_id，timeout 标记 queue 阶段', () => {
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const acquiredReq = buildRequest()
+    const acquiredRes = new FakeResponse()
+    const acquiredObserver = startLlmRequestObservation(acquiredReq, acquiredRes)
+    acquiredObserver.observeQueue({ status: 'acquired', queueRequestId: 'queue-9', waitMs: 87 })
+    acquiredRes.emit('finish')
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      queue_request_id: 'queue-9',
+      failure_stage: null
+    })
+
+    const timeoutReq = buildRequest({ requestId: 'gateway-queue-timeout' })
+    const timeoutRes = new FakeResponse()
+    const timeoutObserver = startLlmRequestObservation(timeoutReq, timeoutRes)
+    timeoutObserver.observeQueue({ status: 'timeout', waitMs: 5000 })
+    timeoutRes.statusCode = 503
+    timeoutRes.emit('finish')
+
+    expect(logger.telemetry.mock.calls[1][0]).toMatchObject({
+      failure_stage: 'queue',
+      error_code: 'queue_timeout',
+      gateway_status_code: 503
+    })
+  })
+
+  it('observeAttempt 逐次落盘 upstream_attempt 并自增序号，telemetry 关闭时不落盘', () => {
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const req = buildRequest()
+    const res = new FakeResponse()
+    const observer = startLlmRequestObservation(req, res)
+
+    observer.observeUpstream({ accountId: 'account-1', accountType: 'claude-official' })
+    observer.observeAttempt({
+      accountId: 'account-1',
+      upstreamStatusCode: 403,
+      success: false,
+      upstreamLatencyMs: 320
+    })
+    observer.noteRetry('upstream_403')
+    observer.observeAttempt({
+      upstreamStatusCode: 200,
+      success: true,
+      upstreamLatencyMs: 640,
+      usage: { input_tokens: 10, output_tokens: 2 }
+    })
+
+    const attemptEvents = logger.telemetry.mock.calls
+      .map((call) => call[0])
+      .filter((record) => record.event_type === 'upstream_attempt')
+    expect(attemptEvents).toHaveLength(2)
+    expect(attemptEvents[0]).toMatchObject({
+      gateway_request_id: 'gateway-request-1',
+      attempt_number: 1,
+      account_id: 'account-1',
+      upstream_status_code: 403,
+      success: false
+    })
+    expect(attemptEvents[1]).toMatchObject({
+      attempt_number: 2,
+      upstream_status_code: 200,
+      success: true,
+      input_tokens: 10
+    })
+
+    res.emit('finish')
+    const finalRecord = logger.telemetry.mock.calls
+      .map((call) => call[0])
+      .find((record) => record.event_type === 'llm_request_completed')
+    expect(finalRecord.attempt_count).toBe(2)
+    expect(finalRecord.retry_reason).toBe('upstream_403')
+  })
+
+  it('客户端断开标记 failure_stage=client_disconnect', () => {
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const req = buildRequest()
+    const res = new FakeResponse()
+
+    startLlmRequestObservation(req, res)
+    res.emit('close')
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      failure_stage: 'client_disconnect'
+    })
+  })
+
   it('11. SKILL 分析器失败不影响 Prompt 记录和 telemetry（fail-open）', () => {
     logger.isPromptLogEnabled.mockReturnValue(true)
     logger.isTelemetryEnabled.mockReturnValue(true)

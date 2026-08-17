@@ -180,7 +180,7 @@ class UserMessageQueueService {
           waitedMs: Date.now() - startTime,
           retries: retryCount
         })
-        return { acquired: true, requestId: reqId }
+        return { acquired: true, requestId: reqId, waitedMs: Date.now() - startTime }
       }
 
       // 需要等待
@@ -211,7 +211,8 @@ class UserMessageQueueService {
     return {
       acquired: false,
       requestId: reqId,
-      error: 'queue_timeout'
+      error: 'queue_timeout',
+      waitedMs: Date.now() - startTime
     }
   }
 

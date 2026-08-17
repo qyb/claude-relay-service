@@ -216,6 +216,22 @@ total_latency_ms       CRS 接收到请求到最终终态
 
 如果某阶段无法测量，使用 `null`，不能用 `0` 表示未知。
 
+### 5.5 失败分层与三层状态码（schema v2 补充）
+
+`llm_request_error` 额外携带以下字段，消除"网关合成状态被误读为上游状态"的歧义：
+
+```text
+client_status_code     客户端实际收到的 HTTP 状态（= 旧 status_code，兼容期保留）
+gateway_status_code    网关决定返回的状态（如 ALL_ACCOUNTS_RATE_LIMITED 合成的 429）
+upstream_status_code   最后一次真实上游响应的状态（未到达上游时为 null）
+failure_stage          account_selection | queue | upstream_http | upstream_stream | relay | client_disconnect
+upstream_error_type    上游错误类型（脱敏枚举）
+upstream_error_code    上游错误码（如智谱 1302）
+upstream_message_template  上游错误消息模板（数字/ID 归一为 <n>/<id>，不落原文）
+```
+
+逐次上游尝试、账号生命周期与 sticky 事件见 `UPSTREAM_TELEMETRY_DESIGN.md`。
+
 ## 六、可派生指标
 
 基础 telemetry 可以聚合出：

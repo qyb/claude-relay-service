@@ -14,6 +14,7 @@ const userMessageQueueService = require('./userMessageQueueService')
 const { isStreamWritable } = require('../utils/streamHelper')
 const { filterForClaude } = require('../utils/headerFilter')
 const { consumeSseLines } = require('../utils/sseStreamDecoder')
+const { extractUpstreamErrorFields } = require('../utils/llmTelemetry')
 
 /**
  * 解析智谱(ZhiPu) 429 报错中的重置时间 (code 1310/1308)
@@ -63,6 +64,22 @@ function parseZhipu429ResetTime(responseData) {
 class ClaudeConsoleRelayService {
   constructor() {
     this.defaultUserAgent = 'claude-cli/2.0.52 (external, cli)'
+  }
+
+  // 📊 从响应体提取 usage（供逐次 attempt 事件记录），解析失败返回 null
+  _extractUsageFromBody(body) {
+    if (!body) {
+      return null
+    }
+    try {
+      const data = typeof body === 'string' ? JSON.parse(body) : body
+      if (data && typeof data === 'object' && data.usage && typeof data.usage === 'object') {
+        return data.usage
+      }
+    } catch (_) {
+      // 非 JSON 响应体没有 usage
+    }
+    return null
   }
 
   // 🚀 转发请求到Claude Console API
@@ -115,6 +132,13 @@ class ClaudeConsoleRelayService {
             `📬 User message queue ${errorType} for console account ${accountId}, key: ${apiKeyData.name}`,
             isBackendError ? { backendError: queueResult.errorMessage } : {}
           )
+          // 排队失败单独标记 failure_stage=queue，与账号选择失败区分
+          if (typeof options.onQueue === 'function') {
+            options.onQueue({
+              status: isBackendError ? 'error' : 'timeout',
+              waitMs: queueResult.waitedMs ?? null
+            })
+          }
           return {
             statusCode,
             headers: {
@@ -138,6 +162,13 @@ class ClaudeConsoleRelayService {
           logger.debug(
             `📬 User message queue lock acquired for console account ${accountId}, requestId: ${queueRequestId}`
           )
+          if (typeof options.onQueue === 'function') {
+            options.onQueue({
+              status: 'acquired',
+              queueRequestId,
+              waitMs: queueResult.waitedMs ?? null
+            })
+          }
         }
         if (typeof options.onUpstreamDetails === 'function') {
           options.onUpstreamDetails({ accountId, accountType: 'claude-console', queueRequestId })
@@ -321,6 +352,8 @@ class ClaudeConsoleRelayService {
         '📤 Sending request to Claude Console API with headers:',
         JSON.stringify(requestConfig.headers, null, 2)
       )
+      // 逐次 attempt 计时起点（console 非流式每请求单次上游尝试）
+      const attemptStartedAt = Date.now()
       const response = await axios(requestConfig)
 
       // 📬 请求已发送成功，立即释放队列锁（无需等待响应处理完成）
@@ -419,6 +452,15 @@ class ClaudeConsoleRelayService {
         logger.warn(
           `🚫 Rate limit detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
         )
+        // 智谱 429 错误详情（如 1302/1310 错误码与消息模板）提取后传入生命周期事件
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails({
+            upstreamStatusCode: response.status,
+            upstreamErrorBody: response.data,
+            upstreamRequestId:
+              response.headers?.['request-id'] ?? response.headers?.['x-request-id'] ?? null
+          })
+        }
         // 收到429先检查是否因为超过了手动配置的每日额度
         await claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
           logger.error('❌ Failed to check quota after 429 error:', err)
@@ -431,7 +473,11 @@ class ClaudeConsoleRelayService {
             'claude-console',
             options.sessionHash,
             resetTimestamp,
-            options.gatewayRequestId
+            options.gatewayRequestId,
+            {
+              upstreamStatusCode: response.status,
+              ...extractUpstreamErrorFields(response.data)
+            }
           )
         }
       } else if (response.status === 529) {
@@ -445,11 +491,25 @@ class ClaudeConsoleRelayService {
         // 如果请求成功，检查并移除错误状态
         const isRateLimited = await claudeConsoleAccountService.isAccountRateLimited(accountId)
         if (isRateLimited) {
-          await claudeConsoleAccountService.removeAccountRateLimit(accountId)
+          // 并行在途请求成功触发提前恢复：记录恢复来源与触发请求，竞态可直接审计
+          await claudeConsoleAccountService.removeAccountRateLimit(accountId, {
+            recoverySource: 'successful_inflight_response',
+            gatewayRequestId: options.gatewayRequestId
+          })
         }
         const isOverloaded = await claudeConsoleAccountService.isAccountOverloaded(accountId)
         if (isOverloaded) {
           await claudeConsoleAccountService.removeAccountOverload(accountId)
+        }
+      } else if (response.status >= 400) {
+        // 非 429/401/529 的其他上游错误：状态码与脱敏错误详情仍回传 observer
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails({
+            upstreamStatusCode: response.status,
+            upstreamErrorBody: response.data,
+            upstreamRequestId:
+              response.headers?.['request-id'] ?? response.headers?.['x-request-id'] ?? null
+          })
         }
       }
 
@@ -480,6 +540,27 @@ class ClaudeConsoleRelayService {
       }
 
       logger.debug(`[DEBUG] Final response body to return: ${responseBody.substring(0, 200)}...`)
+
+      // 逐次 attempt 事件（v2）：console 非流式为单次上游尝试
+      if (typeof options.onAttempt === 'function') {
+        const attemptUsage =
+          response.status >= 200 && response.status < 300
+            ? this._extractUsageFromBody(responseBody)
+            : null
+        options.onAttempt({
+          accountId,
+          accountType: 'claude-console',
+          model: null,
+          queueRequestId,
+          upstreamLatencyMs: Date.now() - attemptStartedAt,
+          upstreamStatusCode: response.status,
+          success: response.status >= 200 && response.status < 300,
+          upstreamRequestId:
+            response.headers?.['request-id'] ?? response.headers?.['x-request-id'] ?? null,
+          usage: attemptUsage,
+          apiUrl: account.apiUrl
+        })
+      }
 
       return {
         statusCode: response.status,
@@ -595,6 +676,13 @@ class ClaudeConsoleRelayService {
             `📬 User message queue ${errorType} for console account ${accountId} (stream), key: ${apiKeyData.name}`,
             isBackendError ? { backendError: queueResult.errorMessage } : {}
           )
+          // 排队失败单独标记 failure_stage=queue，与账号选择失败区分
+          if (typeof options.onQueue === 'function') {
+            options.onQueue({
+              status: isBackendError ? 'error' : 'timeout',
+              waitMs: queueResult.waitedMs ?? null
+            })
+          }
           if (!responseStream.headersSent) {
             const existingConnection = responseStream.getHeader
               ? responseStream.getHeader('Connection')
@@ -618,6 +706,13 @@ class ClaudeConsoleRelayService {
           logger.debug(
             `📬 User message queue lock acquired for console account ${accountId} (stream), requestId: ${queueRequestId}`
           )
+          if (typeof options.onQueue === 'function') {
+            options.onQueue({
+              status: 'acquired',
+              queueRequestId,
+              waitMs: queueResult.waitedMs ?? null
+            })
+          }
         }
         if (typeof options.onUpstreamDetails === 'function') {
           options.onUpstreamDetails({ accountId, accountType: 'claude-console', queueRequestId })
@@ -876,6 +971,8 @@ class ClaudeConsoleRelayService {
       }
 
       // 发送请求
+      // 逐次 attempt 计时起点（console 流式每请求单次上游尝试）
+      const streamAttemptStartedAt = Date.now()
       const request = axios(requestConfig)
 
       // 注意：使用 .then(async ...) 模式处理响应
@@ -906,6 +1003,30 @@ class ClaudeConsoleRelayService {
               logger.error(
                 `📝 [Stream] Upstream error response from ${account?.name || accountId}: ${errorDataForCheck.substring(0, 500)}`
               )
+
+              // 真实上游错误详情（智谱 1302 等错误码/消息模板）回传 observer 与 attempt 事件
+              const upstreamErrorDetails = {
+                upstreamStatusCode: response.status,
+                upstreamRequestId:
+                  response.headers?.['request-id'] ?? response.headers?.['x-request-id'] ?? null,
+                ...extractUpstreamErrorFields(errorDataForCheck)
+              }
+              if (typeof requestOptions.onUpstreamDetails === 'function') {
+                requestOptions.onUpstreamDetails(upstreamErrorDetails)
+              }
+              if (typeof requestOptions.onAttempt === 'function') {
+                requestOptions.onAttempt({
+                  accountId,
+                  accountType: 'claude-console',
+                  model: null,
+                  upstreamLatencyMs: Date.now() - streamAttemptStartedAt,
+                  upstreamStatusCode: response.status,
+                  success: false,
+                  upstreamErrorBody: errorDataForCheck,
+                  upstreamRequestId: upstreamErrorDetails.upstreamRequestId,
+                  apiUrl: account.apiUrl
+                })
+              }
 
               // 检查是否为账户禁用错误
               const accountDisabledError = isAccountDisabledError(
@@ -955,7 +1076,8 @@ class ClaudeConsoleRelayService {
                     'claude-console',
                     requestOptions.sessionHash,
                     resetTimestamp,
-                    requestOptions.gatewayRequestId
+                    requestOptions.gatewayRequestId,
+                    upstreamErrorDetails
                   )
                 }
               } else if (response.status === 529) {
@@ -1021,7 +1143,11 @@ class ClaudeConsoleRelayService {
           // 成功响应，检查并移除错误状态
           claudeConsoleAccountService.isAccountRateLimited(accountId).then((isRateLimited) => {
             if (isRateLimited) {
-              claudeConsoleAccountService.removeAccountRateLimit(accountId)
+              // 并行在途请求成功触发提前恢复：记录恢复来源与触发请求，竞态可直接审计
+              claudeConsoleAccountService.removeAccountRateLimit(accountId, {
+                recoverySource: 'successful_inflight_response',
+                gatewayRequestId: requestOptions.gatewayRequestId
+              })
             }
           })
           claudeConsoleAccountService.isAccountOverloaded(accountId).then((isOverloaded) => {
@@ -1200,6 +1326,23 @@ class ClaudeConsoleRelayService {
 
           const handleStreamEnd = () => {
             try {
+              // 成功 attempt 事件：携带该次真实上游调用的 usage 与延迟
+              if (typeof requestOptions.onAttempt === 'function') {
+                requestOptions.onAttempt({
+                  accountId,
+                  accountType: 'claude-console',
+                  model: collectedUsageData.model ?? null,
+                  upstreamLatencyMs: Date.now() - streamAttemptStartedAt,
+                  upstreamStatusCode: 200,
+                  success: true,
+                  usage:
+                    collectedUsageData.input_tokens !== undefined ||
+                    collectedUsageData.output_tokens !== undefined
+                      ? collectedUsageData
+                      : null,
+                  apiUrl: account.apiUrl
+                })
+              }
               if (!finalUsageReported) {
                 if (
                   collectedUsageData.input_tokens !== undefined ||

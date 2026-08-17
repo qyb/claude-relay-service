@@ -14,7 +14,10 @@ const { defaultAgentContextResolver } = require('./agentContext')
 const purposeClassifier = require('./requestPurposeClassifier')
 const {
   createTelemetryContext,
+  classifyFailureStage,
+  extractUpstreamErrorFields,
   finalizeTelemetry,
+  recordUpstreamTelemetry,
   summarizeResponseForTelemetry
 } = require('./llmTelemetry')
 
@@ -94,6 +97,12 @@ class LlmRequestObserver {
     this.upstreamRequestId = null
     this.queueRequestId = null
     this.upstreamStatusCode = null
+    this.gatewayStatusCode = null
+    this.failureStage = null
+    this.upstreamErrorType = null
+    this.upstreamErrorCode = null
+    this.upstreamMessageTemplate = null
+    this.attemptEventCount = 0
     this.attemptCount = 1
     this.retryReason = null
     this.errorType = null
@@ -120,6 +129,80 @@ class LlmRequestObserver {
     this.model = details.model ?? this.model
     this.queueRequestId = details.queueRequestId ?? this.queueRequestId
     this.upstreamStatusCode = details.upstreamStatusCode ?? this.upstreamStatusCode
+    this.upstreamRequestId = details.upstreamRequestId ?? this.upstreamRequestId
+    this.upstreamErrorType = details.upstreamErrorType ?? this.upstreamErrorType
+    this.upstreamErrorCode = details.upstreamErrorCode ?? this.upstreamErrorCode
+    this.upstreamMessageTemplate = details.upstreamMessageTemplate ?? this.upstreamMessageTemplate
+    // 响应体中的错误详情（智谱 1302 等）：relay 只传原始 body，这里统一脱敏
+    if (details.upstreamErrorBody !== undefined && details.upstreamErrorBody !== null) {
+      const extracted = extractUpstreamErrorFields(details.upstreamErrorBody)
+      this.upstreamErrorType = extracted.upstreamErrorType ?? this.upstreamErrorType
+      this.upstreamErrorCode = extracted.upstreamErrorCode ?? this.upstreamErrorCode
+      this.upstreamMessageTemplate =
+        extracted.upstreamMessageTemplate ?? this.upstreamMessageTemplate
+    }
+    if (
+      Number.isInteger(details.upstreamStatusCode) &&
+      details.upstreamStatusCode >= 400 &&
+      this.failureStage === null
+    ) {
+      this.failureStage = 'upstream_http'
+    }
+    return this
+  }
+
+  // 网关决定返回给客户端的状态码（区别于 res.statusCode 与上游状态）
+  observeGatewayStatus(statusCode) {
+    if (Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 999) {
+      this.gatewayStatusCode = statusCode
+    }
+    return this
+  }
+
+  /**
+   * 队列锁结果：acquired 回填 queue_request_id；timeout/backend_error 标记
+   * failure_stage=queue，使调度失败与排队失败可区分。
+   */
+  observeQueue(outcome = {}) {
+    if (outcome.queueRequestId) {
+      this.queueRequestId = outcome.queueRequestId
+    }
+    if (outcome.status === 'timeout' || outcome.status === 'error') {
+      this.failureStage = this.failureStage ?? 'queue'
+      this.errorCode = this.errorCode ?? 'queue_timeout'
+      this.errorType = this.errorType ?? 'queue_timeout'
+    }
+    return this
+  }
+
+  /**
+   * 逐次真实上游尝试事件（v2）：每次 attempt 结束立即落盘 upstream_attempt，
+   * 用 gateway_request_id + attempt_number 还原完整 retry/failover 链。
+   */
+  observeAttempt(details = {}) {
+    if (!this.telemetryEnabled || !this.context || this.context.finalized) {
+      return this
+    }
+    this.attemptEventCount += 1
+    recordUpstreamTelemetry('upstream_attempt', {
+      gatewayRequestId: this.context.gatewayRequestId,
+      attemptNumber: this.attemptEventCount,
+      accountId: details.accountId ?? this.accountId,
+      accountType: details.accountType ?? this.accountType,
+      provider: details.provider ?? this.provider,
+      model: details.model ?? this.model,
+      queueRequestId: details.queueRequestId ?? this.queueRequestId,
+      queueWaitMs: details.queueWaitMs ?? null,
+      upstreamLatencyMs: details.upstreamLatencyMs ?? null,
+      upstreamStatusCode: details.upstreamStatusCode ?? null,
+      success: details.success === true,
+      upstreamErrorType: details.upstreamErrorType ?? null,
+      upstreamErrorCode: details.upstreamErrorCode ?? null,
+      upstreamMessageTemplate: details.upstreamMessageTemplate ?? null,
+      upstreamRequestId: details.upstreamRequestId ?? null,
+      usage: details.usage ?? null,
+      apiUrl: details.apiUrl ?? this.apiUrl
+    })
     return this
   }
 
@@ -150,6 +233,24 @@ class LlmRequestObserver {
       error?.statusCode ??
       error?.status ??
       this.upstreamStatusCode
+    if (details.upstreamErrorBody !== undefined && details.upstreamErrorBody !== null) {
+      const extracted = extractUpstreamErrorFields(details.upstreamErrorBody)
+      this.upstreamErrorType = extracted.upstreamErrorType ?? this.upstreamErrorType
+      this.upstreamErrorCode = extracted.upstreamErrorCode ?? this.upstreamErrorCode
+      this.upstreamMessageTemplate =
+        extracted.upstreamMessageTemplate ?? this.upstreamMessageTemplate
+    }
+    this.upstreamErrorType = details.upstreamErrorType ?? this.upstreamErrorType
+    this.upstreamErrorCode = details.upstreamErrorCode ?? this.upstreamErrorCode
+    this.upstreamMessageTemplate = details.upstreamMessageTemplate ?? this.upstreamMessageTemplate
+    // 显式指定优先；否则按错误码/上游状态推导失败阶段
+    const derivedStage = classifyFailureStage({
+      errorCode: this.errorCode,
+      errorType: this.errorType,
+      upstreamStatusCode: this.upstreamStatusCode,
+      clientDisconnected: details.clientDisconnected === true
+    })
+    this.failureStage = details.failureStage ?? this.failureStage ?? derivedStage
     return this
   }
 
@@ -160,6 +261,7 @@ class LlmRequestObserver {
   }
 
   observeClientDisconnect() {
+    this.failureStage = 'client_disconnect'
     return this._finalize({
       clientDisconnected: true,
       responseCompleted: false,
@@ -312,6 +414,9 @@ class LlmRequestObserver {
     if (event.type === 'error') {
       this.errorType = event.error?.type ?? 'upstream_stream_error'
       this.errorCode = event.error?.code ?? event.error?.type ?? 'upstream_stream_error'
+      // 流式响应已成功建立（HTTP 200）后出错，属于 upstream_stream 而非 upstream_http。
+      // 不捕获 error.message：SSE 错误消息没有可归一化的结构，原样落盘会泄露正文
+      this.failureStage = 'upstream_stream'
     }
   }
 
@@ -371,6 +476,17 @@ class LlmRequestObserver {
       options.errorType ?? this.errorType ?? (isError && statusCode ? `http_${statusCode}` : null)
     const errorCode =
       options.errorCode ?? this.errorCode ?? (isError && statusCode ? `http_${statusCode}` : null)
+    const clientDisconnected = options.clientDisconnected === true
+    const failureStage =
+      this.failureStage ??
+      (isError
+        ? classifyFailureStage({
+            errorCode,
+            errorType,
+            upstreamStatusCode: this.upstreamStatusCode,
+            clientDisconnected
+          })
+        : null)
 
     return finalizeTelemetry(this.context, {
       eventType: isError ? 'llm_request_error' : 'llm_request_completed',
@@ -390,11 +506,23 @@ class LlmRequestObserver {
       attemptCount: this.attemptCount,
       retryReason: this.retryReason,
       statusCode,
+      clientStatusCode: statusCode,
+      gatewayStatusCode: this.gatewayStatusCode ?? statusCode,
       upstreamStatusCode: this.upstreamStatusCode,
+      failureStage,
+      upstreamErrorType: this.upstreamErrorType,
+      upstreamErrorCode: this.upstreamErrorCode,
+      upstreamMessageTemplate: this.upstreamMessageTemplate,
       responseCompleted: options.responseCompleted === true && !isError,
-      clientDisconnected: options.clientDisconnected === true,
+      clientDisconnected,
       errorType,
-      errorCode
+      errorCode,
+      failureContext: {
+        errorCode,
+        errorType,
+        upstreamStatusCode: this.upstreamStatusCode,
+        clientDisconnected
+      }
     })
   }
 }

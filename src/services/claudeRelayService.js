@@ -18,6 +18,7 @@ const { createClaudeTestPayload } = require('../utils/testPayloadHelper')
 const userMessageQueueService = require('./userMessageQueueService')
 const { isStreamWritable } = require('../utils/streamHelper')
 const { consumeSseLines } = require('../utils/sseStreamDecoder')
+const { extractUpstreamErrorFields } = require('../utils/llmTelemetry')
 
 class ClaudeRelayService {
   constructor() {
@@ -382,6 +383,7 @@ class ClaudeRelayService {
     let upstreamRequest = null
     let queueLockAcquired = false
     let queueRequestId = null
+    let queueWaitedMs = null
     let selectedAccountId = null
     let bodyStoreIdNonStream = null // 🧹 在 try 块外声明，以便 finally 清理
 
@@ -462,6 +464,14 @@ class ClaudeRelayService {
             : 'User message queue wait timeout, please retry later'
           const statusCode = isBackendError ? 500 : 503
 
+          // 排队失败单独标记 failure_stage=queue，与账号选择失败区分
+          if (typeof options.onQueue === 'function') {
+            options.onQueue({
+              status: isBackendError ? 'error' : 'timeout',
+              waitMs: queueResult.waitedMs ?? null
+            })
+          }
+
           // 结构化性能日志，用于后续统计
           logger.performance('user_message_queue_error', {
             errorType,
@@ -496,9 +506,17 @@ class ClaudeRelayService {
         if (queueResult.acquired && !queueResult.skipped) {
           queueLockAcquired = true
           queueRequestId = queueResult.requestId
+          queueWaitedMs = queueResult.waitedMs ?? null
           logger.debug(
             `📬 User message queue lock acquired for account ${accountId}, requestId: ${queueRequestId}`
           )
+          if (typeof options.onQueue === 'function') {
+            options.onQueue({
+              status: 'acquired',
+              queueRequestId,
+              waitMs: queueWaitedMs
+            })
+          }
         }
         if (typeof options.onUpstreamDetails === 'function') {
           options.onUpstreamDetails({ accountId, accountType, queueRequestId })
@@ -586,6 +604,7 @@ class ClaudeRelayService {
             logger.error(`❌ Failed to parse body for retry: ${parseError.message}`)
             throw new Error(`Request body parse failed: ${parseError.message}`)
           }
+          const attemptStartedAt = Date.now()
           response = await this._makeClaudeRequest(
             retryRequestBody,
             accessToken,
@@ -600,6 +619,24 @@ class ClaudeRelayService {
               isRealClaudeCodeRequest
             }
           )
+          // 逐次真实上游尝试事件（v2）：每次 _makeClaudeRequest 返回即一条记录
+          if (typeof requestOptions.onAttempt === 'function') {
+            const attemptUsage = this._extractUsageFromBody(response.body)
+            requestOptions.onAttempt({
+              accountId,
+              accountType,
+              model: retryRequestBody?.model ?? null,
+              queueRequestId,
+              queueWaitMs: queueWaitedMs,
+              upstreamLatencyMs: Date.now() - attemptStartedAt,
+              upstreamStatusCode: response.statusCode,
+              success: response.statusCode >= 200 && response.statusCode < 300,
+              upstreamErrorBody: response.statusCode >= 400 ? response.body : null,
+              upstreamRequestId: this._getUpstreamRequestId(response.headers),
+              usage: attemptUsage,
+              apiUrl: account?.apiUrl || null
+            })
+          }
 
           shouldRetry = response.statusCode === 403 && retryCount < maxRetries
           if (shouldRetry) {
@@ -672,6 +709,15 @@ class ClaudeRelayService {
 
       // 检查响应是否为限流错误或认证错误
       if (response.statusCode !== 200 && response.statusCode !== 201) {
+        // 真实上游错误详情（状态码/错误码/消息模板/request-id）回传请求 observer
+        const upstreamErrorDetails = {
+          upstreamStatusCode: response.statusCode,
+          upstreamRequestId: this._getUpstreamRequestId(response.headers),
+          ...extractUpstreamErrorFields(response.body)
+        }
+        if (typeof options.onUpstreamDetails === 'function') {
+          options.onUpstreamDetails(upstreamErrorDetails)
+        }
         let isRateLimited = false
         let rateLimitResetTimestamp = null
         let dedicatedRateLimitMessage = null
@@ -832,13 +878,14 @@ class ClaudeRelayService {
           logger.warn(
             `🚫 Rate limit detected for account ${accountId}, status: ${response.statusCode}`
           )
-          // 标记账号为限流状态并删除粘性会话映射，传递准确的重置时间戳
+          // 标记账号为限流状态并删除粘性会话映射，传递准确的重置时间戳与真实上游错误详情
           await unifiedClaudeScheduler.markAccountRateLimited(
             accountId,
             accountType,
             sessionHash,
             rateLimitResetTimestamp,
-            options.gatewayRequestId
+            options.gatewayRequestId,
+            upstreamErrorDetails
           )
 
           if (dedicatedRateLimitMessage) {
@@ -884,7 +931,11 @@ class ClaudeRelayService {
           accountType
         )
         if (isRateLimited) {
-          await unifiedClaudeScheduler.removeAccountRateLimit(accountId, accountType)
+          // 并行在途请求成功触发提前恢复：记录恢复来源与触发请求，竞态可直接审计
+          await unifiedClaudeScheduler.removeAccountRateLimit(accountId, accountType, {
+            recoverySource: 'successful_inflight_response',
+            gatewayRequestId: options.gatewayRequestId
+          })
         }
 
         // 如果请求成功，检查并移除过载状态
@@ -1614,6 +1665,7 @@ class ClaudeRelayService {
   ) {
     let queueLockAcquired = false
     let queueRequestId = null
+    let queueWaitedMs = null
     let selectedAccountId = null
 
     try {
@@ -1704,6 +1756,13 @@ class ClaudeRelayService {
             `📬 User message queue ${errorType} for account ${accountId} (stream), key: ${apiKeyData.name}`,
             isBackendError ? { backendError: queueResult.errorMessage } : {}
           )
+          // 排队失败单独标记 failure_stage=queue，与账号选择失败区分
+          if (typeof options.onQueue === 'function') {
+            options.onQueue({
+              status: isBackendError ? 'error' : 'timeout',
+              waitMs: queueResult.waitedMs ?? null
+            })
+          }
           if (!responseStream.headersSent) {
             const existingConnection = responseStream.getHeader
               ? responseStream.getHeader('Connection')
@@ -1731,9 +1790,17 @@ class ClaudeRelayService {
         if (queueResult.acquired && !queueResult.skipped) {
           queueLockAcquired = true
           queueRequestId = queueResult.requestId
+          queueWaitedMs = queueResult.waitedMs ?? null
           logger.debug(
             `📬 User message queue lock acquired for account ${accountId} (stream), requestId: ${queueRequestId}`
           )
+          if (typeof options.onQueue === 'function') {
+            options.onQueue({
+              status: 'acquired',
+              queueRequestId,
+              waitMs: queueWaitedMs
+            })
+          }
         }
         if (typeof options.onUpstreamDetails === 'function') {
           options.onUpstreamDetails({ accountId, accountType, queueRequestId })
@@ -1882,6 +1949,8 @@ class ClaudeRelayService {
     retryCount = 0 // 🔄 403 重试计数器
   ) {
     const maxRetries = 2 // 最大重试次数
+    // 逐次 attempt 计时起点（函数每次递归重试即一次新的上游尝试）
+    const attemptStartedAt = Date.now()
     // 获取账户信息用于统一 User-Agent
     const account = await claudeAccountService.getAccount(accountId)
 
@@ -1974,7 +2043,8 @@ class ClaudeRelayService {
                 accountType,
                 sessionHash,
                 rateLimitResetTimestamp,
-                requestOptions.gatewayRequestId
+                requestOptions.gatewayRequestId,
+                { upstreamStatusCode: 429 }
               )
               logger.warn(`🚫 [Stream] Rate limit detected for account ${accountId}, status 429`)
 
@@ -2009,6 +2079,19 @@ class ClaudeRelayService {
               !responseStream.headersSent
 
             if (canRetry) {
+              // 本次尝试失败（403）：在递归重试前记录 attempt，重试链可完整还原
+              if (typeof requestOptions.onAttempt === 'function') {
+                requestOptions.onAttempt({
+                  accountId,
+                  accountType,
+                  model: body?.model ?? null,
+                  upstreamLatencyMs: Date.now() - attemptStartedAt,
+                  upstreamStatusCode: res.statusCode,
+                  success: false,
+                  upstreamRequestId: this._getUpstreamRequestId(res.headers),
+                  apiUrl: account?.apiUrl || null
+                })
+              }
               if (typeof requestOptions.onRetry === 'function') {
                 requestOptions.onRetry('upstream_403')
               }
@@ -2152,6 +2235,28 @@ class ClaudeRelayService {
               `❌ Claude API error response (Account: ${account?.name || accountId}):`,
               errorData
             )
+            // 真实上游错误详情（状态码/错误码/消息模板/request-id）回传请求 observer
+            const upstreamErrorDetails = {
+              upstreamStatusCode: res.statusCode,
+              upstreamRequestId: this._getUpstreamRequestId(res.headers),
+              ...extractUpstreamErrorFields(errorData)
+            }
+            if (typeof requestOptions.onUpstreamDetails === 'function') {
+              requestOptions.onUpstreamDetails(upstreamErrorDetails)
+            }
+            if (typeof requestOptions.onAttempt === 'function') {
+              requestOptions.onAttempt({
+                accountId,
+                accountType,
+                model: body?.model ?? null,
+                upstreamLatencyMs: Date.now() - attemptStartedAt,
+                upstreamStatusCode: res.statusCode,
+                success: false,
+                upstreamErrorBody: errorData,
+                upstreamRequestId: upstreamErrorDetails.upstreamRequestId,
+                apiUrl: account?.apiUrl || null
+              })
+            }
             if (
               this._isClaudeCodeCredentialError(errorData) &&
               requestOptions.useRandomizedToolNames !== true &&
@@ -2489,6 +2594,20 @@ class ClaudeRelayService {
                   api_url: account?.apiUrl || null
                 })
               }
+
+              // 成功 attempt 事件：携带该次真实上游调用的 usage 与延迟
+              if (typeof requestOptions.onAttempt === 'function') {
+                requestOptions.onAttempt({
+                  accountId,
+                  accountType,
+                  model: finalUsage.model || requestedModel,
+                  upstreamLatencyMs: Date.now() - attemptStartedAt,
+                  upstreamStatusCode: res.statusCode,
+                  success: true,
+                  usage: finalUsage,
+                  apiUrl: account?.apiUrl || null
+                })
+              }
             }
 
             // 提取5小时会话窗口状态
@@ -2558,7 +2677,11 @@ class ClaudeRelayService {
                 accountType
               )
               if (isRateLimited) {
-                await unifiedClaudeScheduler.removeAccountRateLimit(accountId, accountType)
+                // 并行在途请求成功触发提前恢复：记录恢复来源与触发请求，竞态可直接审计
+                await unifiedClaudeScheduler.removeAccountRateLimit(accountId, accountType, {
+                  recoverySource: 'successful_inflight_response',
+                  gatewayRequestId: requestOptions.gatewayRequestId
+                })
               }
 
               // 如果流式请求成功，检查并移除过载状态
@@ -3188,6 +3311,36 @@ class ClaudeRelayService {
   // 仅 claude-official 类型账户（OAuth 或 Setup Token 授权）需要重试
   _shouldRetryOn403(accountType) {
     return accountType === 'claude-official'
+  }
+
+  // 🆔 从上游响应头提取 request-id（大小写不敏感）
+  _getUpstreamRequestId(headers) {
+    if (!headers || typeof headers !== 'object') {
+      return null
+    }
+    return (
+      headers['request-id'] ??
+      headers['Request-Id'] ??
+      headers['x-request-id'] ??
+      headers['X-Request-Id'] ??
+      null
+    )
+  }
+
+  // 📊 从响应体提取 usage（供逐次 attempt 事件记录），解析失败返回 null
+  _extractUsageFromBody(body) {
+    if (!body) {
+      return null
+    }
+    try {
+      const data = typeof body === 'string' ? JSON.parse(body) : body
+      if (data && typeof data === 'object' && data.usage && typeof data.usage === 'object') {
+        return data.usage
+      }
+    } catch (_) {
+      // 流式分片或非 JSON 响应体没有 usage
+    }
+    return null
   }
 
   // ⏱️ 等待指定毫秒数

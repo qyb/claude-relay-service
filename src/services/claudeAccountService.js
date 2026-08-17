@@ -17,6 +17,7 @@ const tokenRefreshService = require('./tokenRefreshService')
 const LRUCache = require('../utils/lruCache')
 const { formatDateWithTimezone, getISOStringWithTimezone } = require('../utils/dateHelper')
 const { isOpus45OrNewer } = require('../utils/modelHelper')
+const { recordUpstreamTelemetry } = require('../utils/llmTelemetry')
 
 /**
  * Check if account is Pro (not Max)
@@ -1321,7 +1322,12 @@ class ClaudeAccountService {
   }
 
   // 🚫 标记账号为限流状态
-  async markAccountRateLimited(accountId, sessionHash = null, rateLimitResetTimestamp = null) {
+  async markAccountRateLimited(
+    accountId,
+    sessionHash = null,
+    rateLimitResetTimestamp = null,
+    context = {}
+  ) {
     try {
       const accountData = await redis.getClaudeAccount(accountId)
       if (!accountData || Object.keys(accountData).length === 0) {
@@ -1336,6 +1342,9 @@ class ClaudeAccountService {
       updatedAccountData.schedulable = 'false'
       // 使用独立的限流自动停止标记，避免与其他自动停止冲突
       updatedAccountData.rateLimitAutoStopped = 'true'
+      if (context.suppressionId) {
+        updatedAccountData.rateLimitStateId = context.suppressionId
+      }
 
       // 如果提供了准确的限流重置时间戳（来自API响应头）
       if (rateLimitResetTimestamp) {
@@ -1401,7 +1410,12 @@ class ClaudeAccountService {
         logger.error('Failed to send rate limit webhook notification:', webhookError)
       }
 
-      return { success: true }
+      // 供调度器补全 account_suppressed 事件的预期恢复信息
+      return {
+        success: true,
+        rateLimitedAt: updatedAccountData.rateLimitedAt,
+        expectedRecoveryAt: updatedAccountData.rateLimitEndAt ?? null
+      }
     } catch (error) {
       logger.error(`❌ Failed to mark account as rate limited: ${accountId}`, error)
       throw error
@@ -1524,7 +1538,8 @@ class ClaudeAccountService {
   }
 
   // ✅ 移除账号的限流状态
-  async removeAccountRateLimit(accountId) {
+  // options.recoverySource：timer_expired / upstream_reset_time / successful_inflight_response / manual
+  async removeAccountRateLimit(accountId, options = {}) {
     try {
       const accountData = await redis.getClaudeAccount(accountId)
       if (!accountData || Object.keys(accountData).length === 0) {
@@ -1533,12 +1548,23 @@ class ClaudeAccountService {
 
       const accountKey = `claude:account:${accountId}`
 
+      const wasRateLimited = Boolean(
+        accountData.rateLimitedAt ||
+          (accountData.rateLimitAutoStopped === 'true' && accountData.rateLimitEndAt)
+      )
+      const suppressionStartedAt = accountData.rateLimitedAt ?? null
+      const expectedRecoveryAt = accountData.rateLimitEndAt ?? null
+      const rateLimitStateId = accountData.rateLimitStateId ?? null
+
       // 清除限流状态
       const redisKey = `claude:account:${accountId}`
       await redis.client.hdel(redisKey, 'rateLimitedAt', 'rateLimitStatus', 'rateLimitEndAt')
       delete accountData.rateLimitedAt
       delete accountData.rateLimitStatus
       delete accountData.rateLimitEndAt // 清除限流结束时间
+      if (rateLimitStateId) {
+        delete accountData.rateLimitStateId
+      }
 
       const hadAutoStop = accountData.rateLimitAutoStopped === 'true'
 
@@ -1567,10 +1593,36 @@ class ClaudeAccountService {
         'rateLimitedAt',
         'rateLimitStatus',
         'rateLimitEndAt',
-        'rateLimitAutoStopped'
+        'rateLimitAutoStopped',
+        'rateLimitStateId'
       )
 
       logger.success(`✅ Rate limit removed for account: ${accountData.name} (${accountId})`)
+
+      // 恢复事件：实际摘除时长与恢复来源可直接审计（提前恢复/竞态均可见）
+      if (wasRateLimited) {
+        const actualRecoveryAt = new Date()
+        let actualSuppressionSeconds = null
+        if (suppressionStartedAt) {
+          const startedAt = new Date(suppressionStartedAt)
+          if (!Number.isNaN(startedAt.getTime())) {
+            actualSuppressionSeconds = Math.max(
+              0,
+              Math.round((actualRecoveryAt - startedAt) / 1000)
+            )
+          }
+        }
+        recordUpstreamTelemetry('account_recovered', {
+          gatewayRequestId: options.gatewayRequestId ?? null,
+          accountId,
+          accountType: 'claude-official',
+          recoverySource: options.recoverySource ?? 'manual',
+          expectedRecoveryAt,
+          actualRecoveryAt: actualRecoveryAt.toISOString(),
+          actualSuppressionSeconds,
+          suppressionId: rateLimitStateId ?? suppressionStartedAt ?? null
+        })
+      }
 
       return { success: true }
     } catch (error) {
@@ -1600,7 +1652,7 @@ class ClaudeAccountService {
 
           // 如果当前时间超过限流结束时间，自动解除
           if (now >= rateLimitEndAt) {
-            await this.removeAccountRateLimit(accountId)
+            await this.removeAccountRateLimit(accountId, { recoverySource: 'upstream_reset_time' })
             return false
           }
 
@@ -1612,7 +1664,7 @@ class ClaudeAccountService {
 
           // 如果限流超过1小时，自动解除
           if (hoursSinceRateLimit >= 1) {
-            await this.removeAccountRateLimit(accountId)
+            await this.removeAccountRateLimit(accountId, { recoverySource: 'timer_expired' })
             return false
           }
 

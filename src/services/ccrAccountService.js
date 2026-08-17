@@ -5,6 +5,7 @@ const redis = require('../models/redis')
 const logger = require('../utils/logger')
 const config = require('../../config/config')
 const LRUCache = require('../utils/lruCache')
+const { recordUpstreamTelemetry } = require('../utils/llmTelemetry')
 
 class CcrAccountService {
   constructor() {
@@ -347,7 +348,7 @@ class CcrAccountService {
   }
 
   // 🚫 标记账户为限流状态
-  async markAccountRateLimited(accountId) {
+  async markAccountRateLimited(accountId, context = {}) {
     try {
       const client = redis.getClientSafe()
       const account = await this.getAccount(accountId)
@@ -364,15 +365,24 @@ class CcrAccountService {
       }
 
       const now = new Date().toISOString()
-      await client.hmset(`${this.ACCOUNT_KEY_PREFIX}${accountId}`, {
+      const fields = {
         status: 'rate_limited',
         rateLimitedAt: now,
         rateLimitStatus: 'active',
         errorMessage: 'Rate limited by upstream service'
-      })
+      }
+      if (context.suppressionId) {
+        fields.rateLimitStateId = context.suppressionId
+      }
+      await client.hmset(`${this.ACCOUNT_KEY_PREFIX}${accountId}`, fields)
 
       logger.warn(`⏱️ Marked CCR account as rate limited: ${account.name} (${accountId})`)
-      return { success: true, rateLimitedAt: now }
+      const durationMinutes = parseInt(account.rateLimitDuration) || 60
+      return {
+        success: true,
+        rateLimitedAt: now,
+        expectedRecoveryAt: new Date(Date.now() + durationMinutes * 60 * 1000).toISOString()
+      }
     } catch (error) {
       logger.error(`❌ Failed to mark CCR account as rate limited: ${accountId}`, error)
       throw error
@@ -380,16 +390,24 @@ class CcrAccountService {
   }
 
   // ✅ 移除账户限流状态
-  async removeAccountRateLimit(accountId) {
+  // options.recoverySource：timer_expired / upstream_reset_time / successful_inflight_response / manual
+  async removeAccountRateLimit(accountId, options = {}) {
     try {
       const client = redis.getClientSafe()
       const accountKey = `${this.ACCOUNT_KEY_PREFIX}${accountId}`
 
-      // 获取账户当前状态和额度信息
-      const [, quotaStoppedAt] = await client.hmget(accountKey, 'status', 'quotaStoppedAt')
+      // 获取账户当前状态和额度信息（恢复事件需要摘除开始时刻与 suppression_id）
+      const [, quotaStoppedAt, rateLimitedAt, rateLimitStateId] = await client.hmget(
+        accountKey,
+        'status',
+        'quotaStoppedAt',
+        'rateLimitedAt',
+        'rateLimitStateId'
+      )
+      const wasRateLimited = Boolean(rateLimitedAt)
 
       // 删除限流相关字段
-      await client.hdel(accountKey, 'rateLimitedAt', 'rateLimitStatus')
+      await client.hdel(accountKey, 'rateLimitedAt', 'rateLimitStatus', 'rateLimitStateId')
 
       // 根据不同情况决定是否恢复账户
       let newStatus = 'active'
@@ -410,6 +428,30 @@ class CcrAccountService {
         status: newStatus,
         errorMessage
       })
+
+      if (wasRateLimited) {
+        const actualRecoveryAt = new Date()
+        let actualSuppressionSeconds = null
+        if (rateLimitedAt) {
+          const startedAt = new Date(rateLimitedAt)
+          if (!Number.isNaN(startedAt.getTime())) {
+            actualSuppressionSeconds = Math.max(
+              0,
+              Math.round((actualRecoveryAt - startedAt) / 1000)
+            )
+          }
+        }
+        recordUpstreamTelemetry('account_recovered', {
+          gatewayRequestId: options.gatewayRequestId ?? null,
+          accountId,
+          accountType: 'ccr',
+          recoverySource: options.recoverySource ?? 'manual',
+          expectedRecoveryAt: null,
+          actualRecoveryAt: actualRecoveryAt.toISOString(),
+          actualSuppressionSeconds,
+          suppressionId: rateLimitStateId ?? rateLimitedAt ?? null
+        })
+      }
 
       return { success: true, newStatus }
     } catch (error) {
@@ -439,7 +481,7 @@ class CcrAccountService {
           return true
         } else {
           // 限流时间已过，自动移除限流状态
-          await this.removeAccountRateLimit(accountId)
+          await this.removeAccountRateLimit(accountId, { recoverySource: 'timer_expired' })
           return false
         }
       }
