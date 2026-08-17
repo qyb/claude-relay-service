@@ -11,6 +11,7 @@ const redis = require('../../models/redis')
 const { authenticateAdmin } = require('../../middleware/auth')
 const logger = require('../../utils/logger')
 const CostCalculator = require('../../utils/costCalculator')
+const { getStoredOrCalculatedCost } = require('../../services/billingCostService')
 const config = require('../../../config/config')
 
 const router = express.Router()
@@ -602,7 +603,11 @@ router.get('/model-stats', authenticateAdmin, async (req, res) => {
           outputTokens: 0,
           cacheCreateTokens: 0,
           cacheReadTokens: 0,
-          allTokens: 0
+          allTokens: 0,
+          costUsd: 0,
+          pricingResolvedRequests: 0,
+          pricingUnavailableRequests: 0,
+          hasStoredCost: false
         }
 
         stats.requests += parseInt(data.requests) || 0
@@ -611,6 +616,13 @@ router.get('/model-stats', authenticateAdmin, async (req, res) => {
         stats.cacheCreateTokens += parseInt(data.cacheCreateTokens) || 0
         stats.cacheReadTokens += parseInt(data.cacheReadTokens) || 0
         stats.allTokens += parseInt(data.allTokens) || 0
+        const storedCost = Number.parseFloat(data.costUsd)
+        if (Number.isFinite(storedCost)) {
+          stats.costUsd += storedCost
+          stats.hasStoredCost = true
+        }
+        stats.pricingResolvedRequests += parseInt(data.pricingResolvedRequests) || 0
+        stats.pricingUnavailableRequests += parseInt(data.pricingUnavailableRequests) || 0
 
         modelStatsMap.set(normalizedModel, stats)
       }
@@ -627,8 +639,17 @@ router.get('/model-stats', authenticateAdmin, async (req, res) => {
         cache_read_input_tokens: stats.cacheReadTokens
       }
 
-      // 计算费用
-      const costData = CostCalculator.calculateCost(usage, model)
+      const costData = getStoredOrCalculatedCost({
+        usage,
+        model,
+        stored: stats.hasStoredCost
+          ? {
+              costUsd: stats.costUsd,
+              pricingResolvedRequests: stats.pricingResolvedRequests,
+              pricingUnavailableRequests: stats.pricingUnavailableRequests
+            }
+          : null
+      })
 
       modelStats.push({
         model,
@@ -651,9 +672,13 @@ router.get('/model-stats', authenticateAdmin, async (req, res) => {
             usage.cache_creation_input_tokens +
             usage.cache_read_input_tokens
         },
-        costs: costData.costs,
-        formatted: costData.formatted,
-        pricing: costData.pricing
+        costs: costData.costData?.costs || { total: costData.totalCost },
+        formatted: costData.costData?.formatted || {
+          total: CostCalculator.formatCost(costData.totalCost)
+        },
+        pricing: costData.costData?.pricing || null,
+        costStatus: costData.status,
+        costAvailable: costData.available
       })
     }
 

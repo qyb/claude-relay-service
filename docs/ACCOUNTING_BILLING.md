@@ -263,6 +263,13 @@ cost_usd = cost_native × exchange_rates[pricing.currency].to_reporting
 3. **已完成 P1**：实现阶梯条件归一化、边界匹配和配置区间校验；`ensureCachePricing` 仅对 Anthropic provider 生效。
 4. **已完成 P1**：`cost` 回填、缺价计数及管理端 `/pricing/missing-counts` 诊断接口上线。
 5. **已完成 P2**：价格表来源、核对日期、汇率、热加载策略和单测锁值已落地；后续价格变更继续按“改表 → 单测 → 版本号递增”执行。
+6. **待办 P2**：限流与记录的定价上下文透传还剩 4 个调用方未覆盖。`updateRateLimitCounters`（`rateLimitHelper.js`，签名已支持 `pricingContext`）共 6 个调用方，本轮已修 `api.js` 与 `openaiClaudeRoutes.js`；剩余调用仍不传上下文，对 `glm-*` 区域模型费用限流计数恒为 $0（token 限流不受影响）：
+   - `src/routes/openaiRoutes.js` 的 `applyRateLimitTracking`（stream 与 non-stream 两处）。注意该路由的 `apiKeyService.recordUsage(...)` 调用同样未传 `options.apiUrl`，费用记录链路一并缺区域，应同步修复。
+   - `src/services/droidRelayService.js`
+   - `src/services/anthropicGeminiBridgeService.js`
+   - `src/handlers/geminiHandlers.js`
+
+   风险评估（2026-08-17）：生产 glm 流量当前 100% 走 `open.bigmodel.cn/api/anthropic`（Anthropic 兼容端点，经 claude/console/ccr relay，均已透传上下文），因此这是潜在缺口而非现行出血点；但一旦配置智谱 OpenAI 兼容账号（如 `open.bigmodel.cn/api/paas/v4`）经 openaiRoutes 转发，费用限流立即失效。修复模式与 `api.js` 一致：从调度器/账号对象取 `account.apiUrl` 构造 `{ apiUrl, region }` 传入。验收：构造 glm 模型请求走上述路径，确认 `costCountKey` 非零递增、recordUsage 落 `costUsd > 0` 且 `pricingResolvedRequests` 递增。
 
 ## 四、验证方案
 

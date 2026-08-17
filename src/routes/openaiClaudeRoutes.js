@@ -30,7 +30,10 @@ function queueRateLimitUpdate(rateLimitInfo, usageSummary, model, context = '') 
 
   const label = context ? ` (${context})` : ''
 
-  updateRateLimitCounters(rateLimitInfo, usageSummary, model)
+  updateRateLimitCounters(rateLimitInfo, usageSummary, model, {
+    apiUrl: usageSummary.apiUrl || usageSummary.api_url,
+    region: usageSummary.region
+  })
     .then(({ totalTokens, totalCost }) => {
       if (totalTokens > 0) {
         logger.api(`📊 Updated rate limit token count${label}: +${totalTokens} tokens`)
@@ -297,7 +300,7 @@ async function handleChatCompletion(req, res, apiKeyData) {
           apiKeyService
             .recordUsageWithDetails(
               apiKeyData.id,
-              usage, // 直接传递整个 usage 对象，包含可能的 cache_creation 详细数据
+              { ...usage, api_url: usage.api_url || usage.apiUrl || null },
               model,
               accountId,
               accountType
@@ -312,7 +315,8 @@ async function handleChatCompletion(req, res, apiKeyData) {
               inputTokens: usage.input_tokens || 0,
               outputTokens: usage.output_tokens || 0,
               cacheCreateTokens,
-              cacheReadTokens
+              cacheReadTokens,
+              apiUrl: usage.api_url || usage.apiUrl || null
             },
             model,
             `openai-${accountType}-stream`
@@ -430,7 +434,7 @@ async function handleChatCompletion(req, res, apiKeyData) {
         apiKeyService
           .recordUsageWithDetails(
             apiKeyData.id,
-            usage, // 直接传递整个 usage 对象，包含可能的 cache_creation 详细数据
+            { ...usage, api_url: usage.api_url || usage.apiUrl || null },
             claudeRequest.model,
             accountId,
             accountType
@@ -445,7 +449,8 @@ async function handleChatCompletion(req, res, apiKeyData) {
             inputTokens: usage.input_tokens || 0,
             outputTokens: usage.output_tokens || 0,
             cacheCreateTokens,
-            cacheReadTokens
+            cacheReadTokens,
+            apiUrl: usage.api_url || usage.apiUrl || null
           },
           claudeRequest.model,
           `openai-${accountType}-non-stream`

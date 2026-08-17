@@ -1183,7 +1183,12 @@ class ClaudeConsoleRelayService {
                     JSON.stringify(collectedUsageData)
                   )
                   if (usageCallback && typeof usageCallback === 'function') {
-                    usageCallback({ ...collectedUsageData, accountId, apiUrl: account.apiUrl })
+                    usageCallback({
+                      ...collectedUsageData,
+                      accountId,
+                      apiUrl: account.apiUrl,
+                      api_url: account.apiUrl
+                    })
                   }
                   finalUsageReported = true
                 }
@@ -1219,7 +1224,12 @@ class ClaudeConsoleRelayService {
                     `📊 [Console] Saving incomplete usage data via fallback: ${JSON.stringify(collectedUsageData)}`
                   )
                   if (usageCallback && typeof usageCallback === 'function') {
-                    usageCallback({ ...collectedUsageData, accountId, apiUrl: account.apiUrl })
+                    usageCallback({
+                      ...collectedUsageData,
+                      accountId,
+                      apiUrl: account.apiUrl,
+                      api_url: account.apiUrl
+                    })
                   }
                   finalUsageReported = true
                 } else {

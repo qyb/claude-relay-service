@@ -1802,7 +1802,12 @@ class ClaudeRelayService {
         (usageData) => {
           // 在usageCallback中添加accountId
           if (usageCallback && typeof usageCallback === 'function') {
-            usageCallback({ ...usageData, accountId })
+            usageCallback({
+              ...usageData,
+              accountId,
+              apiUrl: account?.apiUrl || null,
+              api_url: account?.apiUrl || null
+            })
           }
         },
         accountId,
@@ -2477,7 +2482,12 @@ class ClaudeRelayService {
 
               // 调用一次usageCallback记录合并后的数据
               if (usageCallback && typeof usageCallback === 'function') {
-                usageCallback(finalUsage)
+                usageCallback({
+                  ...finalUsage,
+                  accountId,
+                  apiUrl: account?.apiUrl || null,
+                  api_url: account?.apiUrl || null
+                })
               }
             }
 

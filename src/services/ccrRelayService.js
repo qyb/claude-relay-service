@@ -786,7 +786,8 @@ class CcrRelayService {
                   ...collectedUsage,
                   accountId,
                   model: body.model,
-                  apiUrl: account.apiUrl
+                  apiUrl: account.apiUrl,
+                  api_url: account.apiUrl
                 })
               } catch (err) {
                 logger.error('❌ Error in usage callback:', err)

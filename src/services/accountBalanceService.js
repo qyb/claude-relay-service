@@ -1,7 +1,7 @@
 const redis = require('../models/redis')
 const balanceScriptService = require('./balanceScriptService')
 const logger = require('../utils/logger')
-const CostCalculator = require('../utils/costCalculator')
+const { getStoredOrCalculatedCost } = require('./billingCostService')
 const { isBalanceScriptEnabled } = require('../utils/featureFlags')
 
 class AccountBalanceService {
@@ -616,13 +616,12 @@ class AccountBalanceService {
             cache_read_input_tokens: parseInt(data.cacheReadTokens || 0)
           }
 
-          const storedCost = Number.parseFloat(data.costUsd)
-          if (Number.isFinite(storedCost)) {
-            totalCost += storedCost
-          } else {
-            const costResult = CostCalculator.calculateCost(usage, model)
-            totalCost += costResult.costs.total || 0
-          }
+          const costResult = getStoredOrCalculatedCost({
+            usage,
+            model,
+            stored: data
+          })
+          totalCost += costResult.totalCost || 0
         }
 
         if (iterations >= maxIterations) {

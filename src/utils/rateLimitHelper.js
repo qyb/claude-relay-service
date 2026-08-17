@@ -7,7 +7,7 @@ function toNumber(value) {
   return Number.isFinite(num) ? num : 0
 }
 
-async function updateRateLimitCounters(rateLimitInfo, usageSummary, model) {
+async function updateRateLimitCounters(rateLimitInfo, usageSummary, model, pricingContext = {}) {
   if (!rateLimitInfo) {
     return { totalTokens: 0, totalCost: 0 }
   }
@@ -37,7 +37,7 @@ async function updateRateLimitCounters(rateLimitInfo, usageSummary, model) {
   }
 
   try {
-    const costInfo = pricingService.calculateCost(usagePayload, model)
+    const costInfo = pricingService.calculateCost(usagePayload, model, pricingContext)
     const { totalCost: calculatedCost } = costInfo || {}
     if (typeof calculatedCost === 'number') {
       totalCost = calculatedCost
@@ -49,7 +49,7 @@ async function updateRateLimitCounters(rateLimitInfo, usageSummary, model) {
 
   if (totalCost === 0) {
     try {
-      const fallback = CostCalculator.calculateCost(usagePayload, model)
+      const fallback = CostCalculator.calculateCost(usagePayload, model, pricingContext)
       const { costs } = fallback || {}
       if (costs && typeof costs.total === 'number') {
         totalCost = costs.total

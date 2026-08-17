@@ -1,6 +1,6 @@
 const redis = require('../models/redis')
 const apiKeyService = require('./apiKeyService')
-const CostCalculator = require('../utils/costCalculator')
+const { getStoredOrCalculatedCost } = require('./billingCostService')
 const logger = require('../utils/logger')
 
 class CostInitService {
@@ -53,6 +53,11 @@ class CostInitService {
     const dailyCosts = new Map() // date -> cost
     const monthlyCosts = new Map() // month -> cost
     const hourlyCosts = new Map() // hour -> cost
+    const unavailablePeriods = {
+      daily: new Set(),
+      monthly: new Set(),
+      hourly: new Set()
+    }
 
     for (const key of modelKeys) {
       // 解析key格式: usage:{keyId}:model:{period}:{model}:{date}
@@ -81,8 +86,21 @@ class CostInitService {
           parseInt(data.totalCacheReadTokens) || parseInt(data.cacheReadTokens) || 0
       }
 
-      const costResult = CostCalculator.calculateCost(usage, model)
-      const cost = costResult.costs.total
+      const costResult = getStoredOrCalculatedCost({
+        usage,
+        model,
+        stored: data
+      })
+
+      if (!costResult.available) {
+        unavailablePeriods[period]?.add(dateStr)
+        logger.warn(
+          `💰 Skipping ${period} cost initialization for ${apiKeyId}/${model}/${dateStr}: pricing unavailable`
+        )
+        continue
+      }
+
+      const cost = costResult.totalCost
 
       // 根据period分组累加费用
       if (period === 'daily') {
@@ -102,6 +120,9 @@ class CostInitService {
 
     // 写入每日费用
     for (const [date, cost] of dailyCosts) {
+      if (unavailablePeriods.daily.has(date)) {
+        continue
+      }
       const key = `usage:cost:daily:${apiKeyId}:${date}`
       promises.push(
         client.set(key, cost.toString()),
@@ -111,6 +132,9 @@ class CostInitService {
 
     // 写入每月费用
     for (const [month, cost] of monthlyCosts) {
+      if (unavailablePeriods.monthly.has(month)) {
+        continue
+      }
       const key = `usage:cost:monthly:${apiKeyId}:${month}`
       promises.push(
         client.set(key, cost.toString()),
@@ -120,6 +144,9 @@ class CostInitService {
 
     // 写入每小时费用
     for (const [hour, cost] of hourlyCosts) {
+      if (unavailablePeriods.hourly.has(hour)) {
+        continue
+      }
       const key = `usage:cost:hourly:${apiKeyId}:${hour}`
       promises.push(
         client.set(key, cost.toString()),
@@ -134,7 +161,8 @@ class CostInitService {
     }
 
     // 写入总费用 - 修复：只在总费用不存在时初始化，避免覆盖现有累计值
-    if (totalCost > 0) {
+    const hasUnavailableCost = Object.values(unavailablePeriods).some((periods) => periods.size > 0)
+    if (totalCost > 0 && !hasUnavailableCost) {
       const totalKey = `usage:cost:total:${apiKeyId}`
       // 先检查总费用是否已存在
       const existingTotal = await client.get(totalKey)

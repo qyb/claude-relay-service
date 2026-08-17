@@ -35,7 +35,10 @@ function queueRateLimitUpdate(rateLimitInfo, usageSummary, model, context = '') 
 
   const label = context ? ` (${context})` : ''
 
-  return updateRateLimitCounters(rateLimitInfo, usageSummary, model)
+  return updateRateLimitCounters(rateLimitInfo, usageSummary, model, {
+    apiUrl: usageSummary.apiUrl,
+    region: usageSummary.region
+  })
     .then(({ totalTokens, totalCost }) => {
       if (totalTokens > 0) {
         logger.api(`📊 Updated rate limit token count${label}: +${totalTokens} tokens`)
@@ -533,7 +536,8 @@ async function handleMessagesRequest(req, res) {
                   inputTokens,
                   outputTokens,
                   cacheCreateTokens,
-                  cacheReadTokens
+                  cacheReadTokens,
+                  apiUrl: usageData.apiUrl || null
                 },
                 model,
                 'claude-stream'
@@ -647,7 +651,8 @@ async function handleMessagesRequest(req, res) {
                   inputTokens,
                   outputTokens,
                   cacheCreateTokens,
-                  cacheReadTokens
+                  cacheReadTokens,
+                  apiUrl: usageData.apiUrl || null
                 },
                 model,
                 'claude-console-stream'
@@ -822,7 +827,8 @@ async function handleMessagesRequest(req, res) {
                   inputTokens,
                   outputTokens,
                   cacheCreateTokens,
-                  cacheReadTokens
+                  cacheReadTokens,
+                  apiUrl: usageData.apiUrl || null
                 },
                 model,
                 'ccr-stream'

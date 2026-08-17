@@ -15,7 +15,7 @@ const redis = require('../../models/redis')
 const { authenticateAdmin } = require('../../middleware/auth')
 const logger = require('../../utils/logger')
 const oauthHelper = require('../../utils/oauthHelper')
-const CostCalculator = require('../../utils/costCalculator')
+const { getStoredOrCalculatedCost } = require('../../services/billingCostService')
 const webhookNotifier = require('../../utils/webhookNotifier')
 const { formatAccountExpiry, mapExpiryField } = require('./utils')
 
@@ -418,14 +418,20 @@ router.get('/claude-accounts', authenticateAdmin, async (req, res) => {
               }
 
               logger.debug(`💰 Calculating cost for model ${modelName}:`, JSON.stringify(usageData))
-              const costResult = CostCalculator.calculateCost(usageData, modelName)
-              logger.debug(`💰 Cost result for ${modelName}: total=${costResult.costs.total}`)
+              const costResult = getStoredOrCalculatedCost({
+                usage: usageData,
+                model: modelName,
+                stored: usage
+              })
+              logger.debug(`💰 Cost result for ${modelName}: total=${costResult.totalCost}`)
 
               modelCosts[modelName] = {
                 ...usage,
-                cost: costResult.costs.total
+                cost: costResult.totalCost,
+                costStatus: costResult.status,
+                costAvailable: costResult.available
               }
-              totalCost += costResult.costs.total
+              totalCost += costResult.totalCost
             }
 
             sessionWindowUsage = {

@@ -3,6 +3,7 @@ const { v4: uuidv4 } = require('uuid')
 const config = require('../../config/config')
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
+const { pricingStatusFromResult } = require('./billingCostService')
 
 const ACCOUNT_TYPE_CONFIG = {
   claude: { prefix: 'claude:account:' },
@@ -1023,7 +1024,8 @@ class ApiKeyService {
         0, // ephemeral5mTokens - 暂时为0，后续处理
         0, // ephemeral1hTokens - 暂时为0，后续处理
         isLongContextRequest,
-        costInfo.costs.total
+        costInfo.costs.total,
+        pricingStatusFromResult(costInfo, totalTokens) === 'resolved'
       )
 
       // 记录费用统计
@@ -1054,7 +1056,8 @@ class ApiKeyService {
             cacheReadTokens,
             model,
             isLongContextRequest,
-            costInfo.costs.total
+            costInfo.costs.total,
+            pricingStatusFromResult(costInfo, totalTokens) === 'resolved'
           )
           logger.database(
             `📊 Recorded account usage: ${accountId} - ${totalTokens} tokens (API Key: ${keyId})`
@@ -1075,6 +1078,7 @@ class ApiKeyService {
         apiUrl: options.apiUrl || null,
         pricingRegion: costInfo.region || null,
         pricingModel: costInfo.pricing_model || null,
+        hasPricing: costInfo.hasPricing === true,
         provisionalPricing: costInfo.provisionalPricing === true,
         inputTokens,
         outputTokens,
@@ -1174,7 +1178,12 @@ class ApiKeyService {
             costInfo = {
               totalCost: fallbackCost.costs.total,
               ephemeral5mCost: 0,
-              ephemeral1hCost: 0
+              ephemeral1hCost: 0,
+              hasPricing: fallbackCost.hasPricing === true,
+              region: fallbackCost.region || null,
+              pricing_model: fallbackCost.pricing_model || null,
+              provisionalPricing: fallbackCost.provisionalPricing === true,
+              isLongContextRequest: fallbackCost.isLongContextRequest || false
             }
           } else {
             costInfo = { totalCost: 0, ephemeral5mCost: 0, ephemeral1hCost: 0 }
@@ -1196,7 +1205,12 @@ class ApiKeyService {
             costInfo = {
               totalCost: fallbackCost.costs.total,
               ephemeral5mCost: 0,
-              ephemeral1hCost: 0
+              ephemeral1hCost: 0,
+              hasPricing: fallbackCost.hasPricing === true,
+              region: fallbackCost.region || null,
+              pricing_model: fallbackCost.pricing_model || null,
+              provisionalPricing: fallbackCost.provisionalPricing === true,
+              isLongContextRequest: fallbackCost.isLongContextRequest || false
             }
           }
         } catch (fallbackError) {
@@ -1225,7 +1239,8 @@ class ApiKeyService {
         ephemeral5mTokens, // 传递5分钟缓存 tokens
         ephemeral1hTokens, // 传递1小时缓存 tokens
         costInfo.isLongContextRequest || false, // 传递 1M 上下文请求标记
-        costInfo.totalCost
+        costInfo.totalCost,
+        pricingStatusFromResult(costInfo, totalTokens) === 'resolved'
       )
 
       // 记录费用统计
@@ -1276,7 +1291,8 @@ class ApiKeyService {
             cacheReadTokens,
             model,
             costInfo.isLongContextRequest || false,
-            costInfo.totalCost
+            costInfo.totalCost,
+            pricingStatusFromResult(costInfo, totalTokens) === 'resolved'
           )
           logger.database(
             `📊 Recorded account usage: ${accountId} - ${totalTokens} tokens (API Key: ${keyId})`
@@ -1296,6 +1312,7 @@ class ApiKeyService {
         apiUrl: usageObject.api_url || null,
         pricingRegion: costInfo.region || null,
         pricingModel: costInfo.pricing_model || null,
+        hasPricing: costInfo.hasPricing === true,
         provisionalPricing: costInfo.provisionalPricing === true,
         inputTokens,
         outputTokens,

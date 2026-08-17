@@ -50,6 +50,10 @@ function getWeekStringInTimezone(date = new Date()) {
   return `${year}-W${String(weekNumber).padStart(2, '0')}`
 }
 
+function getPricingStatusField(pricingResolved) {
+  return pricingResolved ? 'pricingResolvedRequests' : 'pricingUnavailableRequests'
+}
+
 // 并发队列相关常量
 const QUEUE_STATS_TTL_SECONDS = 86400 * 7 // 统计计数保留 7 天
 const WAIT_TIME_TTL_SECONDS = 86400 // 等待时间样本保留 1 天（滚动窗口，无需长期保留）
@@ -483,7 +487,8 @@ class RedisClient {
     ephemeral5mTokens = 0, // 新增：5分钟缓存 tokens
     ephemeral1hTokens = 0, // 新增：1小时缓存 tokens
     isLongContextRequest = false, // 新增：是否为 1M 上下文请求（超过200k）
-    costUsd = 0
+    costUsd = 0,
+    pricingResolved = false
   ) {
     const key = `usage:${keyId}`
     const now = new Date()
@@ -551,6 +556,7 @@ class RedisClient {
     }
     // 请求计数
     pipeline.hincrby(key, 'totalRequests', 1)
+    pipeline.hincrby(key, getPricingStatusField(pricingResolved), 1)
 
     // 每日统计
     pipeline.hincrby(daily, 'tokens', coreTokens)
@@ -560,6 +566,7 @@ class RedisClient {
     pipeline.hincrby(daily, 'cacheReadTokens', finalCacheReadTokens)
     pipeline.hincrby(daily, 'allTokens', totalTokens)
     pipeline.hincrby(daily, 'requests', 1)
+    pipeline.hincrby(daily, getPricingStatusField(pricingResolved), 1)
     // 详细缓存类型统计
     pipeline.hincrby(daily, 'ephemeral5mTokens', ephemeral5mTokens)
     pipeline.hincrby(daily, 'ephemeral1hTokens', ephemeral1hTokens)
@@ -578,6 +585,7 @@ class RedisClient {
     pipeline.hincrby(monthly, 'cacheReadTokens', finalCacheReadTokens)
     pipeline.hincrby(monthly, 'allTokens', totalTokens)
     pipeline.hincrby(monthly, 'requests', 1)
+    pipeline.hincrby(monthly, getPricingStatusField(pricingResolved), 1)
     // 详细缓存类型统计
     pipeline.hincrby(monthly, 'ephemeral5mTokens', ephemeral5mTokens)
     pipeline.hincrby(monthly, 'ephemeral1hTokens', ephemeral1hTokens)
@@ -590,6 +598,7 @@ class RedisClient {
     pipeline.hincrby(modelDaily, 'allTokens', totalTokens)
     pipeline.hincrby(modelDaily, 'requests', 1)
     pipeline.hincrbyfloat(modelDaily, 'costUsd', Number(costUsd) || 0)
+    pipeline.hincrby(modelDaily, getPricingStatusField(pricingResolved), 1)
 
     // 按模型统计 - 每月
     pipeline.hincrby(modelMonthly, 'inputTokens', finalInputTokens)
@@ -599,6 +608,7 @@ class RedisClient {
     pipeline.hincrby(modelMonthly, 'allTokens', totalTokens)
     pipeline.hincrby(modelMonthly, 'requests', 1)
     pipeline.hincrbyfloat(modelMonthly, 'costUsd', Number(costUsd) || 0)
+    pipeline.hincrby(modelMonthly, getPricingStatusField(pricingResolved), 1)
 
     // API Key级别的模型统计 - 每日
     pipeline.hincrby(keyModelDaily, 'inputTokens', finalInputTokens)
@@ -608,6 +618,7 @@ class RedisClient {
     pipeline.hincrby(keyModelDaily, 'allTokens', totalTokens)
     pipeline.hincrby(keyModelDaily, 'requests', 1)
     pipeline.hincrbyfloat(keyModelDaily, 'costUsd', Number(costUsd) || 0)
+    pipeline.hincrby(keyModelDaily, getPricingStatusField(pricingResolved), 1)
     // 详细缓存类型统计
     pipeline.hincrby(keyModelDaily, 'ephemeral5mTokens', ephemeral5mTokens)
     pipeline.hincrby(keyModelDaily, 'ephemeral1hTokens', ephemeral1hTokens)
@@ -620,6 +631,7 @@ class RedisClient {
     pipeline.hincrby(keyModelMonthly, 'allTokens', totalTokens)
     pipeline.hincrby(keyModelMonthly, 'requests', 1)
     pipeline.hincrbyfloat(keyModelMonthly, 'costUsd', Number(costUsd) || 0)
+    pipeline.hincrby(keyModelMonthly, getPricingStatusField(pricingResolved), 1)
     // 详细缓存类型统计
     pipeline.hincrby(keyModelMonthly, 'ephemeral5mTokens', ephemeral5mTokens)
     pipeline.hincrby(keyModelMonthly, 'ephemeral1hTokens', ephemeral1hTokens)
@@ -632,6 +644,7 @@ class RedisClient {
     pipeline.hincrby(hourly, 'cacheReadTokens', finalCacheReadTokens)
     pipeline.hincrby(hourly, 'allTokens', totalTokens)
     pipeline.hincrby(hourly, 'requests', 1)
+    pipeline.hincrby(hourly, getPricingStatusField(pricingResolved), 1)
 
     // 按模型统计 - 每小时
     pipeline.hincrby(modelHourly, 'inputTokens', finalInputTokens)
@@ -641,6 +654,7 @@ class RedisClient {
     pipeline.hincrby(modelHourly, 'allTokens', totalTokens)
     pipeline.hincrby(modelHourly, 'requests', 1)
     pipeline.hincrbyfloat(modelHourly, 'costUsd', Number(costUsd) || 0)
+    pipeline.hincrby(modelHourly, getPricingStatusField(pricingResolved), 1)
 
     // API Key级别的模型统计 - 每小时
     pipeline.hincrby(keyModelHourly, 'inputTokens', finalInputTokens)
@@ -650,6 +664,7 @@ class RedisClient {
     pipeline.hincrby(keyModelHourly, 'allTokens', totalTokens)
     pipeline.hincrby(keyModelHourly, 'requests', 1)
     pipeline.hincrbyfloat(keyModelHourly, 'costUsd', Number(costUsd) || 0)
+    pipeline.hincrby(keyModelHourly, getPricingStatusField(pricingResolved), 1)
 
     // 新增：系统级分钟统计
     pipeline.hincrby(systemMinuteKey, 'requests', 1)
@@ -689,7 +704,8 @@ class RedisClient {
     cacheReadTokens = 0,
     model = 'unknown',
     isLongContextRequest = false,
-    costUsd = 0
+    costUsd = 0,
+    pricingResolved = false
   ) {
     const now = new Date()
     const today = getDateStringInTimezone(now)
@@ -734,6 +750,7 @@ class RedisClient {
       this.client.hincrby(accountKey, 'totalAllTokens', actualTotalTokens),
       this.client.hincrby(accountKey, 'totalRequests', 1),
       this.client.hincrbyfloat(accountKey, 'costUsd', Number(costUsd) || 0),
+      this.client.hincrby(accountKey, getPricingStatusField(pricingResolved), 1),
 
       // 账户每日统计
       this.client.hincrby(accountDaily, 'tokens', coreTokens),
@@ -744,6 +761,7 @@ class RedisClient {
       this.client.hincrby(accountDaily, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountDaily, 'requests', 1),
       this.client.hincrbyfloat(accountDaily, 'costUsd', Number(costUsd) || 0),
+      this.client.hincrby(accountDaily, getPricingStatusField(pricingResolved), 1),
 
       // 账户每月统计
       this.client.hincrby(accountMonthly, 'tokens', coreTokens),
@@ -754,6 +772,7 @@ class RedisClient {
       this.client.hincrby(accountMonthly, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountMonthly, 'requests', 1),
       this.client.hincrbyfloat(accountMonthly, 'costUsd', Number(costUsd) || 0),
+      this.client.hincrby(accountMonthly, getPricingStatusField(pricingResolved), 1),
 
       // 账户每小时统计
       this.client.hincrby(accountHourly, 'tokens', coreTokens),
@@ -764,6 +783,7 @@ class RedisClient {
       this.client.hincrby(accountHourly, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountHourly, 'requests', 1),
       this.client.hincrbyfloat(accountHourly, 'costUsd', Number(costUsd) || 0),
+      this.client.hincrby(accountHourly, getPricingStatusField(pricingResolved), 1),
 
       // 添加模型级别的数据到hourly键中，以支持会话窗口的统计
       this.client.hincrby(accountHourly, `model:${normalizedModel}:inputTokens`, finalInputTokens),
@@ -789,6 +809,11 @@ class RedisClient {
         `model:${normalizedModel}:costUsd`,
         Number(costUsd) || 0
       ),
+      this.client.hincrby(
+        accountHourly,
+        `model:${normalizedModel}:${getPricingStatusField(pricingResolved)}`,
+        1
+      ),
 
       // 账户按模型统计 - 每日
       this.client.hincrby(accountModelDaily, 'inputTokens', finalInputTokens),
@@ -798,6 +823,7 @@ class RedisClient {
       this.client.hincrby(accountModelDaily, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountModelDaily, 'requests', 1),
       this.client.hincrbyfloat(accountModelDaily, 'costUsd', Number(costUsd) || 0),
+      this.client.hincrby(accountModelDaily, getPricingStatusField(pricingResolved), 1),
 
       // 账户按模型统计 - 每月
       this.client.hincrby(accountModelMonthly, 'inputTokens', finalInputTokens),
@@ -807,6 +833,7 @@ class RedisClient {
       this.client.hincrby(accountModelMonthly, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountModelMonthly, 'requests', 1),
       this.client.hincrbyfloat(accountModelMonthly, 'costUsd', Number(costUsd) || 0),
+      this.client.hincrby(accountModelMonthly, getPricingStatusField(pricingResolved), 1),
 
       // 账户按模型统计 - 每小时
       this.client.hincrby(accountModelHourly, 'inputTokens', finalInputTokens),
@@ -816,6 +843,7 @@ class RedisClient {
       this.client.hincrby(accountModelHourly, 'allTokens', actualTotalTokens),
       this.client.hincrby(accountModelHourly, 'requests', 1),
       this.client.hincrbyfloat(accountModelHourly, 'costUsd', Number(costUsd) || 0),
+      this.client.hincrby(accountModelHourly, getPricingStatusField(pricingResolved), 1),
 
       // 设置过期时间
       this.client.expire(accountDaily, 86400 * 32), // 32天过期
@@ -940,6 +968,8 @@ class RedisClient {
       const allTokens = parseInt(data.totalAllTokens) || parseInt(data.allTokens) || 0
       const costUsd = parseFloat(data.costUsd)
       const hasCostUsd = Number.isFinite(costUsd)
+      const pricingResolvedRequests = parseInt(data.pricingResolvedRequests) || 0
+      const pricingUnavailableRequests = parseInt(data.pricingUnavailableRequests) || 0
 
       const totalFromSeparate = inputTokens + outputTokens
       // 计算实际的总tokens（包含所有类型）
@@ -957,7 +987,9 @@ class RedisClient {
           allTokens: tokens, // 对于旧数据，allTokens等于tokens
           requests,
           costUsd: hasCostUsd ? costUsd : 0,
-          hasCostUsd
+          hasCostUsd,
+          pricingResolvedRequests,
+          pricingUnavailableRequests
         }
       } else {
         // 新数据或无数据 - 统一使用allTokens作为tokens的值
@@ -970,7 +1002,9 @@ class RedisClient {
           allTokens: actualAllTokens,
           requests,
           costUsd: hasCostUsd ? costUsd : 0,
-          hasCostUsd
+          hasCostUsd,
+          pricingResolvedRequests,
+          pricingUnavailableRequests
         }
       }
     }
@@ -1139,7 +1173,7 @@ class RedisClient {
 
   // 💰 计算账户的每日费用（基于模型使用）
   async getAccountDailyCost(accountId) {
-    const CostCalculator = require('../utils/costCalculator')
+    const { getStoredOrCalculatedCost } = require('../services/billingCostService')
     const today = getDateStringInTimezone()
 
     // 获取账户今日所有模型的使用数据
@@ -1169,20 +1203,15 @@ class RedisClient {
           cache_read_input_tokens: parseInt(modelUsage.cacheReadTokens || 0)
         }
 
-        const storedCost = Number.parseFloat(modelUsage.costUsd)
-        let calculatedCost = 0
-        if (Number.isFinite(storedCost)) {
-          totalCost += storedCost
-        } else {
-          const costResult = CostCalculator.calculateCost(usage, model)
-          calculatedCost = costResult.costs.total
-          totalCost += calculatedCost
-        }
+        const costResult = getStoredOrCalculatedCost({
+          usage,
+          model,
+          stored: modelUsage
+        })
+        totalCost += costResult.totalCost
 
         logger.debug(
-          `💰 Account ${accountId} daily cost for model ${model}: $${
-            Number.isFinite(storedCost) ? storedCost : calculatedCost
-          }`
+          `💰 Account ${accountId} daily cost for model ${model}: $${costResult.totalCost}`
         )
       }
     }
@@ -2767,7 +2796,10 @@ class RedisClient {
                   cacheCreateTokens: 0,
                   cacheReadTokens: 0,
                   allTokens: 0,
-                  requests: 0
+                  requests: 0,
+                  costUsd: 0,
+                  pricingResolvedRequests: 0,
+                  pricingUnavailableRequests: 0
                 }
               }
 
@@ -2783,6 +2815,12 @@ class RedisClient {
                 modelUsage[modelName].allTokens += parseInt(value || 0)
               } else if (metric === 'requests') {
                 modelUsage[modelName].requests += parseInt(value || 0)
+              } else if (metric === 'costUsd') {
+                modelUsage[modelName].costUsd += parseFloat(value || 0)
+              } else if (metric === 'pricingResolvedRequests') {
+                modelUsage[modelName].pricingResolvedRequests += parseInt(value || 0)
+              } else if (metric === 'pricingUnavailableRequests') {
+                modelUsage[modelName].pricingUnavailableRequests += parseInt(value || 0)
               }
             }
           }

@@ -255,7 +255,7 @@ class CostCalculator {
    * @param {string} model - 模型名称
    * @returns {Object} 费用详情
    */
-  static calculateAggregatedCost(aggregatedUsage, model = 'unknown') {
+  static calculateAggregatedCost(aggregatedUsage, model = 'unknown', options = {}) {
     const usage = {
       input_tokens: aggregatedUsage.inputTokens || aggregatedUsage.totalInputTokens || 0,
       output_tokens: aggregatedUsage.outputTokens || aggregatedUsage.totalOutputTokens || 0,
@@ -265,7 +265,7 @@ class CostCalculator {
         aggregatedUsage.cacheReadTokens || aggregatedUsage.totalCacheReadTokens || 0
     }
 
-    return this.calculateCost(usage, model)
+    return this.calculateCost(usage, model, options)
   }
 
   /**

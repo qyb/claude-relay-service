@@ -4,6 +4,7 @@ const redis = require('../../models/redis')
 const { authenticateAdmin } = require('../../middleware/auth')
 const logger = require('../../utils/logger')
 const CostCalculator = require('../../utils/costCalculator')
+const { getStoredOrCalculatedCost } = require('../../services/billingCostService')
 const config = require('../../../config/config')
 
 const router = express.Router()
@@ -882,8 +883,8 @@ async function calculateKeyStats(keyId, timeRange, startDate, endDate, apiKeyOve
       dailyCost = await redis.getDailyCost(keyId)
     }
 
-    // 只在启用了总费用限制时查询
-    if (totalCostLimit > 0) {
+    // 全部时间范围需要总费用；费用限制开启时也需要读取它。
+    if (timeRange === 'all' || totalCostLimit > 0) {
       const totalCostKey = `usage:cost:total:${keyId}`
       allTimeCost = parseFloat((await client.get(totalCostKey)) || '0')
     }
@@ -1020,7 +1021,11 @@ async function calculateKeyStats(keyId, timeRange, startDate, endDate, apiKeyOve
         outputTokens: 0,
         cacheCreateTokens: 0,
         cacheReadTokens: 0,
-        requests: 0
+        requests: 0,
+        costUsd: 0,
+        pricingResolvedRequests: 0,
+        pricingUnavailableRequests: 0,
+        hasStoredCost: false
       })
     }
 
@@ -1032,6 +1037,13 @@ async function calculateKeyStats(keyId, timeRange, startDate, endDate, apiKeyOve
     stats.cacheReadTokens +=
       parseInt(data.totalCacheReadTokens) || parseInt(data.cacheReadTokens) || 0
     stats.requests += parseInt(data.totalRequests) || parseInt(data.requests) || 0
+    const storedCost = Number.parseFloat(data.costUsd)
+    if (Number.isFinite(storedCost)) {
+      stats.costUsd += storedCost
+      stats.hasStoredCost = true
+    }
+    stats.pricingResolvedRequests += parseInt(data.pricingResolvedRequests) || 0
+    stats.pricingUnavailableRequests += parseInt(data.pricingUnavailableRequests) || 0
 
     totalRequests += parseInt(data.totalRequests) || parseInt(data.requests) || 0
   }
@@ -1049,16 +1061,23 @@ async function calculateKeyStats(keyId, timeRange, startDate, endDate, apiKeyOve
     cacheCreateTokens += stats.cacheCreateTokens
     cacheReadTokens += stats.cacheReadTokens
 
-    const costResult = CostCalculator.calculateCost(
-      {
+    const costResult = getStoredOrCalculatedCost({
+      usage: {
         input_tokens: stats.inputTokens,
         output_tokens: stats.outputTokens,
         cache_creation_input_tokens: stats.cacheCreateTokens,
         cache_read_input_tokens: stats.cacheReadTokens
       },
-      model
-    )
-    totalCost += costResult.costs.total
+      model,
+      stored: stats.hasStoredCost
+        ? {
+            costUsd: stats.costUsd,
+            pricingResolvedRequests: stats.pricingResolvedRequests,
+            pricingUnavailableRequests: stats.pricingUnavailableRequests
+          }
+        : null
+    })
+    totalCost += costResult.totalCost
   }
 
   const tokens = inputTokens + outputTokens + cacheCreateTokens + cacheReadTokens

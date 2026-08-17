@@ -3,21 +3,34 @@ const redis = require('../models/redis')
 const logger = require('../utils/logger')
 const apiKeyService = require('../services/apiKeyService')
 const CostCalculator = require('../utils/costCalculator')
+const { getStoredOrCalculatedCost, readStoredCost } = require('../services/billingCostService')
 const claudeAccountService = require('../services/claudeAccountService')
 const openaiAccountService = require('../services/openaiAccountService')
 const { createClaudeTestPayload } = require('../utils/testPayloadHelper')
 
 const router = express.Router()
 
-const withStoredAggregateCost = (costData, storedCost) => {
+const withStoredAggregateCost = (costData, storedCost, storedMetadata = {}) => {
   if (!Number.isFinite(storedCost)) {
     return costData
   }
 
+  const storedResult = readStoredCost(
+    { ...storedMetadata, costUsd: storedCost },
+    {
+      input_tokens: costData.usage?.inputTokens || 0,
+      output_tokens: costData.usage?.outputTokens || 0,
+      cache_creation_input_tokens: costData.usage?.cacheCreateTokens || 0,
+      cache_read_input_tokens: costData.usage?.cacheReadTokens || 0
+    }
+  )
+
   return {
     ...costData,
     costs: { ...costData.costs, total: storedCost },
-    formatted: { ...costData.formatted, total: CostCalculator.formatCost(storedCost) }
+    formatted: { ...costData.formatted, total: CostCalculator.formatCost(storedCost) },
+    costStatus: storedResult.status,
+    costAvailable: storedResult.available
   }
 }
 
@@ -256,7 +269,9 @@ router.post('/api/user-stats', async (req, res) => {
                 cacheCreateTokens: 0,
                 cacheReadTokens: 0,
                 costUsd: 0,
-                hasCostUsd: false
+                hasCostUsd: false,
+                pricingResolvedRequests: 0,
+                pricingUnavailableRequests: 0
               })
             }
 
@@ -270,6 +285,8 @@ router.post('/api/user-stats', async (req, res) => {
               modelUsage.costUsd += storedCost
               modelUsage.hasCostUsd = true
             }
+            modelUsage.pricingResolvedRequests += parseInt(data.pricingResolvedRequests) || 0
+            modelUsage.pricingUnavailableRequests += parseInt(data.pricingUnavailableRequests) || 0
           }
         }
 
@@ -282,12 +299,12 @@ router.post('/api/user-stats', async (req, res) => {
             cache_read_input_tokens: usage.cacheReadTokens
           }
 
-          if (usage.hasCostUsd) {
-            totalCost += usage.costUsd
-          } else {
-            const costResult = CostCalculator.calculateCost(usageData, model)
-            totalCost += costResult.costs.total
-          }
+          const costResult = getStoredOrCalculatedCost({
+            usage: usageData,
+            model,
+            stored: usage.hasCostUsd ? usage : null
+          })
+          totalCost += costResult.totalCost
         }
 
         // 如果没有模型级别的详细数据，回退到总体数据计算
@@ -754,7 +771,9 @@ router.post('/api/batch-model-stats', async (req, res) => {
                 cacheReadTokens: 0,
                 allTokens: 0,
                 costUsd: 0,
-                hasCostUsd: false
+                hasCostUsd: false,
+                pricingResolvedRequests: 0,
+                pricingUnavailableRequests: 0
               })
             }
 
@@ -770,6 +789,8 @@ router.post('/api/batch-model-stats', async (req, res) => {
               modelUsage.costUsd += storedCost
               modelUsage.hasCostUsd = true
             }
+            modelUsage.pricingResolvedRequests += parseInt(data.pricingResolvedRequests) || 0
+            modelUsage.pricingUnavailableRequests += parseInt(data.pricingUnavailableRequests) || 0
           }
         }
       })
@@ -787,7 +808,8 @@ router.post('/api/batch-model-stats', async (req, res) => {
 
       const costData = withStoredAggregateCost(
         CostCalculator.calculateCost(usageData, model),
-        usage.hasCostUsd ? usage.costUsd : NaN
+        usage.hasCostUsd ? usage.costUsd : NaN,
+        usage
       )
 
       modelStats.push({
@@ -1001,7 +1023,8 @@ router.post('/api/user-model-stats', async (req, res) => {
 
         const costData = withStoredAggregateCost(
           CostCalculator.calculateCost(usage, model),
-          Number.parseFloat(data.costUsd)
+          Number.parseFloat(data.costUsd),
+          data
         )
 
         modelStats.push({
