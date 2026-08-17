@@ -107,6 +107,21 @@ describe('requestPurposeClassifier', () => {
     expect(result.request_purpose).toBe('skill_execution')
   })
 
+  it('仅命令标记（/clear 等）不判为 skill_execution（v4 生产取证回归）', () => {
+    const classifier = makeClassifier()
+    const result = classifier.classify({
+      latestUserText:
+        '<command-name>/clear</command-name>\n<command-message>clear</command-message>',
+      messageCount: 4,
+      rootSessionId: SESSION
+    })
+    expect(result.request_purpose).not.toBe('skill_execution')
+    expect(result.prompt_source).toBe('command')
+    // 无技能实例、无人工文本、有历史消息 → 结构信号兜底为 background
+    expect(result.request_purpose).toBe('background')
+    expect(result.purpose_source).toBe('structure')
+  })
+
   it('同一根 session 的非主上下文判为 subagent（不依赖正文）', () => {
     const classifier = makeClassifier()
 

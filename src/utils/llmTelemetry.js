@@ -8,13 +8,12 @@
 const crypto = require('crypto')
 const logger = require('./logger')
 const pricingService = require('../services/pricingService')
+const { detectHarness } = require('./harnessDetector')
 
 // v2：未知价格时 cost 保留 null（不再写 0），并透传 skill/system-reminder 拆分指标
 const SCHEMA_VERSION = 2
 const MAX_TOOL_NAMES = 64
 const MAX_TOOL_NAME_LENGTH = 128
-const MAX_HARNESS_ID_LENGTH = 64
-const MAX_HARNESS_VERSION_LENGTH = 64
 const VALID_EVENT_TYPES = new Set([
   'llm_request_completed',
   'llm_request_error',
@@ -22,21 +21,6 @@ const VALID_EVENT_TYPES = new Set([
   'sticky_session_lifecycle'
 ])
 const UPSTREAM_EVENT_TYPES = new Set(['account_failover', 'sticky_session_lifecycle'])
-
-function getHeader(headers, name) {
-  if (!headers || typeof headers !== 'object') {
-    return null
-  }
-
-  const direct = headers[name] ?? headers[name.toLowerCase()]
-  if (typeof direct === 'string') {
-    return direct
-  }
-
-  const matchingKey = Object.keys(headers).find((key) => key.toLowerCase() === name.toLowerCase())
-  const value = matchingKey ? headers[matchingKey] : null
-  return typeof value === 'string' ? value : null
-}
 
 function sanitizeToken(value, maxLength) {
   if (typeof value !== 'string') {
@@ -129,48 +113,6 @@ function hashValue(value) {
     return null
   }
   return crypto.createHash('sha256').update(stableSerialize(value)).digest('hex')
-}
-
-function detectHarness(headers = {}) {
-  const explicitId = sanitizeToken(getHeader(headers, 'x-crs-harness'), MAX_HARNESS_ID_LENGTH)
-  const explicitVersion = sanitizeToken(
-    getHeader(headers, 'x-crs-harness-version'),
-    MAX_HARNESS_VERSION_LENGTH
-  )
-
-  if (explicitId) {
-    return {
-      harness_id: explicitId.toLowerCase(),
-      harness_version: explicitVersion,
-      harness_source: 'explicit_header'
-    }
-  }
-
-  const userAgent = getHeader(headers, 'user-agent') || ''
-  const patterns = [
-    { regex: /^claude-cli\/([a-zA-Z0-9.-]+)/i, id: 'claude-code' },
-    { regex: /^zcode\/([a-zA-Z0-9.-]+)(?:\s|$)/i, id: 'zcode' },
-    { regex: /^codex_cli_rs\/([a-zA-Z0-9.-]+)/i, id: 'codex-cli' },
-    { regex: /^codex_vscode\/([a-zA-Z0-9.-]+)/i, id: 'codex-vscode' },
-    { regex: /^factory-cli\/([a-zA-Z0-9.-]+)/i, id: 'droid' }
-  ]
-
-  for (const pattern of patterns) {
-    const match = userAgent.match(pattern.regex)
-    if (match) {
-      return {
-        harness_id: pattern.id,
-        harness_version: sanitizeToken(match[1], MAX_HARNESS_VERSION_LENGTH),
-        harness_source: 'user_agent'
-      }
-    }
-  }
-
-  return {
-    harness_id: 'unknown',
-    harness_version: null,
-    harness_source: 'unknown'
-  }
 }
 
 function collectToolResults(messages) {
@@ -374,7 +316,13 @@ function finalizeTelemetry(context, outcome = {}) {
 
   const skillFields = effectiveSkillSummary
     ? {
+        // v4 语义：skill_detected 只反映真实技能实例（invocation/definition/
+        // rehydration）；技能目录与命令调用有独立字段，不再互相污染
         skill_detected: effectiveSkillSummary.skill_detected === true,
+        skill_catalog_detected: effectiveSkillSummary.skill_catalog_detected === true,
+        skill_catalog_names: Number.isInteger(effectiveSkillSummary.skill_catalog_names)
+          ? effectiveSkillSummary.skill_catalog_names
+          : 0,
         skill_detection_confidence: effectiveSkillSummary.skill_detection_confidence ?? null,
         skill_detection_rule_version: effectiveSkillSummary.skill_detection_rule_version ?? 1,
         skill_detection_types: Array.isArray(effectiveSkillSummary.skill_detection_types)
@@ -401,6 +349,12 @@ function finalizeTelemetry(context, outcome = {}) {
           ? effectiveSkillSummary.skill_reinjected_count
           : 0,
         skill_rehydrated: effectiveSkillSummary.skill_rehydrated === true,
+        command_invocation_count: Number.isInteger(effectiveSkillSummary.command_invocation_count)
+          ? effectiveSkillSummary.command_invocation_count
+          : 0,
+        command_invocation_names: Array.isArray(effectiveSkillSummary.command_invocation_names)
+          ? effectiveSkillSummary.command_invocation_names
+          : [],
         system_reminder_detected: effectiveSkillSummary.system_reminder_detected === true,
         system_reminder_count: Number.isInteger(effectiveSkillSummary.system_reminder_count)
           ? effectiveSkillSummary.system_reminder_count
@@ -423,6 +377,40 @@ function finalizeTelemetry(context, outcome = {}) {
         )
           ? effectiveSkillSummary.system_reminder_reinjected_count
           : 0,
+        // 上下文构成（字符量）：需与响应侧真实 usage（cache_read_input_tokens
+        // 等）按 gateway_request_id 关联才能回答成本来源；字符量≠缓存命中量
+        tool_result_context_chars: Number.isInteger(effectiveSkillSummary.tool_result_context_chars)
+          ? effectiveSkillSummary.tool_result_context_chars
+          : 0,
+        tool_result_chars_current: Number.isInteger(effectiveSkillSummary.tool_result_chars_current)
+          ? effectiveSkillSummary.tool_result_chars_current
+          : 0,
+        system_prompt_chars: Number.isInteger(effectiveSkillSummary.system_prompt_chars)
+          ? effectiveSkillSummary.system_prompt_chars
+          : 0,
+        skill_context_chars_current: Number.isInteger(
+          effectiveSkillSummary.skill_context_chars_current
+        )
+          ? effectiveSkillSummary.skill_context_chars_current
+          : 0,
+        skill_context_chars_added: Number.isInteger(effectiveSkillSummary.skill_context_chars_added)
+          ? effectiveSkillSummary.skill_context_chars_added
+          : 0,
+        skill_context_chars_carried: Number.isInteger(
+          effectiveSkillSummary.skill_context_chars_carried
+        )
+          ? effectiveSkillSummary.skill_context_chars_carried
+          : 0,
+        skill_context_chars_rehydrated: Number.isInteger(
+          effectiveSkillSummary.skill_context_chars_rehydrated
+        )
+          ? effectiveSkillSummary.skill_context_chars_rehydrated
+          : 0,
+        active_skill_content_hashes: Array.isArray(
+          effectiveSkillSummary.active_skill_content_hashes
+        )
+          ? effectiveSkillSummary.active_skill_content_hashes
+          : [],
         skill_analysis_duration_ms: Number.isInteger(effectiveSkillSummary.analysis_duration_ms)
           ? effectiveSkillSummary.analysis_duration_ms
           : null,

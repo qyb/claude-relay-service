@@ -459,6 +459,8 @@ describe('llmTelemetry skill summary fields', () => {
   it('skillSummary 展开为 telemetry 记录的 skill_* 摘要字段', () => {
     const context = createTelemetryContext(buildRequest(), buildSessionInfo(), {
       skill_detected: true,
+      skill_catalog_detected: true,
+      skill_catalog_names: 14,
       skill_detection_confidence: 'exact_marker',
       skill_detection_rule_version: 2,
       skill_detection_types: ['invoked_skills'],
@@ -469,12 +471,22 @@ describe('llmTelemetry skill summary fields', () => {
       skill_newly_injected_count: 1,
       skill_reinjected_count: 0,
       skill_rehydrated: false,
+      command_invocation_count: 1,
+      command_invocation_names: ['clear'],
       system_reminder_detected: true,
       system_reminder_count: 3,
       system_reminder_detection_types: ['generic_system_reminder'],
       system_reminder_chars: 900,
       system_reminder_newly_injected_count: 2,
       system_reminder_reinjected_count: 1,
+      tool_result_context_chars: 1200,
+      tool_result_chars_current: 34567,
+      system_prompt_chars: 8901,
+      skill_context_chars_current: 18420,
+      skill_context_chars_added: 9000,
+      skill_context_chars_carried: 8000,
+      skill_context_chars_rehydrated: 1420,
+      active_skill_content_hashes: ['a'.repeat(64)],
       analysis_duration_ms: 2,
       analysis_scanned_chars: 2048,
       analysis_truncated: false
@@ -484,6 +496,8 @@ describe('llmTelemetry skill summary fields', () => {
 
     expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
       skill_detected: true,
+      skill_catalog_detected: true,
+      skill_catalog_names: 14,
       skill_detection_confidence: 'exact_marker',
       skill_detection_rule_version: 2,
       skill_detection_types: ['invoked_skills'],
@@ -494,15 +508,45 @@ describe('llmTelemetry skill summary fields', () => {
       skill_newly_injected_count: 1,
       skill_reinjected_count: 0,
       skill_rehydrated: false,
+      command_invocation_count: 1,
+      command_invocation_names: ['clear'],
       system_reminder_detected: true,
       system_reminder_count: 3,
       system_reminder_detection_types: ['generic_system_reminder'],
       system_reminder_chars: 900,
       system_reminder_newly_injected_count: 2,
       system_reminder_reinjected_count: 1,
+      tool_result_context_chars: 1200,
+      tool_result_chars_current: 34567,
+      system_prompt_chars: 8901,
+      skill_context_chars_current: 18420,
+      skill_context_chars_added: 9000,
+      skill_context_chars_carried: 8000,
+      skill_context_chars_rehydrated: 1420,
+      active_skill_content_hashes: ['a'.repeat(64)],
       skill_analysis_duration_ms: 2,
       skill_analysis_scanned_chars: 2048,
       skill_analysis_truncated: false
+    })
+  })
+
+  it('v4 语义：目录-only 摘要输出 skill_detected=false 与独立目录/命令字段', () => {
+    const context = createTelemetryContext(buildRequest(), buildSessionInfo(), {
+      skill_detected: false,
+      skill_catalog_detected: true,
+      skill_catalog_names: 14,
+      command_invocation_count: 2,
+      command_invocation_names: ['clear', 'model']
+    })
+
+    finalizeTelemetry(context, { eventType: 'llm_request_completed' })
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      skill_detected: false,
+      skill_catalog_detected: true,
+      skill_catalog_names: 14,
+      command_invocation_count: 2,
+      command_invocation_names: ['clear', 'model']
     })
   })
 

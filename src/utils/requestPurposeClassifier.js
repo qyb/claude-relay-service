@@ -4,7 +4,10 @@
  * 判定优先级（高到低）：
  * 1. 客户端显式 header `x-crs-request-purpose`（枚举校验，未来的标准通道）；
  * 2. 真实日志取证的机器模板指纹（完整固定短语，不做自然语言猜测）；
- * 3. 最新 user 文本本身是 SKILL 调用标记 → skill_execution；
+ * 3. 最新 user 文本带强技能证据（skill-format / 恢复结构 / Base directory）→
+ *    skill_execution。v4 起仅命令标记（/clear、/model 等）不再判为
+ *    skill_execution（promptSourceClassifier v4 拆分），此类请求走
+ *    context_role / skill_instance / structure 分支；
  * 4. 上下文角色：同一根 session 下非主上下文 → subagent（P0-2 的
  *    agent_context_id 派生使这成为可靠信号，无需读正文）；
  * 5. 最新 user 文本为员工自然语言 → human；
@@ -34,7 +37,7 @@ const crypto = require('crypto')
 const LRUCache = require('./lruCache')
 const { classifyPromptSource } = require('./promptSourceClassifier')
 
-const PURPOSE_RULE_VERSION = 3
+const PURPOSE_RULE_VERSION = 4
 const PURPOSE_TYPES = [
   'human',
   'auto_classifier',
@@ -236,7 +239,8 @@ class RequestPurposeClassifier {
       purposeSource = 'template'
       templateId = template.id
     } else if (contentSource === 'skill') {
-      // 最新 user 文本本身是 SKILL 调用标记 → 本次请求由 SKILL 触发
+      // 最新 user 文本带强技能证据（skill-format / 恢复结构 / Base directory）
+      // → 本次请求由 SKILL 触发。仅命令标记（/clear 等）不走此分支
       requestPurpose = 'skill_execution'
       purposeSource = 'skill_marker'
     } else if (agentContextRole === 'secondary') {

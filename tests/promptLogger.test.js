@@ -341,7 +341,7 @@ describe('PromptLogger LRU retention', () => {
       client_session_id: SESSION_A,
       model: 'claude-sonnet-test',
       prompt_source: 'human',
-      prompt_source_rule_version: 3,
+      prompt_source_rule_version: 4,
       request_purpose: 'human',
       schema_version: 3
     })
@@ -349,7 +349,7 @@ describe('PromptLogger LRU retention', () => {
     expect(record.hash_key_id).toMatch(/^(ek|ephemeral)-[0-9a-f]{8}$/)
   })
 
-  it('8. SKILL 明文只进入 skill_prompt_observed，不污染 user_prompt_observed', () => {
+  it('8. SKILL 明文只进入 prompt_component_observed，不污染 user_prompt_observed', () => {
     const writeRecord = jest.fn(() => true)
     const promptLogger = new PromptLogger({ writeRecord })
     const skillText = `<system-reminder>
@@ -379,19 +379,20 @@ Run eslint on modified files
     }
 
     expect(Object.keys(recordsByType).sort()).toEqual([
-      'skill_prompt_observed',
+      'prompt_component_observed',
       'user_prompt_observed'
     ])
     // 员工输入与 SKILL 明文各归各的记录类型
     expect(recordsByType.user_prompt_observed.prompt).toBe('human prompt')
-    expect(recordsByType.skill_prompt_observed.prompt).toBe('Run eslint on modified files')
-    expect(recordsByType.skill_prompt_observed).toMatchObject({
+    expect(recordsByType.prompt_component_observed.prompt).toBe('Run eslint on modified files')
+    expect(recordsByType.prompt_component_observed).toMatchObject({
+      prompt_kind: 'unknown_machine_prompt',
       prompt_source: 'skill_injection',
       skill_name: 'linter',
       skill_injection_kind: 'newly_injected',
-      schema_version: 2
+      schema_version: 4
     })
-    expect(JSON.stringify(recordsByType.skill_prompt_observed)).not.toContain('human prompt')
+    expect(JSON.stringify(recordsByType.prompt_component_observed)).not.toContain('human prompt')
     expect(JSON.stringify(recordsByType.user_prompt_observed)).not.toContain('Run eslint')
   })
 
@@ -503,7 +504,7 @@ Run eslint on modified files
     ])
 
     const paths = writeRecord.mock.calls
-      .filter((call) => call[0].event_type === 'skill_prompt_observed')
+      .filter((call) => call[0].event_type === 'prompt_component_observed')
       .map((call) => call[0].skill_path)
     expect(paths).toEqual([
       '$HOME/.claude/skills/x/SKILL.md',
@@ -532,7 +533,7 @@ Run eslint on modified files
     ])
 
     expect(writeRecord.mock.calls[0][0]).toMatchObject({
-      event_type: 'skill_prompt_observed',
+      event_type: 'prompt_component_observed',
       prompt_source: 'system_reminder'
     })
   })

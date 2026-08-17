@@ -433,7 +433,8 @@ function startLlmRequestObservation(req, res) {
         req?.body,
         sessionInfo,
         req?.apiKey?.id,
-        agentContextInfo
+        agentContextInfo,
+        { requestId: req?.requestId ?? null }
       )
     } catch (error) {
       logger.error('Failed to analyze SKILL prompt injection:', error?.message || String(error))

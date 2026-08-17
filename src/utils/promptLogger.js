@@ -4,7 +4,7 @@
  * Prompt 原文只在内存中经过脱敏，然后传给 logger.promptLog() 的独立高敏感
  * 日志 transport；LRU 只保存 session 与 Prompt 的 HMAC，不保存明文。
  * 只有分类为 human 的文本才进入 user_prompt_observed，机器注入内容一律
- * 通过 SKILL 分析器的 skill_prompt_observed 单独落盘。
+ * 通过 SKILL 分析器的 prompt_component_observed（schema v4）单独落盘。
  */
 
 const crypto = require('crypto')
@@ -16,9 +16,14 @@ const {
   isHumanPrompt: classifyIsHumanPrompt,
   PROMPT_SOURCE_RULE_VERSION
 } = require('./promptSourceClassifier')
+const { detectHarness } = require('./harnessDetector')
 const { getPurposeKey, getKeyId } = require('./hmacKeyring')
 
 const SCHEMA_VERSION = 3
+// SKILL/命令/reminder 组件记录的独立 schema（v4：prompt_kind 分类体系 + 归因字段）
+const COMPONENT_RECORD_SCHEMA_VERSION = 4
+// 兼容旧版分析器输出（无 skill_detection_rule_version 字段）时的回退版本号
+const RULE_VERSION_FALLBACK = 1
 const DEFAULT_CACHE_SIZE = 10000
 const DEFAULT_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const SUSPECTED_SECRET_WARN_INTERVAL_MS = 5 * 60 * 1000
@@ -222,37 +227,46 @@ function warnSuspectedSecret(record) {
 }
 
 function maskPromptRecord(record, maskPromptFn) {
-  if (!record || typeof record.prompt !== 'string') {
+  if (!record || (typeof record.prompt !== 'string' && typeof record.prompt_prefix !== 'string')) {
     return record
   }
 
   try {
-    const result = maskPromptFn(record.prompt)
-    const maskedRecord = {
-      ...record,
-      prompt: result.maskedPrompt,
-      mask_version: result.maskVersion || DEFAULT_MASK_VERSION,
-      mask_count: Number.isInteger(result.maskCount) ? result.maskCount : 0,
-      mask_key_id: result.maskKeyId || null,
-      rules_source: result.rulesSource || 'default'
-    }
+    const next = { ...record }
+    if (typeof record.prompt === 'string') {
+      const result = maskPromptFn(record.prompt)
+      next.prompt = result.maskedPrompt
+      next.mask_version = result.maskVersion || DEFAULT_MASK_VERSION
+      next.mask_count = Number.isInteger(result.maskCount) ? result.maskCount : 0
+      next.mask_key_id = result.maskKeyId || null
+      next.rules_source = result.rulesSource || 'default'
 
-    if (Array.isArray(result.entityFingerprints) && result.entityFingerprints.length > 0) {
-      maskedRecord.entity_fingerprints = result.entityFingerprints
+      if (Array.isArray(result.entityFingerprints) && result.entityFingerprints.length > 0) {
+        next.entity_fingerprints = result.entityFingerprints
+      }
+      if (Number.isInteger(result.highEntropyCount) && result.highEntropyCount > 0) {
+        next.high_entropy_count = result.highEntropyCount
+      }
+      if (result.suspectedSecret === true) {
+        next.suspected_secret = true
+      }
     }
-    if (Number.isInteger(result.highEntropyCount) && result.highEntropyCount > 0) {
-      maskedRecord.high_entropy_count = result.highEntropyCount
+    if (typeof record.prompt_prefix === 'string') {
+      // 前缀采样与正文走同一脱敏路径；脱敏异常时同样以占位符兜底
+      try {
+        const prefixResult = maskPromptFn(record.prompt_prefix)
+        next.prompt_prefix = prefixResult.maskedPrompt
+      } catch (error) {
+        next.prompt_prefix = '[MASKED:prompt_masking_error]'
+      }
     }
-    if (result.suspectedSecret === true) {
-      maskedRecord.suspected_secret = true
-    }
-
-    return maskedRecord
+    return next
   } catch (error) {
     // 脱敏异常时绝不能把明文继续写盘；使用不可逆占位符并保留可复核元字段。
     return {
       ...record,
       prompt: '[MASKED:prompt_masking_error]',
+      prompt_prefix: undefined,
       mask_version: DEFAULT_MASK_VERSION,
       mask_count: 0,
       suspected_secret: true
@@ -294,12 +308,15 @@ class PromptLogger {
       return this.writeRecord(maskedRecord) === true
     }
 
-    // 1. 记录待落盘的 SKILL Prompt（写盘前脱敏）
+    // 1. 记录待落盘的机器注入组件（写盘前脱敏）。schema v4：prompt_kind
+    //    分类体系（skill_invocation / command_invocation / system_reminder 等），
+    //    并携带 request_purpose、agent_context、harness 与内容 hash 归因字段
     if (Array.isArray(skillRecords)) {
+      const harness = detectHarness(req?.headers)
       for (const skillRecord of skillRecords) {
         const record = {
-          schema_version: 2,
-          event_type: 'skill_prompt_observed',
+          schema_version: COMPONENT_RECORD_SCHEMA_VERSION,
+          event_type: 'prompt_component_observed',
           timestamp: new Date().toISOString(),
           gateway_request_id: req?.requestId ?? null,
           api_key_record_id: req?.apiKey?.id ?? null,
@@ -308,15 +325,37 @@ class PromptLogger {
           session_id_source: sessionInfo?.source ?? null,
           route: req?.route?.path ?? req?.originalUrl?.split('?')[0] ?? null,
           model: req?.body?.model ?? null,
+          harness_id: harness.harness_id,
+          harness_version: harness.harness_version,
+          harness_source: harness.harness_source,
+          request_purpose: purposeInfo?.request_purpose ?? null,
+          purpose_source: purposeInfo?.purpose_source ?? null,
+          agent_context_id: purposeInfo?.agent_context_id ?? null,
+          agent_context_role: purposeInfo?.agent_context_role ?? null,
+          prompt_kind: skillRecord.prompt_kind ?? 'unknown_machine_prompt',
           prompt_source: skillRecord.prompt_source ?? 'skill_injection',
           skill_name: skillRecord.skill_name ?? null,
+          command_name: skillRecord.command_name ?? null,
           skill_path: normalizeSkillPath(skillRecord.skill_path),
+          detection_type: skillRecord.detection_type ?? null,
           skill_detection_confidence: skillRecord.skill_detection_confidence ?? null,
-          skill_detection_rule_version: skillRecord.skill_detection_rule_version ?? 1,
+          classification_confidence: skillRecord.classification_confidence ?? null,
+          classification_reason: skillRecord.classification_reason ?? null,
+          skill_detection_rule_version:
+            skillRecord.skill_detection_rule_version ?? RULE_VERSION_FALLBACK,
           skill_injection_kind: skillRecord.skill_injection_kind ?? 'newly_injected',
           skill_rehydrated: skillRecord.skill_rehydrated === true,
+          message_index: Number.isInteger(skillRecord.message_index)
+            ? skillRecord.message_index
+            : null,
+          content_hash: skillRecord.content_hash ?? null,
+          content_first_seen_request_id: skillRecord.content_first_seen_request_id ?? null,
+          active_age_requests: Number.isInteger(skillRecord.active_age_requests)
+            ? skillRecord.active_age_requests
+            : null,
           skill_chars: skillRecord.skill_chars ?? 0,
-          prompt: skillRecord.prompt
+          prompt: skillRecord.prompt ?? null,
+          prompt_prefix: skillRecord.prompt_prefix ?? null
         }
         try {
           writeMaskedRecord(record)
@@ -419,6 +458,7 @@ const defaultPromptLogger = new PromptLogger()
 module.exports = defaultPromptLogger
 module.exports.PromptLogger = PromptLogger
 module.exports.SCHEMA_VERSION = SCHEMA_VERSION
+module.exports.COMPONENT_RECORD_SCHEMA_VERSION = COMPONENT_RECORD_SCHEMA_VERSION
 module.exports.buildPromptSessionKey = buildPromptSessionKey
 module.exports.extractLatestUserPrompt = extractLatestUserPrompt
 module.exports.extractLatestUserMessageText = extractLatestUserMessageText

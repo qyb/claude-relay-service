@@ -1,5 +1,6 @@
 const {
   PROMPT_SOURCE_RULE_VERSION,
+  SOURCE_TYPES,
   classifyPromptSource,
   isHumanPrompt
 } = require('../src/utils/promptSourceClassifier')
@@ -8,20 +9,44 @@ describe('promptSourceClassifier', () => {
   it('员工自然语言输入判为 human', () => {
     expect(classifyPromptSource('Please refactor this function')).toBe('human')
     expect(classifyPromptSource('帮我看一下这个报错')).toBe('human')
-    expect(classifyPromptSource('  \n多行\n输入  \n')).toBe('human')
+    expect(classifyPromptSource('  \n多行\n输入  ')).toBe('human')
     expect(isHumanPrompt('run the tests')).toBe(true)
   })
 
-  it('SKILL 相关标记判为 skill', () => {
-    expect(classifyPromptSource('<command-message>linter</command-message>')).toBe('skill')
-    expect(classifyPromptSource('<command-name>pdf</command-name>')).toBe('skill')
+  it('强技能证据判为 skill', () => {
     expect(classifyPromptSource('<skill-format>true</skill-format>')).toBe('skill')
+    expect(
+      classifyPromptSource(
+        '<command-message>linter</command-message>\n<skill-format>true</skill-format>\nbody'
+      )
+    ).toBe('skill')
     expect(
       classifyPromptSource('The following skills were invoked in this session:\n### Skill: x')
     ).toBe('skill')
     expect(classifyPromptSource('Base directory for this skill: /home/u/.claude/skills/x')).toBe(
       'skill'
     )
+    expect(classifyPromptSource('### Skill: code-reviewer\nPath: /skills/x/SKILL.md')).toBe('skill')
+  })
+
+  it('仅命令标记不足以证明是技能，判为 command（/clear、/model、/resume 生产取证）', () => {
+    expect(classifyPromptSource('<command-message>clear</command-message>')).toBe('command')
+    expect(classifyPromptSource('<command-name>/model</command-name>')).toBe('command')
+    expect(classifyPromptSource('<command-args>--verbose</command-args>')).toBe('command')
+    expect(
+      classifyPromptSource(
+        '<command-name>/clear</command-name>\n<command-message>clear</command-message>'
+      )
+    ).toBe('command')
+    // 命令是机器包装，不进入员工统计
+    expect(isHumanPrompt('<command-name>/clear</command-name>')).toBe(false)
+    // skill-format 非真值时只是普通标记文本，不构成技能证据
+    expect(classifyPromptSource('<skill-format>invalid</skill-format>')).not.toBe('skill')
+  })
+
+  it('SOURCE_TYPES 包含 command 且与 skill 分开', () => {
+    expect(SOURCE_TYPES).toContain('command')
+    expect(SOURCE_TYPES).toContain('skill')
   })
 
   it('系统包装与列表判为 system', () => {
@@ -57,6 +82,6 @@ describe('promptSourceClassifier', () => {
   it('空输入判为 unknown，规则版本随分类规则演进', () => {
     expect(classifyPromptSource('')).toBe('unknown')
     expect(classifyPromptSource(null)).toBe('unknown')
-    expect(PROMPT_SOURCE_RULE_VERSION).toBe(3)
+    expect(PROMPT_SOURCE_RULE_VERSION).toBe(4)
   })
 })

@@ -7,7 +7,8 @@ const {
   SkillPromptAnalyzer,
   classifyPromptSource,
   parseInvokedSkills,
-  parseCommandMarkers
+  parseCommandMarkers,
+  parseSkillCatalog
 } = require('../src/utils/skillPromptAnalyzer')
 const { AgentContextResolver } = require('../src/utils/agentContext')
 
@@ -81,7 +82,7 @@ Run tests with jest...
     expect(classifyPromptSource(text)).toBe('skill_injection')
   })
 
-  it('3. 能识别 SKILL 列表但不把它计入正文大小', () => {
+  it('3. 技能目录只置 skill_catalog_detected，不置 skill_detected（吴昊 488/493 取证）', () => {
     const analyzer = new SkillPromptAnalyzer()
     const listText = `<system-reminder>
 The following skills are available for use with the Skill tool:
@@ -94,10 +95,14 @@ The following skills are available for use with the Skill tool:
     }
 
     const { summary, skillRecords } = analyzer.analyze(requestBody, sessionInfo(), 'key-1')
-    expect(summary.skill_detected).toBe(true)
-    expect(summary.skill_detection_types).toContain('skill_listing')
+    // v4 语义：看到目录 ≠ 正在使用技能
+    expect(summary.skill_detected).toBe(false)
+    expect(summary.skill_catalog_detected).toBe(true)
+    expect(summary.skill_detection_types).toEqual([])
+    expect(summary.skill_detection_confidence).toBeNull()
     expect(summary.skill_chars).toBe(0)
     expect(summary.skill_count).toBe(0)
+    expect(summary.skill_injection_count).toBe(0)
     expect(skillRecords).toHaveLength(0)
 
     expect(classifyPromptSource(listText)).toBe('system_reminder')
@@ -719,7 +724,9 @@ Code review body text
         sessionInfo(),
         'key-1'
       )
-      expect(res.summary.skill_detected).toBe(true)
+      // skill-format 非真值且无目录匹配：按命令调用处理，不算技能
+      expect(res.summary.skill_detected).toBe(false)
+      expect(res.summary.command_invocation_count).toBe(1)
       expect(res.summary.skill_chars).toBeLessThanOrEqual(512 * 1024)
       if (res.summary.skill_names.length > 0) {
         expect(res.summary.skill_names[0].length).toBeLessThanOrEqual(128)
@@ -764,5 +771,279 @@ Code review body text
     expect(summary.skill_names).toHaveLength(0)
     expect(summary.skill_chars).toBe(0)
     expect(skillRecords).toHaveLength(0)
+  })
+})
+
+describe('skillPromptAnalyzer v4 分类体系（2026-08-17 生产日志取证回归）', () => {
+  const CLEAR_COMMAND = `<command-name>/clear</command-name>
+            <command-message>clear</command-message>`
+
+  const SYSTEM_WITH_CATALOG = `You are a coding assistant.
+
+The following skills are available for use with the Skill tool:
+
+- code-reviewer: review code carefully
+- superpowers:systematic-debugging: debug systematically
+  with multiple steps
+- browser-use:control-browser: control the browser (also loadable as control-browser)
+
+Next section of the system prompt.`
+
+  it('/clear /model /resume 等普通命令判为 command_invocation，不算技能', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const request = {
+      messages: [{ role: 'user', content: [{ type: 'text', text: CLEAR_COMMAND }] }]
+    }
+
+    const { summary, skillRecords } = analyzer.analyze(request, sessionInfo(), 'key-1')
+    expect(summary.skill_detected).toBe(false)
+    expect(summary.skill_injection_count).toBe(0)
+    expect(summary.command_invocation_count).toBe(1)
+    expect(summary.command_invocation_names).toEqual(['clear'])
+    expect(skillRecords).toHaveLength(1)
+    expect(skillRecords[0]).toMatchObject({
+      prompt_kind: 'command_invocation',
+      command_name: 'clear',
+      skill_name: 'clear',
+      classification_reason: 'command_marker_without_skill_evidence',
+      prompt_source: 'command_invocation',
+      skill_injection_kind: 'newly_injected'
+    })
+    // 正文有界：只有命令标签块，不含外围包装
+    expect(skillRecords[0].prompt).toContain('<command-name>/clear</command-name>')
+    expect(skillRecords[0].prompt).not.toHaveLength(0)
+    expect(summary.skill_chars).toBe(0)
+  })
+
+  it('命令名命中系统提示技能目录时升级为 skill_invocation', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const request = {
+      system: SYSTEM_WITH_CATALOG,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: '<command-message>superpowers:systematic-debugging</command-message>\n<command-name>/superpowers:systematic-debugging</command-name>\n\nDebug skill body follows'
+            }
+          ]
+        }
+      ]
+    }
+
+    const { summary, skillRecords } = analyzer.analyze(request, sessionInfo(), 'key-1')
+    expect(summary.skill_detected).toBe(true)
+    expect(summary.skill_injection_count).toBe(1)
+    expect(summary.skill_names).toContain('superpowers:systematic-debugging')
+    expect(summary.skill_catalog_detected).toBe(true)
+    expect(summary.skill_catalog_names).toBe(4) // 含 also-loadable 别名
+    expect(skillRecords[0]).toMatchObject({
+      prompt_kind: 'skill_invocation',
+      classification_reason: 'catalog_name_match'
+    })
+  })
+
+  it('目录解析支持别名、命名空间与折行描述', () => {
+    const catalog = parseSkillCatalog(SYSTEM_WITH_CATALOG)
+    expect(catalog).not.toBeNull()
+    for (const name of [
+      'code-reviewer',
+      'superpowers:systematic-debugging',
+      'browser-use:control-browser',
+      'control-browser'
+    ]) {
+      expect(catalog[name.toLowerCase()]).toBe(true)
+    }
+    // 目录之外的系统提示内容不会被误收
+    expect(catalog['you are a coding assistant.']).toBeUndefined()
+    expect(parseSkillCatalog('no catalog here')).toBeNull()
+  })
+
+  it('无目录时仅 skill-format=true 仍可判技能（原有精确路径不受影响）', () => {
+    const skills = parseCommandMarkers(
+      '<command-message>linter</command-message>\n<skill-format>true</skill-format>\nRun eslint'
+    )
+    expect(skills[0]).toMatchObject({
+      promptKind: 'skill_invocation',
+      detectionType: 'skill_command_marker',
+      classificationReason: 'skill_format_marker'
+    })
+  })
+
+  it('命令正文有界提取：前置 hook 噪音不进入正文（asc-sql-check/CAVEMAN 取证）', () => {
+    const noisyText = `SessionStart:startup hook success: CAVEMAN MODE ACTIVE — level: full
+${'hook output line\n'.repeat(500)}
+<command-message>asc-sql-check</command-message>
+<command-name>/asc-sql-check</command-name>
+<command-args></command-args>
+
+skill body for asc sql check`
+
+    const skills = parseCommandMarkers(noisyText, { 'asc-sql-check': true })
+    expect(skills[0].promptKind).toBe('skill_invocation')
+    expect(skills[0].body.startsWith('<command-message>asc-sql-check')).toBe(true)
+    expect(skills[0].body).not.toContain('CAVEMAN MODE')
+    expect(skills[0].body).toContain('skill body for asc sql check')
+
+    // 普通命令的正文截断到最后一个闭合标签
+    const commandSkills = parseCommandMarkers(`User: ${CLEAR_COMMAND}`)
+    expect(commandSkills[0].promptKind).toBe('command_invocation')
+    expect(commandSkills[0].body).not.toContain('User:')
+    expect(commandSkills[0].body).toContain('<command-message>clear</command-message>')
+  })
+
+  it('工具结果形状的文本块归 tool_result_context，不产生明文记录', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const toolResultText = `Result of calling the Read tool:
+<system-reminder>The file has been read recently</system-reminder>
+${'file content line\n'.repeat(2000)}`
+
+    const request = {
+      messages: [{ role: 'user', content: [{ type: 'text', text: toolResultText }] }]
+    }
+    const { summary, skillRecords } = analyzer.analyze(request, sessionInfo(), 'key-1')
+    expect(summary.skill_detected).toBe(false)
+    expect(summary.system_reminder_detected).toBe(false)
+    expect(summary.tool_result_context_chars).toBe(toolResultText.length)
+    expect(skillRecords).toHaveLength(0)
+  })
+
+  it('通用 reminder 记录只保留前缀采样，不落全文', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const reminderBody = `${'Runtime guidance padding '.repeat(100)}`
+    const request = {
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: `<system-reminder>${reminderBody}</system-reminder>` }]
+        }
+      ]
+    }
+    const { skillRecords } = analyzer.analyze(request, sessionInfo(), 'key-1')
+    expect(skillRecords).toHaveLength(1)
+    expect(skillRecords[0].prompt).toBeNull()
+    expect(skillRecords[0].prompt_prefix).not.toBeNull()
+    expect(skillRecords[0].prompt_prefix.length).toBeLessThanOrEqual(200)
+  })
+
+  it('结构性 tool_result 块字符量单独统计，不进入扫描预算', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const request = {
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 't1', content: 'x'.repeat(300) },
+            {
+              type: 'tool_result',
+              tool_use_id: 't2',
+              content: [{ type: 'text', text: 'y'.repeat(200) }]
+            },
+            { type: 'text', text: 'plain text' }
+          ]
+        }
+      ]
+    }
+    const { summary } = analyzer.analyze(request, sessionInfo(), 'key-1')
+    expect(summary.tool_result_chars_current).toBe(500)
+    expect(summary.system_prompt_chars).toBe(0)
+  })
+
+  it('上下文构成字段拆分 current/added/carried/rehydrated', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const skill1 =
+      '<system-reminder><command-message>skill-one</command-message><skill-format>true</skill-format>AAAA</system-reminder>'
+    const skill2 =
+      '<system-reminder><command-message>skill-two</command-message><skill-format>true</skill-format>BBBB</system-reminder>'
+
+    analyzer.analyze(
+      { messages: [{ role: 'user', content: [{ type: 'text', text: skill1 }] }] },
+      sessionInfo(),
+      'key-1'
+    )
+    const result = analyzer.analyze(
+      {
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: skill1 }] },
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: [{ type: 'text', text: skill2 }] }
+        ]
+      },
+      sessionInfo(),
+      'key-1'
+    )
+
+    const added = result.skillRecords.find((r) => r.skill_name === 'skill-two').skill_chars
+    expect(result.summary.skill_context_chars_added).toBe(added)
+    expect(result.summary.skill_context_chars_current).toBe(
+      result.summary.skill_context_chars_added + result.summary.skill_context_chars_carried
+    )
+    expect(result.summary.skill_context_chars_current).toBe(result.summary.skill_chars)
+    expect(result.summary.active_skill_content_hashes).toHaveLength(2)
+  })
+
+  it('记录携带 message_index、content_hash、首见请求与存活轮数', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const skill =
+      '<system-reminder><command-message>linter</command-message><skill-format>true</skill-format>Body</system-reminder>'
+    const request = (extraMessages) => ({
+      messages: [
+        { role: 'user', content: 'human prompt' },
+        { role: 'user', content: [{ type: 'text', text: skill }] },
+        ...(extraMessages || [])
+      ]
+    })
+
+    const first = analyzer.analyze(request(), sessionInfo(), 'key-1', null, {
+      requestId: 'req-first'
+    })
+    expect(first.skillRecords[0]).toMatchObject({
+      message_index: 1,
+      content_first_seen_request_id: 'req-first',
+      active_age_requests: 1
+    })
+    expect(first.skillRecords[0].content_hash).toMatch(/^[0-9a-f]{64}$/)
+
+    // 相同位置延续：不写记录；seen 表的 firstSeen 保留
+    const second = analyzer.analyze(request(), sessionInfo(), 'key-1', null, {
+      requestId: 'req-second'
+    })
+    expect(second.skillRecords).toHaveLength(0)
+
+    // 消失后重新出现：re_injected 记录沿用首见请求，age 增长
+    analyzer.analyze({ messages: [{ role: 'user', content: 'compacted' }] }, sessionInfo(), 'key-1')
+    const fourth = analyzer.analyze(request(), sessionInfo(), 'key-1', null, {
+      requestId: 'req-fourth'
+    })
+    expect(fourth.skillRecords[0]).toMatchObject({
+      skill_injection_kind: 're_injected',
+      content_first_seen_request_id: 'req-first',
+      active_age_requests: 4
+    })
+  })
+
+  it('命令调用参与位置去重，延续请求不重复写记录', () => {
+    const analyzer = new SkillPromptAnalyzer()
+    const request = (extra) => ({
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: CLEAR_COMMAND }] },
+        ...(extra || [])
+      ]
+    })
+
+    const first = analyzer.analyze(request(), sessionInfo(), 'key-1')
+    expect(first.skillRecords).toHaveLength(1)
+    const second = analyzer.analyze(
+      request([
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'next' }
+      ]),
+      sessionInfo(),
+      'key-1'
+    )
+    expect(second.skillRecords).toHaveLength(0)
+    expect(second.summary.command_invocation_count).toBe(1)
+    expect(second.summary.command_invocation_newly_count).toBe(0)
   })
 })
