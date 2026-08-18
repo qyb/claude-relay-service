@@ -2000,6 +2000,8 @@ class ClaudeRelayService {
 
         // 错误响应处理
         if (res.statusCode !== 200) {
+          let rateLimitResetTimestamp = null
+          let dedicatedRateLimitMessage = null
           if (res.statusCode === 429) {
             const resetHeader = res.headers
               ? res.headers['anthropic-ratelimit-unified-reset']
@@ -2035,37 +2037,14 @@ class ClaudeRelayService {
                 return
               }
             } else {
-              const rateLimitResetTimestamp = Number.isNaN(parsedResetTimestamp)
+              rateLimitResetTimestamp = Number.isNaN(parsedResetTimestamp)
                 ? null
                 : parsedResetTimestamp
-              await unifiedClaudeScheduler.markAccountRateLimited(
-                accountId,
-                accountType,
-                sessionHash,
-                rateLimitResetTimestamp,
-                requestOptions.gatewayRequestId,
-                { upstreamStatusCode: 429 }
-              )
-              logger.warn(`🚫 [Stream] Rate limit detected for account ${accountId}, status 429`)
 
               if (isDedicatedOfficialAccount) {
-                const limitMessage = this._buildStandardRateLimitMessage(
+                dedicatedRateLimitMessage = this._buildStandardRateLimitMessage(
                   rateLimitResetTimestamp || account?.rateLimitEndAt
                 )
-                if (!responseStream.headersSent) {
-                  responseStream.status(403)
-                  responseStream.setHeader('Content-Type', 'application/json')
-                }
-                responseStream.write(
-                  JSON.stringify({
-                    error: 'upstream_rate_limited',
-                    message: limitMessage
-                  })
-                )
-                responseStream.end()
-                res.resume()
-                resolve()
-                return
               }
             }
           }
@@ -2256,6 +2235,35 @@ class ClaudeRelayService {
                 upstreamRequestId: upstreamErrorDetails.upstreamRequestId,
                 apiUrl: account?.apiUrl || null
               })
+            }
+            if (res.statusCode === 429 && !isOpusModelRequest) {
+              // 必须在错误体读取完成后再记录生命周期事件，否则智谱等上游的
+              // 错误码和脱敏模板会永久丢失。
+              await unifiedClaudeScheduler.markAccountRateLimited(
+                accountId,
+                accountType,
+                sessionHash,
+                rateLimitResetTimestamp,
+                requestOptions.gatewayRequestId,
+                upstreamErrorDetails
+              )
+              logger.warn(`🚫 [Stream] Rate limit detected for account ${accountId}, status 429`)
+
+              if (dedicatedRateLimitMessage) {
+                if (!responseStream.headersSent) {
+                  responseStream.status(403)
+                  responseStream.setHeader('Content-Type', 'application/json')
+                }
+                responseStream.write(
+                  JSON.stringify({
+                    error: 'upstream_rate_limited',
+                    message: dedicatedRateLimitMessage
+                  })
+                )
+                responseStream.end()
+                resolve()
+                return
+              }
             }
             if (
               this._isClaudeCodeCredentialError(errorData) &&

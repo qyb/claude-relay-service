@@ -169,8 +169,9 @@ class LlmRequestObserver {
     }
     if (outcome.status === 'timeout' || outcome.status === 'error') {
       this.failureStage = this.failureStage ?? 'queue'
-      this.errorCode = this.errorCode ?? 'queue_timeout'
-      this.errorType = this.errorType ?? 'queue_timeout'
+      const queueError = outcome.status === 'error' ? 'queue_backend_error' : 'queue_timeout'
+      this.errorCode = this.errorCode ?? queueError
+      this.errorType = this.errorType ?? queueError
     }
     return this
   }
@@ -184,6 +185,10 @@ class LlmRequestObserver {
       return this
     }
     this.attemptEventCount += 1
+    const extracted =
+      details.upstreamErrorBody !== undefined && details.upstreamErrorBody !== null
+        ? extractUpstreamErrorFields(details.upstreamErrorBody)
+        : {}
     recordUpstreamTelemetry('upstream_attempt', {
       gatewayRequestId: this.context.gatewayRequestId,
       attemptNumber: this.attemptEventCount,
@@ -196,9 +201,10 @@ class LlmRequestObserver {
       upstreamLatencyMs: details.upstreamLatencyMs ?? null,
       upstreamStatusCode: details.upstreamStatusCode ?? null,
       success: details.success === true,
-      upstreamErrorType: details.upstreamErrorType ?? null,
-      upstreamErrorCode: details.upstreamErrorCode ?? null,
-      upstreamMessageTemplate: details.upstreamMessageTemplate ?? null,
+      upstreamErrorType: details.upstreamErrorType ?? extracted.upstreamErrorType ?? null,
+      upstreamErrorCode: details.upstreamErrorCode ?? extracted.upstreamErrorCode ?? null,
+      upstreamMessageTemplate:
+        details.upstreamMessageTemplate ?? extracted.upstreamMessageTemplate ?? null,
       upstreamRequestId: details.upstreamRequestId ?? null,
       usage: details.usage ?? null,
       apiUrl: details.apiUrl ?? this.apiUrl

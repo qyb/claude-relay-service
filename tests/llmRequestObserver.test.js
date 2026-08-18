@@ -693,6 +693,19 @@ describe('LLM request observation lifecycle', () => {
       error_code: 'queue_timeout',
       gateway_status_code: 503
     })
+
+    const backendReq = buildRequest({ requestId: 'gateway-queue-backend-error' })
+    const backendRes = new FakeResponse()
+    const backendObserver = startLlmRequestObservation(backendReq, backendRes)
+    backendObserver.observeQueue({ status: 'error' })
+    backendRes.statusCode = 500
+    backendRes.emit('finish')
+
+    expect(logger.telemetry.mock.calls[2][0]).toMatchObject({
+      failure_stage: 'queue',
+      error_code: 'queue_backend_error',
+      gateway_status_code: 500
+    })
   })
 
   it('observeAttempt 逐次落盘 upstream_attempt 并自增序号，telemetry 关闭时不落盘', () => {
@@ -706,7 +719,8 @@ describe('LLM request observation lifecycle', () => {
       accountId: 'account-1',
       upstreamStatusCode: 403,
       success: false,
-      upstreamLatencyMs: 320
+      upstreamLatencyMs: 320,
+      upstreamErrorBody: '{"error":{"code":"1302","message":"请求 42 的账户已达到速率限制"}}'
     })
     observer.noteRetry('upstream_403')
     observer.observeAttempt({
@@ -725,7 +739,9 @@ describe('LLM request observation lifecycle', () => {
       attempt_number: 1,
       account_id: 'account-1',
       upstream_status_code: 403,
-      success: false
+      success: false,
+      upstream_error_code: '1302',
+      upstream_message_template: '请求 <n> 的账户已达到速率限制'
     })
     expect(attemptEvents[1]).toMatchObject({
       attempt_number: 2,
