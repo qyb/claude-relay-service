@@ -42,7 +42,7 @@ describe('regional model pricing', () => {
     expect(pricing.output_cost_per_token).toBeCloseTo((14 * 0.1483) / 1000000)
   })
 
-  it('uses glm-5.2 pricing as provisional pricing for glm-5.3', () => {
+  it('uses official glm-5.3 pricing in the international region', () => {
     const result = pricingService.calculateCost(
       { input_tokens: 1000000, output_tokens: 0 },
       'glm-5.3',
@@ -50,8 +50,8 @@ describe('regional model pricing', () => {
     )
 
     expect(result.hasPricing).toBe(true)
-    expect(result.pricing_model).toBe('glm-5.2')
-    expect(result.provisionalPricing).toBe(true)
+    expect(result.pricing_model).toBe('glm-5.3')
+    expect(result.provisionalPricing).toBe(false)
     expect(result.totalCost).toBeCloseTo(1.4)
   })
 

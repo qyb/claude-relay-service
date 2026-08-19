@@ -24,7 +24,7 @@ LiteLLM model_prices_and_context_window.json（社区维护，美元）
 | 缓存价自动补全比例错误 | `ensureCachePricing` 对缺缓存价格条目默认按 Anthropic 比例填（写 1.25× / 读 **0.1×**）；GLM 实际按模型和阶梯为 **20%~25%**（CN），或 **~18.6%~20%**（intl） |
 | 计价模型名不一致 | 存在上游模型重定向：`glm-4.5-air → glm-4.7`（1,461/1,461，100%）、`claude-sonnet-4 / claude-opus-4-7 / claude-sonnet-4-6 → glm-4.7`、`glm-5 / glm-5.1 → glm-5.2`。按请求模型计价会用错价目条目 |
 | 成本无基线 | telemetry `cost` 全为 null；api-key 成本统计对 GLM 流量失真 |
-| 新模型暂无报价 | 生产已观测到 `glm-5.3` 成功响应，但官方价格页暂无报价；临时按 `glm-5.2` 价格计费，并必须标记为临时价格 |
+| 新模型价格同步 | 生产已观测到 `glm-5.3` 成功响应；国内与国际官方价格均已发布，并已纳入独立价格条目 |
 
 ### 1.3 两套官方报价（互相独立，非汇率换算）
 
@@ -34,6 +34,7 @@ LiteLLM model_prices_and_context_window.json（社区维护，美元）
 
 | 模型 | 阶梯条件（官网原始记法） | 输入 ¥/M | 输出 ¥/M | 缓存命中 ¥/M |
 |---|---|---:|---:|---:|
+| GLM-5.3 | 统一价格，1M 上下文 | 8 | 28 | 2 |
 | GLM-5.2 | 统一价格，1M 上下文 | 8 | 28 | 2 |
 | GLM-5.1 | 输入长度 `[0, 32)` | 6 | 24 | 1.3 |
 | GLM-5.1 | 输入长度 `[32, +)` | 8 | 28 | 2 |
@@ -54,6 +55,7 @@ LiteLLM model_prices_and_context_window.json（社区维护，美元）
 
 | 模型 | Intl 输入 $/M | Intl 缓存命中 $/M | Intl 输出 $/M |
 |---|---:|---:|---:|
+| GLM-5.3 | 1.4 | 0.26 | 4.4 |
 | GLM-5.2 | 1.4 | 0.26 | 4.4 |
 | GLM-5.1 | 1.4 | 0.26 | 4.4 |
 | GLM-5 | 1.0 | 0.20 | 3.2 |
@@ -63,7 +65,7 @@ LiteLLM model_prices_and_context_window.json（社区维护，美元）
 
 来源：大陆版 <https://bigmodel.cn/pricing>，国际版 <https://docs.z.ai/guides/overview/pricing>。国际版价格页明确列出 `GLM-4.5-Air` 为 `$0.2 / $0.03 / $1.1`。Intl 缓存存储费限时免费；CN 缓存/输入比按阶梯为 20%~25%，不再使用单一的 25% 假设。
 
-生产日志已观测到新模型 `glm-5.3`，但国际版和大陆版官方价格页暂未提供其报价。在正式报价发布前，`glm-5.3` 通过显式计费别名临时复用 `glm-5.2` 的对应 region 价格；该别名只影响成本查找，不改变 telemetry 中记录的真实响应模型名，并在成本结果中标记 `provisionalPricing=true`。
+官方价格页现已提供 `glm-5.3` 报价，国内与国际价格均与 `glm-5.2` 一致。价格表使用独立的 `glm-5.3` 模型条目，不再通过临时计费别名复用；成本结果中的 `provisionalPricing` 对该模型为 `false`。
 
 ## 二、设计
 
@@ -88,9 +90,7 @@ LiteLLM model_prices_and_context_window.json（社区维护，美元）
       "to_reporting": 1
     }
   },
-  "pricing_aliases": {
-    "glm-5.3": "glm-5.2"
-  },
+  "pricing_aliases": {},
   "models": {
     "glm-5.2": {
       "cn": {
@@ -187,7 +187,7 @@ LiteLLM model_prices_and_context_window.json（社区维护，美元）
 - **`tiers` 必填**。每个 region 至少有一个价格阶梯；`when` 为空表示统一价格，多个阶梯使用半开区间，边界不得重叠或留空。
 - **`cache_storage` 单独记录**。`limited_time_free` 不是永久免费承诺，价格状态变化时必须更新版本并重新核对。
 - **`redirects` 记录已知的上游重定向**，用于补齐历史数据回算与告警比对（见 2.3）。
-- **`pricing_aliases` 记录临时计价复用关系**，与 `redirects` 分开。`glm-5.3 → glm-5.2` 只表示价格复用，不表示上游实际发生了模型重定向；查找结果必须带 `provisionalPricing=true`，官方报价发布后删除该别名并递增版本。
+- **`pricing_aliases` 仅记录临时计价复用关系**，与 `redirects` 分开。官方价格发布后应删除对应别名，改为维护独立模型条目，并递增版本。
 - `null` 表示待补录；待补录条目参与查找时按"缺价"处理（见 2.4），不得猜测填充。阶梯单位无法确认时同样按缺价处理，不得把官网展示值直接当作 tokens 比较。
 
 ### 2.2 region 判定
@@ -204,7 +204,7 @@ LiteLLM model_prices_and_context_window.json（社区维护，美元）
 
 ```
 1. 覆盖表 [served_model][region]        ← 命中即返回（含 currency）
-2. `pricing_aliases[served_model]` 对应的覆盖表 [pricing_model][region] ← 命中即返回，并标记 `provisionalPricing=true`
+2. `pricing_aliases[served_model]` 对应的覆盖表 [pricing_model][region] ← 仅临时别名命中时返回，并标记 `provisionalPricing=true`
 3. 覆盖表模型但 region/tier 缺失         ← 直接按缺价处理，不进入 LiteLLM
 4. 非覆盖表模型才进入现有 LiteLLM 匹配逻辑 ← Claude 等其它模型不受影响
 5. 都未命中 → 记 hasPricing=false，成本记 0，warn 日志 + 计数指标
@@ -234,7 +234,7 @@ LiteLLM model_prices_and_context_window.json（社区维护，美元）
 ### 2.4 缺价处理：宁缺勿错
 
 - `MODEL_PRICING.unknown`（Claude Sonnet 价）**不得再作为 GLM/未知模型的兜底**。缺价时成本记 0、`hasPricing: false`，并打 warn 日志 + 暴露计数指标（按模型名维度），确保缺价条目会被发现并补录。
-- `pricing_aliases` 是唯一允许的临时复用例外。命中 `glm-5.3 → glm-5.2` 时成本可以计算，但必须同时记录 `pricing_model: "glm-5.2"`、`provisionalPricing: true`，并暴露临时计价模型指标；不得把该别名当作正式报价或上游重定向。
+- `pricing_aliases` 是唯一允许的临时复用例外。正式报价模型必须使用自身的价格条目，不得把价格相同误记为上游重定向。
 - `ensureCachePricing` 的自动补全**仅对 anthropic 系 provider 生效**；覆盖表模型的缓存价必须显式录入，缺失视为缺价（同上处理）。
 - 价格配置加载失败会缓存到当前文件 mtime；文件修复或替换后下一次读取会自动重试并热加载，无需重启进程。
 
@@ -259,7 +259,7 @@ cost_usd = cost_native × exchange_rates[pricing.currency].to_reporting
 ## 三、实施顺序
 
 1. **已完成 P0**：覆盖表落地（Intl 单价和 CN 阶梯价），`getModelPricing` 接入 region 查找；覆盖表模型 miss 时不再进入 LiteLLM。
-2. **已完成 P0**：计价改用响应模型名；telemetry 增加 `requested_model`、`pricing_region`；支持 `glm-5.3` 临时计价别名并标记 provisional。
+2. **已完成 P0**：计价改用响应模型名；telemetry 增加 `requested_model`、`pricing_region`；`glm-5.3` 已切换为正式独立价格条目。
 3. **已完成 P1**：实现阶梯条件归一化、边界匹配和配置区间校验；`ensureCachePricing` 仅对 Anthropic provider 生效。
 4. **已完成 P1**：`cost` 回填、缺价计数及管理端 `/pricing/missing-counts` 诊断接口上线。
 5. **已完成 P2**：价格表来源、核对日期、汇率、热加载策略和单测锁值已落地；后续价格变更继续按“改表 → 单测 → 版本号递增”执行。
@@ -275,7 +275,7 @@ cost_usd = cost_native × exchange_rates[pricing.currency].to_reporting
 
 1. 抽取生产一天流量重算成本，`glm-4.5-air` 请求 100% 按 glm-4.7 价格计（验证响应模型名规则生效）。
 2. 锁定大陆版价格：`glm-5.2` 输入/缓存/输出必须为 `8/2/28`；`glm-5-turbo` 的 `<32K` 和 `≥32K` 两档必须分别为 `5/1.2/22`、`7/1.8/26`。
-3. 验证 `glm-5.3` 在 cn/intl 均复用 `glm-5.2` 价格，结果带 `pricing_model: "glm-5.2"` 和 `provisionalPricing:true`，telemetry 的 `model` 仍为 `glm-5.3`。
+3. 验证 `glm-5.3` 在 cn/intl 使用自身正式价格条目，结果带 `pricing_model: "glm-5.3"` 和 `provisionalPricing:false`，telemetry 的 `model` 仍为 `glm-5.3`。
 4. 验证阶梯边界：`32K` 不得落入 `[0,32)`；`GLM-4.7` 输出 `0.2` 必须落入 `[0.2,+)`；无匹配和重叠匹配都必须告警并按缺价处理。
 5. 构造缺价模型请求，确认返回 `hasPricing:false`、成本 0、warn 日志出现，而非 Sonnet 兜底价。
 6. 混合 cn/intl 账号的请求各算一例，手工核对 USD 折算；CN 价格乘 `0.1483`，Intl 价格不换算。
