@@ -6,9 +6,17 @@
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
 const sessionHelper = require('../utils/sessionHelper')
+const {
+  PEAK_TRAFFIC_WINDOW,
+  formatPeakTrafficWindow
+} = require('../utils/concurrencyLimitMultiple')
 
 const CONFIG_KEY = 'claude_relay_config'
 const SESSION_BINDING_PREFIX = 'original_session_binding:'
+const getPeakTrafficWindowConfig = () => ({
+  ...PEAK_TRAFFIC_WINDOW,
+  displayLabel: formatPeakTrafficWindow(PEAK_TRAFFIC_WINDOW)
+})
 
 // 默认配置
 const DEFAULT_CONFIG = {
@@ -30,6 +38,8 @@ const DEFAULT_CONFIG = {
   // 排队健康检查配置
   concurrentRequestQueueHealthCheckEnabled: true, // 是否启用排队健康检查（默认开启）
   concurrentRequestQueueHealthThreshold: 0.8, // 健康检查阈值（P90 >= 超时 × 阈值时拒绝新请求）
+  // API Key 并发接入系数（百分比）。低于 100% 时，未配置并发限制的 Key 会被拒绝。
+  concurrencyLimitMultiple: 100,
   updatedAt: null,
   updatedBy: null
 }
@@ -69,22 +79,26 @@ class ClaudeRelayConfigService {
       const client = redis.getClient()
       if (!client) {
         logger.warn('⚠️ Redis not connected, using default config')
-        return { ...DEFAULT_CONFIG }
+        return { ...DEFAULT_CONFIG, peakTrafficWindow: getPeakTrafficWindowConfig() }
       }
 
       const data = await client.get(CONFIG_KEY)
 
       if (data) {
-        configCache = { ...DEFAULT_CONFIG, ...JSON.parse(data) }
+        configCache = {
+          ...DEFAULT_CONFIG,
+          ...JSON.parse(data),
+          peakTrafficWindow: getPeakTrafficWindowConfig()
+        }
       } else {
-        configCache = { ...DEFAULT_CONFIG }
+        configCache = { ...DEFAULT_CONFIG, peakTrafficWindow: getPeakTrafficWindowConfig() }
       }
 
       configCacheTime = Date.now()
       return configCache
     } catch (error) {
       logger.error('❌ Failed to get Claude relay config:', error)
-      return { ...DEFAULT_CONFIG }
+      return { ...DEFAULT_CONFIG, peakTrafficWindow: getPeakTrafficWindowConfig() }
     }
   }
 

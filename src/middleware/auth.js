@@ -9,6 +9,12 @@ const ClientValidator = require('../validators/clientValidator')
 const ClaudeCodeValidator = require('../validators/clients/claudeCodeValidator')
 const claudeRelayConfigService = require('../services/claudeRelayConfigService')
 const { calculateWaitTimeStats } = require('../utils/statsHelper')
+const {
+  normalizeConcurrencyLimitMultiple,
+  getEffectiveConcurrencyLimit,
+  getPeakConcurrencyOverride,
+  formatPeakTrafficResumeTime
+} = require('../utils/concurrencyLimitMultiple')
 
 // 工具函数
 function sleep(ms) {
@@ -560,9 +566,50 @@ const authenticateApiKey = async (req, res, next) => {
       }
     }
 
-    // 检查并发限制
-    const concurrencyLimit = validation.keyData.concurrencyLimit || 0
-    if (!skipKeyRestrictions && concurrencyLimit > 0) {
+    // 峰值窗口内使用管理员配置的并发接入系数；窗口外始终维持 100%。
+    // 系数低于 100% 时，未设并发限制的 Key 无法被削峰，因此直接拒绝。
+    const queueConfig = await claudeRelayConfigService.getConfig()
+    const peakConcurrencyOverride = getPeakConcurrencyOverride(
+      new Date(),
+      queueConfig.peakTrafficWindow
+    )
+    const concurrencyLimitMultiple = peakConcurrencyOverride
+      ? normalizeConcurrencyLimitMultiple(queueConfig.concurrencyLimitMultiple)
+      : 100
+    const configuredConcurrencyLimit = Number(validation.keyData.concurrencyLimit) || 0
+
+    if (concurrencyLimitMultiple === 0) {
+      res.set('Retry-After', String(peakConcurrencyOverride.retryAfterSeconds))
+      logger.security(
+        `🚦 API access paused by concurrency multiple for key: ${validation.keyData.id} (${validation.keyData.name})`
+      )
+      return res.status(429).json({
+        error: 'Service temporarily unavailable',
+        message: `服务高峰期暂停接入，请于 ${formatPeakTrafficResumeTime(queueConfig.peakTrafficWindow)} 后再试。`,
+        concurrencyLimitMultiple,
+        retryAfterSeconds: peakConcurrencyOverride.retryAfterSeconds
+      })
+    }
+
+    if (concurrencyLimitMultiple < 100 && configuredConcurrencyLimit <= 0) {
+      logger.security(
+        `🚦 API key without concurrency limit rejected during traffic reduction: ${validation.keyData.id} (${validation.keyData.name})`
+      )
+      return res.status(429).json({
+        error: 'Concurrency limit required',
+        message: '当前处于削峰期，请让管理员正确设定并发限制。',
+        concurrencyLimitMultiple
+      })
+    }
+
+    const concurrencyLimit = getEffectiveConcurrencyLimit(
+      configuredConcurrencyLimit,
+      concurrencyLimitMultiple
+    )
+    const shouldEnforceConcurrency = !skipKeyRestrictions || concurrencyLimitMultiple < 100
+
+    // 检查并发限制。削峰期间令 token count 请求也受限，确保所有上游调用被削峰。
+    if (shouldEnforceConcurrency && concurrencyLimit > 0) {
       const { leaseSeconds: configLeaseSeconds, renewIntervalSeconds: configRenewIntervalSeconds } =
         resolveConcurrencyConfig()
       const leaseSeconds = Math.max(Number(configLeaseSeconds) || 300, 30)
@@ -644,8 +691,6 @@ const authenticateApiKey = async (req, res, next) => {
         concurrencyCleanup = null
 
         // 2. 获取排队配置
-        const queueConfig = await claudeRelayConfigService.getConfig()
-
         // 3. 排队功能未启用，直接返回 429（保持现有行为）
         if (!queueConfig.concurrentRequestQueueEnabled) {
           logger.security(

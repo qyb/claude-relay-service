@@ -902,6 +902,44 @@
             <div
               class="mb-6 rounded-lg bg-white/80 p-6 shadow-lg backdrop-blur-sm dark:bg-gray-800/80"
             >
+              <div class="flex items-center">
+                <div
+                  class="flex h-12 w-12 items-center justify-center rounded-lg bg-gradient-to-r from-amber-500 to-orange-500 text-white shadow-lg"
+                >
+                  <i class="fas fa-gauge-high text-xl"></i>
+                </div>
+                <div class="ml-4">
+                  <h4 class="text-lg font-semibold text-gray-900 dark:text-white">并发接入系数</h4>
+                  <p class="text-sm text-gray-500 dark:text-gray-400">
+                    在高峰期按比例缩减各 API Key 的并发能力
+                  </p>
+                </div>
+              </div>
+              <div class="mt-6">
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                  接入比例（%）
+                </label>
+                <input
+                  v-model.number="claudeConfig.concurrencyLimitMultiple"
+                  class="mt-1 block w-full max-w-xs rounded-lg border border-gray-300 bg-white px-3 py-2 shadow-sm focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 dark:border-gray-500 dark:bg-gray-700 dark:text-white sm:text-sm"
+                  max="100"
+                  min="0"
+                  step="1"
+                  type="number"
+                  @change="saveClaudeConfig"
+                />
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  仅在每日
+                  {{ claudeConfig.peakTrafficWindow?.displayLabel || '峰值' }} 窗口生效：100%
+                  保持原并发；低于 100% 时按向上取整缩减，未设置并发限制的 Key 返回 429；0% 时所有
+                  API Key 请求直接返回 429。窗口外始终按 100% 提供服务。
+                </p>
+              </div>
+            </div>
+
+            <div
+              class="mb-6 rounded-lg bg-white/80 p-6 shadow-lg backdrop-blur-sm dark:bg-gray-800/80"
+            >
               <div class="flex items-center justify-between">
                 <div class="flex items-center">
                   <div
@@ -1684,6 +1722,8 @@ const claudeConfig = ref({
   concurrentRequestQueueMaxSize: 3,
   concurrentRequestQueueMaxSizeMultiplier: 0,
   concurrentRequestQueueTimeoutMs: 10000,
+  concurrencyLimitMultiple: 100,
+  peakTrafficWindow: null,
   updatedAt: null,
   updatedBy: null
 })
@@ -1961,6 +2001,8 @@ const loadClaudeConfig = async () => {
         concurrentRequestQueueMaxSizeMultiplier:
           response.config?.concurrentRequestQueueMaxSizeMultiplier ?? 0,
         concurrentRequestQueueTimeoutMs: response.config?.concurrentRequestQueueTimeoutMs ?? 10000,
+        concurrencyLimitMultiple: response.config?.concurrencyLimitMultiple ?? 100,
+        peakTrafficWindow: response.config?.peakTrafficWindow ?? null,
         updatedAt: response.config?.updatedAt || null,
         updatedBy: response.config?.updatedBy || null
       }
@@ -1993,7 +2035,8 @@ const saveClaudeConfig = async () => {
       concurrentRequestQueueMaxSize: claudeConfig.value.concurrentRequestQueueMaxSize,
       concurrentRequestQueueMaxSizeMultiplier:
         claudeConfig.value.concurrentRequestQueueMaxSizeMultiplier,
-      concurrentRequestQueueTimeoutMs: claudeConfig.value.concurrentRequestQueueTimeoutMs
+      concurrentRequestQueueTimeoutMs: claudeConfig.value.concurrentRequestQueueTimeoutMs,
+      concurrencyLimitMultiple: claudeConfig.value.concurrencyLimitMultiple
     }
 
     const response = await apiClient.put('/admin/claude-relay-config', payload, {

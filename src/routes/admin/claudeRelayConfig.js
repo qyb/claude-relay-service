@@ -47,7 +47,8 @@ router.put('/claude-relay-config', authenticateAdmin, async (req, res) => {
       concurrentRequestQueueEnabled,
       concurrentRequestQueueMaxSize,
       concurrentRequestQueueMaxSizeMultiplier,
-      concurrentRequestQueueTimeoutMs
+      concurrentRequestQueueTimeoutMs,
+      concurrencyLimitMultiple
     } = req.body
 
     // 验证输入
@@ -162,6 +163,18 @@ router.put('/claude-relay-config', authenticateAdmin, async (req, res) => {
       }
     }
 
+    if (concurrencyLimitMultiple !== undefined) {
+      if (
+        !Number.isFinite(concurrencyLimitMultiple) ||
+        concurrencyLimitMultiple < 0 ||
+        concurrencyLimitMultiple > 100
+      ) {
+        return res.status(400).json({
+          error: 'concurrencyLimitMultiple must be a finite number between 0 and 100'
+        })
+      }
+    }
+
     const updateData = {}
     if (claudeCodeOnlyEnabled !== undefined) {
       updateData.claudeCodeOnlyEnabled = claudeCodeOnlyEnabled
@@ -195,6 +208,9 @@ router.put('/claude-relay-config', authenticateAdmin, async (req, res) => {
     }
     if (concurrentRequestQueueTimeoutMs !== undefined) {
       updateData.concurrentRequestQueueTimeoutMs = concurrentRequestQueueTimeoutMs
+    }
+    if (concurrencyLimitMultiple !== undefined) {
+      updateData.concurrencyLimitMultiple = concurrencyLimitMultiple
     }
 
     const updatedConfig = await claudeRelayConfigService.updateConfig(
