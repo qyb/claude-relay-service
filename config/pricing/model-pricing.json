@@ -1,5 +1,5 @@
 {
-  "version": "2026.08.19",
+  "version": "2026.08.27",
   "reporting_currency": "USD",
   "sources": {
     "cn": "https://bigmodel.cn/pricing",
@@ -23,6 +23,38 @@
     "glm-5.1": "glm-5.2"
   },
   "models": {
+    "glm-5.3-flash": {
+      "cn": {
+        "currency": "CNY",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": null
+        },
+        "tiers": [
+          {
+            "when": {},
+            "input": 0.8,
+            "cached": 0.23,
+            "output": 2.8
+          }
+        ]
+      },
+      "intl": {
+        "currency": "USD",
+        "unit": "per_1m_tokens",
+        "cache_storage": {
+          "price": null
+        },
+        "tiers": [
+          {
+            "when": {},
+            "input": 0.15,
+            "cached": 0.03,
+            "output": 0.5
+          }
+        ]
+      }
+    },
     "glm-5.3": {
       "cn": {
         "currency": "CNY",
