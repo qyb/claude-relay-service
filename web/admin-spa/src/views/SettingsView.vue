@@ -948,7 +948,8 @@
                 ></textarea>
                 <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
                   可使用空格、换行、逗号或分号分隔。推广模型在高峰期不应用接入比例，但仍受 API Key
-                  原始并发限制；模型名采用不区分大小写的精确匹配。
+                  原始并发限制；最多配置 5 个，每个模型名最多 25
+                  个字符，采用不区分大小写的精确匹配。
                 </p>
               </div>
             </div>
@@ -2039,6 +2040,9 @@ const loadClaudeConfig = async () => {
   }
 }
 
+const MAX_PROMOTION_MODELS = 5
+const MAX_PROMOTION_MODEL_LENGTH = 25
+
 const parsePromotionModels = (input) => {
   const seen = new Set()
   return String(input || '')
@@ -2056,6 +2060,16 @@ const parsePromotionModels = (input) => {
 const saveClaudeConfig = async () => {
   if (!isMounted.value) return
   try {
+    const promotionModels = parsePromotionModels(claudeConfig.value.promotionModelsInput)
+    if (promotionModels.length > MAX_PROMOTION_MODELS) {
+      showToast(`推广模型最多配置 ${MAX_PROMOTION_MODELS} 个`, 'error')
+      return
+    }
+    if (promotionModels.some((model) => model.length > MAX_PROMOTION_MODEL_LENGTH)) {
+      showToast(`每个推广模型名最多 ${MAX_PROMOTION_MODEL_LENGTH} 个字符`, 'error')
+      return
+    }
+
     const payload = {
       claudeCodeOnlyEnabled: claudeConfig.value.claudeCodeOnlyEnabled,
       globalSessionBindingEnabled: claudeConfig.value.globalSessionBindingEnabled,
@@ -2070,7 +2084,7 @@ const saveClaudeConfig = async () => {
         claudeConfig.value.concurrentRequestQueueMaxSizeMultiplier,
       concurrentRequestQueueTimeoutMs: claudeConfig.value.concurrentRequestQueueTimeoutMs,
       concurrencyLimitMultiple: claudeConfig.value.concurrencyLimitMultiple,
-      promotionModels: parsePromotionModels(claudeConfig.value.promotionModelsInput)
+      promotionModels
     }
 
     const response = await apiClient.put('/admin/claude-relay-config', payload, {

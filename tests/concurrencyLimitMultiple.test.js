@@ -1,6 +1,9 @@
 const {
+  MAX_PROMOTION_MODELS,
+  MAX_PROMOTION_MODEL_LENGTH,
   normalizeConcurrencyLimitMultiple,
   normalizePromotionModels,
+  getPromotionModelsValidationError,
   isPromotionModel,
   getEffectiveConcurrencyLimit,
   getPeakConcurrencyOverride,
@@ -59,6 +62,30 @@ describe('concurrency limit multiple', () => {
     ).toEqual(['promotionmodel1', 'promotionmodel2'])
   })
 
+  test('accepts promotion model limits at their boundaries', () => {
+    const models = Array.from({ length: MAX_PROMOTION_MODELS }, (_, index) =>
+      String(index).repeat(MAX_PROMOTION_MODEL_LENGTH)
+    )
+
+    expect(getPromotionModelsValidationError(models)).toBeNull()
+  })
+
+  test('rejects too many promotion models', () => {
+    const models = Array.from({ length: MAX_PROMOTION_MODELS + 1 }, (_, index) => `model-${index}`)
+
+    expect(getPromotionModelsValidationError(models)).toBe(
+      `promotionModels must contain at most ${MAX_PROMOTION_MODELS} items`
+    )
+  })
+
+  test('rejects promotion model names that are too long after trimming', () => {
+    const model = ` ${'m'.repeat(MAX_PROMOTION_MODEL_LENGTH + 1)} `
+
+    expect(getPromotionModelsValidationError([model])).toBe(
+      `each promotion model must be at most ${MAX_PROMOTION_MODEL_LENGTH} characters`
+    )
+  })
+
   test('matches promotion models exactly and case-insensitively', () => {
     expect(isPromotionModel(' PROMOTIONMODEL1 ', ['promotionmodel1'])).toBe(true)
     expect(isPromotionModel('promotionmodel1-latest', ['promotionmodel1'])).toBe(false)
@@ -88,7 +115,7 @@ describe('concurrency limit multiple', () => {
     expect(policy.concurrencyLimitMultiple).toBe(25)
     expect(policy.promotionModel).toBe(false)
     expect(formatPeakTrafficRecommendation(policy.promotionModels)).toBe(
-      '高峰期限流, 仅推荐使用 promotionmodel1, promotionmodel2。'
+      '高峰期限流, 仅可使用 promotionmodel1, promotionmodel2。'
     )
   })
 })

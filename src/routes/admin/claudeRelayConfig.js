@@ -7,7 +7,10 @@ const express = require('express')
 const { authenticateAdmin } = require('../../middleware/auth')
 const claudeRelayConfigService = require('../../services/claudeRelayConfigService')
 const logger = require('../../utils/logger')
-const { normalizePromotionModels } = require('../../utils/concurrencyLimitMultiple')
+const {
+  normalizePromotionModels,
+  getPromotionModelsValidationError
+} = require('../../utils/concurrencyLimitMultiple')
 
 const router = express.Router()
 
@@ -177,14 +180,11 @@ router.put('/claude-relay-config', authenticateAdmin, async (req, res) => {
       }
     }
 
-    if (
-      promotionModels !== undefined &&
-      (!Array.isArray(promotionModels) ||
-        promotionModels.some((model) => typeof model !== 'string'))
-    ) {
-      return res.status(400).json({
-        error: 'promotionModels must be an array of strings'
-      })
+    if (promotionModels !== undefined) {
+      const promotionModelsValidationError = getPromotionModelsValidationError(promotionModels)
+      if (promotionModelsValidationError) {
+        return res.status(400).json({ error: promotionModelsValidationError })
+      }
     }
 
     const updateData = {}

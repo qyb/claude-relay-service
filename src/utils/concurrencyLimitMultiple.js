@@ -3,6 +3,8 @@ const PEAK_TRAFFIC_WINDOW = Object.freeze({
   startHour: 15,
   endHour: 17
 })
+const MAX_PROMOTION_MODELS = 5
+const MAX_PROMOTION_MODEL_LENGTH = 25
 
 function getDateTimeParts(now, timeZone) {
   return Object.fromEntries(
@@ -46,6 +48,22 @@ function normalizePromotionModels(value) {
     models.push(model)
     return models
   }, [])
+}
+
+function getPromotionModelsValidationError(value) {
+  if (!Array.isArray(value) || value.some((model) => typeof model !== 'string')) {
+    return 'promotionModels must be an array of strings'
+  }
+
+  if (value.length > MAX_PROMOTION_MODELS) {
+    return `promotionModels must contain at most ${MAX_PROMOTION_MODELS} items`
+  }
+
+  if (value.some((model) => model.trim().length > MAX_PROMOTION_MODEL_LENGTH)) {
+    return `each promotion model must be at most ${MAX_PROMOTION_MODEL_LENGTH} characters`
+  }
+
+  return null
 }
 
 function isPromotionModel(requestedModel, promotionModels) {
@@ -125,14 +143,17 @@ function resolvePeakConcurrencyPolicy({
 function formatPeakTrafficRecommendation(promotionModels) {
   const normalizedPromotionModels = normalizePromotionModels(promotionModels)
   return normalizedPromotionModels.length > 0
-    ? `高峰期限流, 仅推荐使用 ${normalizedPromotionModels.join(', ')}。`
+    ? `高峰期限流, 仅可使用 ${normalizedPromotionModels.join(', ')}。`
     : '高峰期限流。'
 }
 
 module.exports = {
   PEAK_TRAFFIC_WINDOW,
+  MAX_PROMOTION_MODELS,
+  MAX_PROMOTION_MODEL_LENGTH,
   normalizeConcurrencyLimitMultiple,
   normalizePromotionModels,
+  getPromotionModelsValidationError,
   isPromotionModel,
   getEffectiveConcurrencyLimit,
   getPeakConcurrencyOverride,
