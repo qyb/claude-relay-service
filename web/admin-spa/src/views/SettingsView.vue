@@ -932,7 +932,23 @@
                   仅在每日
                   {{ claudeConfig.peakTrafficWindow?.displayLabel || '峰值' }} 窗口生效：100%
                   保持原并发；低于 100% 时按向上取整缩减，未设置并发限制的 Key 返回 429；0% 时所有
-                  API Key 请求直接返回 429。窗口外始终按 100% 提供服务。
+                  非推广模型请求直接返回 429。窗口外始终按 100% 提供服务。
+                </p>
+              </div>
+              <div class="mt-4">
+                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                  推广模型
+                </label>
+                <textarea
+                  v-model="claudeConfig.promotionModelsInput"
+                  class="mt-1 block w-full max-w-xl rounded-lg border border-gray-300 bg-white px-3 py-2 shadow-sm focus:border-amber-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 dark:border-gray-500 dark:bg-gray-700 dark:text-white sm:text-sm"
+                  placeholder="promotionmodel1, promotionmodel2"
+                  rows="3"
+                  @change="saveClaudeConfig"
+                ></textarea>
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  可使用空格、换行、逗号或分号分隔。推广模型在高峰期不应用接入比例，但仍受 API Key
+                  原始并发限制；模型名采用不区分大小写的精确匹配。
                 </p>
               </div>
             </div>
@@ -1723,6 +1739,7 @@ const claudeConfig = ref({
   concurrentRequestQueueMaxSizeMultiplier: 0,
   concurrentRequestQueueTimeoutMs: 10000,
   concurrencyLimitMultiple: 100,
+  promotionModelsInput: '',
   peakTrafficWindow: null,
   updatedAt: null,
   updatedBy: null
@@ -2002,6 +2019,9 @@ const loadClaudeConfig = async () => {
           response.config?.concurrentRequestQueueMaxSizeMultiplier ?? 0,
         concurrentRequestQueueTimeoutMs: response.config?.concurrentRequestQueueTimeoutMs ?? 10000,
         concurrencyLimitMultiple: response.config?.concurrencyLimitMultiple ?? 100,
+        promotionModelsInput: Array.isArray(response.config?.promotionModels)
+          ? response.config.promotionModels.join('\n')
+          : '',
         peakTrafficWindow: response.config?.peakTrafficWindow ?? null,
         updatedAt: response.config?.updatedAt || null,
         updatedBy: response.config?.updatedBy || null
@@ -2017,6 +2037,19 @@ const loadClaudeConfig = async () => {
       claudeConfigLoading.value = false
     }
   }
+}
+
+const parsePromotionModels = (input) => {
+  const seen = new Set()
+  return String(input || '')
+    .split(/[\s,，;；]+/)
+    .map((model) => model.trim())
+    .filter((model) => {
+      const normalizedModel = model.toLowerCase()
+      if (!model || seen.has(normalizedModel)) return false
+      seen.add(normalizedModel)
+      return true
+    })
 }
 
 // 保存 Claude 转发配置
@@ -2036,7 +2069,8 @@ const saveClaudeConfig = async () => {
       concurrentRequestQueueMaxSizeMultiplier:
         claudeConfig.value.concurrentRequestQueueMaxSizeMultiplier,
       concurrentRequestQueueTimeoutMs: claudeConfig.value.concurrentRequestQueueTimeoutMs,
-      concurrencyLimitMultiple: claudeConfig.value.concurrencyLimitMultiple
+      concurrencyLimitMultiple: claudeConfig.value.concurrencyLimitMultiple,
+      promotionModels: parsePromotionModels(claudeConfig.value.promotionModelsInput)
     }
 
     const response = await apiClient.put('/admin/claude-relay-config', payload, {
@@ -2045,6 +2079,9 @@ const saveClaudeConfig = async () => {
     if (response.success && isMounted.value) {
       claudeConfig.value = {
         ...claudeConfig.value,
+        promotionModelsInput: Array.isArray(response.config?.promotionModels)
+          ? response.config.promotionModels.join('\n')
+          : claudeConfig.value.promotionModelsInput,
         updatedAt: response.config?.updatedAt || new Date().toISOString(),
         updatedBy: response.config?.updatedBy || null
       }

@@ -1,9 +1,13 @@
 const {
   normalizeConcurrencyLimitMultiple,
+  normalizePromotionModels,
+  isPromotionModel,
   getEffectiveConcurrencyLimit,
   getPeakConcurrencyOverride,
+  resolvePeakConcurrencyPolicy,
   formatPeakTrafficWindow,
-  formatPeakTrafficResumeTime
+  formatPeakTrafficResumeTime,
+  formatPeakTrafficRecommendation
 } = require('../src/utils/concurrencyLimitMultiple')
 
 describe('concurrency limit multiple', () => {
@@ -47,5 +51,44 @@ describe('concurrency limit multiple', () => {
 
     expect(formatPeakTrafficWindow(window)).toBe('13:00–16:00（UTC+8）')
     expect(formatPeakTrafficResumeTime(window)).toBe('16:00（UTC+8）')
+  })
+
+  test('normalizes and deduplicates promotion models', () => {
+    expect(
+      normalizePromotionModels([' promotionmodel1 ', 'PromotionModel1', '', 'promotionmodel2'])
+    ).toEqual(['promotionmodel1', 'promotionmodel2'])
+  })
+
+  test('matches promotion models exactly and case-insensitively', () => {
+    expect(isPromotionModel(' PROMOTIONMODEL1 ', ['promotionmodel1'])).toBe(true)
+    expect(isPromotionModel('promotionmodel1-latest', ['promotionmodel1'])).toBe(false)
+  })
+
+  test('promotion models use the original concurrency limit during the peak window', () => {
+    const policy = resolvePeakConcurrencyPolicy({
+      now: new Date('2026-08-24T07:30:00.000Z'),
+      configuredMultiple: 0,
+      requestedModel: 'promotionmodel1',
+      promotionModels: ['promotionmodel1', 'promotionmodel2']
+    })
+
+    expect(policy.concurrencyLimitMultiple).toBe(100)
+    expect(policy.promotionModel).toBe(true)
+    expect(policy.peakConcurrencyOverride).not.toBeNull()
+  })
+
+  test('other models still use the configured multiple during the peak window', () => {
+    const policy = resolvePeakConcurrencyPolicy({
+      now: new Date('2026-08-24T07:30:00.000Z'),
+      configuredMultiple: 25,
+      requestedModel: 'regular-model',
+      promotionModels: ['promotionmodel1', 'promotionmodel2']
+    })
+
+    expect(policy.concurrencyLimitMultiple).toBe(25)
+    expect(policy.promotionModel).toBe(false)
+    expect(formatPeakTrafficRecommendation(policy.promotionModels)).toBe(
+      '高峰期限流, 仅推荐使用 promotionmodel1, promotionmodel2。'
+    )
   })
 })

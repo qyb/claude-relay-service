@@ -7,6 +7,7 @@ const express = require('express')
 const { authenticateAdmin } = require('../../middleware/auth')
 const claudeRelayConfigService = require('../../services/claudeRelayConfigService')
 const logger = require('../../utils/logger')
+const { normalizePromotionModels } = require('../../utils/concurrencyLimitMultiple')
 
 const router = express.Router()
 
@@ -48,7 +49,8 @@ router.put('/claude-relay-config', authenticateAdmin, async (req, res) => {
       concurrentRequestQueueMaxSize,
       concurrentRequestQueueMaxSizeMultiplier,
       concurrentRequestQueueTimeoutMs,
-      concurrencyLimitMultiple
+      concurrencyLimitMultiple,
+      promotionModels
     } = req.body
 
     // 验证输入
@@ -175,6 +177,16 @@ router.put('/claude-relay-config', authenticateAdmin, async (req, res) => {
       }
     }
 
+    if (
+      promotionModels !== undefined &&
+      (!Array.isArray(promotionModels) ||
+        promotionModels.some((model) => typeof model !== 'string'))
+    ) {
+      return res.status(400).json({
+        error: 'promotionModels must be an array of strings'
+      })
+    }
+
     const updateData = {}
     if (claudeCodeOnlyEnabled !== undefined) {
       updateData.claudeCodeOnlyEnabled = claudeCodeOnlyEnabled
@@ -211,6 +223,9 @@ router.put('/claude-relay-config', authenticateAdmin, async (req, res) => {
     }
     if (concurrencyLimitMultiple !== undefined) {
       updateData.concurrencyLimitMultiple = concurrencyLimitMultiple
+    }
+    if (promotionModels !== undefined) {
+      updateData.promotionModels = normalizePromotionModels(promotionModels)
     }
 
     const updatedConfig = await claudeRelayConfigService.updateConfig(

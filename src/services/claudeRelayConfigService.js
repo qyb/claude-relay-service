@@ -8,7 +8,8 @@ const logger = require('../utils/logger')
 const sessionHelper = require('../utils/sessionHelper')
 const {
   PEAK_TRAFFIC_WINDOW,
-  formatPeakTrafficWindow
+  formatPeakTrafficWindow,
+  normalizePromotionModels
 } = require('../utils/concurrencyLimitMultiple')
 
 const CONFIG_KEY = 'claude_relay_config'
@@ -40,6 +41,8 @@ const DEFAULT_CONFIG = {
   concurrentRequestQueueHealthThreshold: 0.8, // 健康检查阈值（P90 >= 超时 × 阈值时拒绝新请求）
   // API Key 并发接入系数（百分比）。低于 100% 时，未配置并发限制的 Key 会被拒绝。
   concurrencyLimitMultiple: 100,
+  // 高峰期推广模型不应用并发接入系数，但仍受 API Key 原始并发限制。
+  promotionModels: [],
   updatedAt: null,
   updatedBy: null
 }
@@ -85,9 +88,11 @@ class ClaudeRelayConfigService {
       const data = await client.get(CONFIG_KEY)
 
       if (data) {
+        const storedConfig = JSON.parse(data)
         configCache = {
           ...DEFAULT_CONFIG,
-          ...JSON.parse(data),
+          ...storedConfig,
+          promotionModels: normalizePromotionModels(storedConfig.promotionModels),
           peakTrafficWindow: getPeakTrafficWindowConfig()
         }
       } else {

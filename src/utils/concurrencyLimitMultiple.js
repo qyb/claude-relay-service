@@ -25,6 +25,43 @@ function normalizeConcurrencyLimitMultiple(value) {
   return Number.isFinite(multiple) && multiple >= 0 && multiple <= 100 ? multiple : 100
 }
 
+function normalizePromotionModels(value) {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  const seen = new Set()
+  return value.reduce((models, item) => {
+    if (typeof item !== 'string') {
+      return models
+    }
+
+    const model = item.trim()
+    const normalizedModel = model.toLowerCase()
+    if (!model || seen.has(normalizedModel)) {
+      return models
+    }
+
+    seen.add(normalizedModel)
+    models.push(model)
+    return models
+  }, [])
+}
+
+function isPromotionModel(requestedModel, promotionModels) {
+  if (typeof requestedModel !== 'string') {
+    return false
+  }
+
+  const normalizedRequestedModel = requestedModel.trim().toLowerCase()
+  return (
+    normalizedRequestedModel.length > 0 &&
+    normalizePromotionModels(promotionModels).some(
+      (model) => model.toLowerCase() === normalizedRequestedModel
+    )
+  )
+}
+
 function getEffectiveConcurrencyLimit(configuredLimit, multiple) {
   return Math.ceil((configuredLimit * multiple) / 100)
 }
@@ -61,11 +98,46 @@ function getPeakConcurrencyOverride(now = new Date(), window = PEAK_TRAFFIC_WIND
   }
 }
 
+function resolvePeakConcurrencyPolicy({
+  now = new Date(),
+  window = PEAK_TRAFFIC_WINDOW,
+  configuredMultiple,
+  requestedModel,
+  promotionModels
+} = {}) {
+  const peakConcurrencyOverride = getPeakConcurrencyOverride(now, window)
+  const normalizedPromotionModels = normalizePromotionModels(promotionModels)
+  const promotionModel =
+    peakConcurrencyOverride !== null && isPromotionModel(requestedModel, normalizedPromotionModels)
+  const concurrencyLimitMultiple =
+    peakConcurrencyOverride && !promotionModel
+      ? normalizeConcurrencyLimitMultiple(configuredMultiple)
+      : 100
+
+  return {
+    peakConcurrencyOverride,
+    concurrencyLimitMultiple,
+    promotionModel,
+    promotionModels: normalizedPromotionModels
+  }
+}
+
+function formatPeakTrafficRecommendation(promotionModels) {
+  const normalizedPromotionModels = normalizePromotionModels(promotionModels)
+  return normalizedPromotionModels.length > 0
+    ? `高峰期限流, 仅推荐使用 ${normalizedPromotionModels.join(', ')}。`
+    : '高峰期限流。'
+}
+
 module.exports = {
   PEAK_TRAFFIC_WINDOW,
   normalizeConcurrencyLimitMultiple,
+  normalizePromotionModels,
+  isPromotionModel,
   getEffectiveConcurrencyLimit,
   getPeakConcurrencyOverride,
+  resolvePeakConcurrencyPolicy,
   formatPeakTrafficWindow,
-  formatPeakTrafficResumeTime
+  formatPeakTrafficResumeTime,
+  formatPeakTrafficRecommendation
 }

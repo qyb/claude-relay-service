@@ -10,10 +10,10 @@ const ClaudeCodeValidator = require('../validators/clients/claudeCodeValidator')
 const claudeRelayConfigService = require('../services/claudeRelayConfigService')
 const { calculateWaitTimeStats } = require('../utils/statsHelper')
 const {
-  normalizeConcurrencyLimitMultiple,
   getEffectiveConcurrencyLimit,
-  getPeakConcurrencyOverride,
-  formatPeakTrafficResumeTime
+  resolvePeakConcurrencyPolicy,
+  formatPeakTrafficResumeTime,
+  formatPeakTrafficRecommendation
 } = require('../utils/concurrencyLimitMultiple')
 
 // 工具函数
@@ -569,14 +569,22 @@ const authenticateApiKey = async (req, res, next) => {
     // 峰值窗口内使用管理员配置的并发接入系数；窗口外始终维持 100%。
     // 系数低于 100% 时，未设并发限制的 Key 无法被削峰，因此直接拒绝。
     const queueConfig = await claudeRelayConfigService.getConfig()
-    const peakConcurrencyOverride = getPeakConcurrencyOverride(
-      new Date(),
-      queueConfig.peakTrafficWindow
-    )
-    const concurrencyLimitMultiple = peakConcurrencyOverride
-      ? normalizeConcurrencyLimitMultiple(queueConfig.concurrencyLimitMultiple)
-      : 100
+    const requestedModel = req.body?.model || req.params?.modelName || req.params?.model || null
+    const { peakConcurrencyOverride, concurrencyLimitMultiple, promotionModel, promotionModels } =
+      resolvePeakConcurrencyPolicy({
+        now: new Date(),
+        window: queueConfig.peakTrafficWindow,
+        configuredMultiple: queueConfig.concurrencyLimitMultiple,
+        requestedModel,
+        promotionModels: queueConfig.promotionModels
+      })
     const configuredConcurrencyLimit = Number(validation.keyData.concurrencyLimit) || 0
+    const peakTrafficRecommendation =
+      peakConcurrencyOverride && !promotionModel && concurrencyLimitMultiple < 100
+        ? formatPeakTrafficRecommendation(promotionModels)
+        : ''
+    const withPeakTrafficRecommendation = (message) =>
+      peakTrafficRecommendation ? `${peakTrafficRecommendation} ${message}` : message
 
     if (concurrencyLimitMultiple === 0) {
       res.set('Retry-After', String(peakConcurrencyOverride.retryAfterSeconds))
@@ -585,7 +593,9 @@ const authenticateApiKey = async (req, res, next) => {
       )
       return res.status(429).json({
         error: 'Service temporarily unavailable',
-        message: `服务高峰期暂停接入，请于 ${formatPeakTrafficResumeTime(queueConfig.peakTrafficWindow)} 后再试。`,
+        message: withPeakTrafficRecommendation(
+          `服务高峰期暂停接入，请于 ${formatPeakTrafficResumeTime(queueConfig.peakTrafficWindow)} 后再试。`
+        ),
         concurrencyLimitMultiple,
         retryAfterSeconds: peakConcurrencyOverride.retryAfterSeconds
       })
@@ -597,7 +607,7 @@ const authenticateApiKey = async (req, res, next) => {
       )
       return res.status(429).json({
         error: 'Concurrency limit required',
-        message: '当前处于削峰期，请让管理员正确设定并发限制。',
+        message: withPeakTrafficRecommendation('请让管理员正确设定并发限制。'),
         concurrencyLimitMultiple
       })
     }
@@ -702,7 +712,9 @@ const authenticateApiKey = async (req, res, next) => {
           res.set('Retry-After', '1')
           return res.status(429).json({
             error: 'Concurrency limit exceeded',
-            message: `Too many concurrent requests. Limit: ${concurrencyLimit} concurrent requests`,
+            message: withPeakTrafficRecommendation(
+              `Too many concurrent requests. Limit: ${concurrencyLimit} concurrent requests`
+            ),
             currentConcurrency: currentConcurrency - 1,
             concurrencyLimit
           })
@@ -740,7 +752,9 @@ const authenticateApiKey = async (req, res, next) => {
           res.set('Retry-After', String(retryAfterSeconds))
           return res.status(429).json({
             error: 'Queue overloaded',
-            message: `Queue is overloaded. Estimated wait time (${overloadCheck.estimatedWaitMs}ms) exceeds threshold. Limit: ${concurrencyLimit} concurrent requests, queue: ${currentQueueCount}/${maxQueueSize}. Please retry later.`,
+            message: withPeakTrafficRecommendation(
+              `Queue is overloaded. Estimated wait time (${overloadCheck.estimatedWaitMs}ms) exceeds threshold. Limit: ${concurrencyLimit} concurrent requests, queue: ${currentQueueCount}/${maxQueueSize}. Please retry later.`
+            ),
             currentConcurrency: concurrencyLimit,
             concurrencyLimit,
             queueCount: currentQueueCount,
@@ -774,7 +788,9 @@ const authenticateApiKey = async (req, res, next) => {
             res.set('Retry-After', String(retryAfterSeconds))
             return res.status(429).json({
               error: 'Concurrency queue full',
-              message: `Too many requests waiting in queue. Limit: ${concurrencyLimit} concurrent requests, queue: ${newQueueCount - 1}/${maxQueueSize}, timeout: ${retryAfterSeconds}s`,
+              message: withPeakTrafficRecommendation(
+                `Too many requests waiting in queue. Limit: ${concurrencyLimit} concurrent requests, queue: ${newQueueCount - 1}/${maxQueueSize}, timeout: ${retryAfterSeconds}s`
+              ),
               currentConcurrency: concurrencyLimit,
               concurrencyLimit,
               queueCount: newQueueCount - 1,
@@ -867,7 +883,9 @@ const authenticateApiKey = async (req, res, next) => {
             res.set('Retry-After', String(retryAfterSeconds))
             return res.status(429).json({
               error: 'Queue timeout',
-              message: `Request timed out waiting for concurrency slot. Limit: ${concurrencyLimit} concurrent requests, maxQueue: ${maxQueueSize}, Queue timeout: ${timeoutSeconds}s, waited: ${slot.waitTimeMs}ms`,
+              message: withPeakTrafficRecommendation(
+                `Request timed out waiting for concurrency slot. Limit: ${concurrencyLimit} concurrent requests, maxQueue: ${maxQueueSize}, Queue timeout: ${timeoutSeconds}s, waited: ${slot.waitTimeMs}ms`
+              ),
               currentConcurrency: concurrencyLimit,
               concurrencyLimit,
               maxQueueSize,
