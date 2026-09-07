@@ -312,9 +312,9 @@ describe('llmTelemetry finalization', () => {
       api_url: 'https://api.z.ai/api/anthropic',
       cost: 1.4,
       has_pricing: true,
-      pricing_model: 'glm-5.2',
+      pricing_model: 'glm-5.3',
       pricing_region: 'intl',
-      provisional_pricing: true
+      provisional_pricing: false
     })
   })
 

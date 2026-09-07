@@ -17,6 +17,7 @@ const sessionHelper = require('../utils/sessionHelper')
 const { updateRateLimitCounters } = require('../utils/rateLimitHelper')
 const pricingService = require('../services/pricingService')
 const { getEffectiveModel } = require('../utils/modelHelper')
+const { startLlmRequestObservation } = require('../utils/llmRequestObserver')
 
 // 🔧 辅助函数：检查 API Key 权限
 function checkPermissions(apiKeyData, requiredPermission = 'claude') {
@@ -179,6 +180,7 @@ router.get('/v1/models/:model', authenticateApiKey, async (req, res) => {
 async function handleChatCompletion(req, res, apiKeyData) {
   const startTime = Date.now()
   let abortController = null
+  let requestObservation = null
 
   try {
     // 检查权限
@@ -191,6 +193,8 @@ async function handleChatCompletion(req, res, apiKeyData) {
         }
       })
     }
+
+    requestObservation = startLlmRequestObservation(req, res)
 
     // 记录原始请求
     logger.debug('📥 Received OpenAI format request:', {
@@ -254,6 +258,11 @@ async function handleChatCompletion(req, res, apiKeyData) {
       throw error
     }
     const { accountId, accountType } = accountSelection
+    requestObservation.observeUpstream({
+      accountId,
+      accountType,
+      model: claudeRequest.model
+    })
 
     // 获取该账号存储的 Claude Code headers
     const claudeCodeHeaders = await claudeCodeHeadersService.getAccountHeaders(accountId)
@@ -296,6 +305,14 @@ async function handleChatCompletion(req, res, apiKeyData) {
               : usage.cache_creation_input_tokens || 0) || 0
           const cacheReadTokens = usage.cache_read_input_tokens || 0
 
+          requestObservation.observeUsage({
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_input_tokens: cacheCreateTokens,
+            cache_read_input_tokens: cacheReadTokens,
+            cache_creation: usage.cache_creation
+          })
+
           // 使用新的 recordUsageWithDetails 方法来支持详细的缓存数据
           apiKeyService
             .recordUsageWithDetails(
@@ -326,8 +343,10 @@ async function handleChatCompletion(req, res, apiKeyData) {
 
       // 创建流转换器
       const sessionId = `chatcmpl-${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`
-      const streamTransformer = (chunk) =>
-        openaiToClaude.convertStreamChunk(chunk, req.body.model, sessionId)
+      const streamTransformer = (chunk) => {
+        requestObservation.observeUpstreamStreamChunk(chunk)
+        return openaiToClaude.convertStreamChunk(chunk, req.body.model, sessionId)
+      }
 
       // 根据账户类型选择转发服务
       if (accountType === 'claude-console') {
@@ -355,6 +374,7 @@ async function handleChatCompletion(req, res, apiKeyData) {
           usageCallback,
           streamTransformer,
           {
+            gatewayRequestId: req.requestId,
             betaHeader:
               'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14'
           }
@@ -409,6 +429,15 @@ async function handleChatCompletion(req, res, apiKeyData) {
 
       // 处理错误响应
       if (claudeResponse.statusCode >= 400) {
+        requestObservation
+          .observeUpstream({
+            upstreamStatusCode: claudeResponse.statusCode,
+            upstreamErrorBody: claudeData
+          })
+          .observeError(new Error('Claude upstream request failed'), {
+            errorType: claudeData.error?.type || 'upstream_error',
+            errorCode: claudeData.error?.code || `http_${claudeResponse.statusCode}`
+          })
         return res.status(claudeResponse.statusCode).json({
           error: {
             message: claudeData.error?.message || 'Claude API error',
@@ -417,6 +446,8 @@ async function handleChatCompletion(req, res, apiKeyData) {
           }
         })
       }
+
+      requestObservation.observeUpstreamResponse(claudeData)
 
       // 转换为 OpenAI 格式
       const openaiResponse = openaiToClaude.convertResponse(claudeData, req.body.model)
@@ -464,6 +495,12 @@ async function handleChatCompletion(req, res, apiKeyData) {
     const duration = Date.now() - startTime
     logger.info(`✅ OpenAI-Claude request completed in ${duration}ms`)
   } catch (error) {
+    if (error.message === 'Client disconnected') {
+      requestObservation?.observeClientDisconnect()
+    } else {
+      requestObservation?.observeError(error)
+    }
+
     // 客户端主动断开连接是正常情况，使用 INFO 级别
     if (error.message === 'Client disconnected') {
       logger.info('🔌 OpenAI-Claude stream ended: Client disconnected')

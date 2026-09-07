@@ -89,6 +89,7 @@ class LlmRequestObserver {
     this.finishSeen = false
     this.usage = null
     this.responseSummary = null
+    this.upstreamResponseSummary = null
     this.provider = null
     this.accountId = null
     this.accountType = null
@@ -115,6 +116,9 @@ class LlmRequestObserver {
     this.decoder = telemetryEnabled && req?.body?.stream === true ? new StringDecoder('utf8') : null
     this.sseBuffer = ''
     this.sseDataLines = []
+    this.upstreamDecoder = null
+    this.upstreamSseBuffer = ''
+    this.upstreamSseDataLines = []
 
     if (telemetryEnabled) {
       this._attachResponseLifecycle()
@@ -217,12 +221,54 @@ class LlmRequestObserver {
     return this
   }
 
+  observeUpstreamStreamChunk(chunk, encoding) {
+    if (!this.telemetryEnabled || !this.context || this.context.finalized) {
+      return this
+    }
+
+    if (!this.upstreamDecoder) {
+      this.upstreamDecoder = new StringDecoder('utf8')
+    }
+
+    try {
+      let decoded
+      if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
+        decoded = this.upstreamDecoder.write(Buffer.from(chunk))
+      } else {
+        const bufferEncoding = typeof encoding === 'string' ? encoding : 'utf8'
+        decoded = this.upstreamDecoder.write(Buffer.from(String(chunk), bufferEncoding))
+      }
+      this._consumeUpstreamSseText(decoded)
+    } catch (error) {
+      logger.error(
+        'Failed to inspect upstream telemetry SSE chunk:',
+        error?.message || String(error)
+      )
+    }
+
+    return this
+  }
+
   observeResponse(response) {
     if (!response || typeof response !== 'object') {
       return this
     }
 
     this.responseSummary = summarizeResponseForTelemetry(response)
+    if (!this.upstreamResponseSummary) {
+      this.observeUsage(response.usage)
+      this.upstreamRequestId = response.id ?? this.upstreamRequestId
+      this.model = response.model ?? this.model
+    }
+    return this
+  }
+
+  observeUpstreamResponse(response) {
+    if (!response || typeof response !== 'object') {
+      return this
+    }
+
+    this.upstreamResponseSummary = summarizeResponseForTelemetry(response)
     this.observeUsage(response.usage)
     this.upstreamRequestId = response.id ?? this.upstreamRequestId
     this.model = response.model ?? this.model
@@ -456,7 +502,77 @@ class LlmRequestObserver {
     }
   }
 
+  _consumeUpstreamSseText(text) {
+    if (!text) {
+      return
+    }
+
+    this.upstreamSseBuffer += text
+    let newlineIndex = this.upstreamSseBuffer.indexOf('\n')
+    while (newlineIndex !== -1) {
+      let line = this.upstreamSseBuffer.slice(0, newlineIndex)
+      if (line.endsWith('\r')) {
+        line = line.slice(0, -1)
+      }
+      this.upstreamSseBuffer = this.upstreamSseBuffer.slice(newlineIndex + 1)
+      if (line === '') {
+        this._consumeUpstreamSseEvent()
+      } else if (line.startsWith('data:')) {
+        this.upstreamSseDataLines.push(line.slice(5).trimStart())
+      }
+      newlineIndex = this.upstreamSseBuffer.indexOf('\n')
+    }
+  }
+
+  _consumeUpstreamSseEvent() {
+    if (this.upstreamSseDataLines.length === 0) {
+      return
+    }
+
+    const payload = this.upstreamSseDataLines.join('\n')
+    this.upstreamSseDataLines = []
+    if (!payload || payload === '[DONE]') {
+      return
+    }
+
+    try {
+      this._observeSseEvent(JSON.parse(payload))
+    } catch (_) {
+      return
+    }
+  }
+
+  _flushUpstreamSse() {
+    if (!this.upstreamDecoder) {
+      return
+    }
+
+    try {
+      this._consumeUpstreamSseText(this.upstreamDecoder.end())
+      if (this.upstreamSseBuffer) {
+        const tail = this.upstreamSseBuffer.endsWith('\r')
+          ? this.upstreamSseBuffer.slice(0, -1)
+          : this.upstreamSseBuffer
+        this.upstreamSseBuffer = ''
+        if (tail.startsWith('data:')) {
+          this.upstreamSseDataLines.push(tail.slice(5).trimStart())
+        }
+      }
+      this._consumeUpstreamSseEvent()
+    } catch (error) {
+      logger.error(
+        'Failed to flush upstream telemetry SSE summary:',
+        error?.message || String(error)
+      )
+    } finally {
+      this.upstreamDecoder = null
+    }
+  }
+
   _getResponseSummary() {
+    if (this.upstreamResponseSummary) {
+      return this.upstreamResponseSummary
+    }
     if (this.responseSummary) {
       return this.responseSummary
     }
@@ -476,6 +592,7 @@ class LlmRequestObserver {
     }
 
     this._flushSse()
+    this._flushUpstreamSse()
     const statusCode = this.res.statusCode ?? null
     const isError = options.forceError === true || Boolean(this.errorType) || statusCode >= 400
     const errorType =

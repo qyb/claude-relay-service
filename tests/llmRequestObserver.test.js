@@ -456,6 +456,58 @@ describe('LLM request observation lifecycle', () => {
     expect(JSON.stringify(record)).not.toContain('do-not-log')
   })
 
+  it('OpenAI 兼容层在转换前观察上游 Claude SSE', () => {
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const req = buildRequest()
+    const res = new FakeResponse()
+    const observer = startLlmRequestObservation(req, res)
+    observer.observeUpstream({
+      accountId: 'account-openai-1',
+      accountType: 'claude-console',
+      model: 'glm-5.3-flash'
+    })
+
+    const payload =
+      sse({
+        type: 'message_start',
+        message: {
+          id: 'msg-openai-1',
+          model: 'glm-5.3-flash',
+          usage: { input_tokens: 20, cache_read_input_tokens: 100 }
+        }
+      }) +
+      sse({
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'tool-openai-1', name: 'Read', input: {} }
+      }) +
+      sse({
+        type: 'message_delta',
+        delta: { stop_reason: 'tool_use' },
+        usage: { output_tokens: 8 }
+      })
+
+    observer.observeUpstreamStreamChunk(payload.slice(0, 43))
+    observer.observeUpstreamStreamChunk(payload.slice(43))
+    res.emit('finish')
+
+    expect(logger.telemetry).toHaveBeenCalledTimes(1)
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      event_type: 'llm_request_completed',
+      upstream_request_id: 'msg-openai-1',
+      account_id: 'account-openai-1',
+      account_type: 'claude-console',
+      model: 'glm-5.3-flash',
+      stop_reason: 'tool_use',
+      tool_use_count: 1,
+      tool_use_names: ['Read'],
+      input_tokens: 20,
+      output_tokens: 8,
+      cache_read_input_tokens: 100,
+      total_tokens: 128
+    })
+  })
+
   it('非流式响应通过 observeResponse 提取摘要但不记录正文', () => {
     logger.isTelemetryEnabled.mockReturnValue(true)
     const req = buildRequest({
@@ -527,6 +579,43 @@ describe('LLM request observation lifecycle', () => {
     expect(JSON.stringify(logger.telemetry.mock.calls[0][0])).not.toContain(
       'private bridge response'
     )
+  })
+
+  it('上游响应摘要优先于 OpenAI bridge 响应摘要', () => {
+    logger.isTelemetryEnabled.mockReturnValue(true)
+    const req = buildRequest({
+      body: {
+        model: 'glm-5.3-flash',
+        stream: false,
+        messages: [{ role: 'user', content: 'human prompt' }]
+      }
+    })
+    const res = new FakeResponse()
+    const observer = startLlmRequestObservation(req, res)
+
+    observer.observeUpstreamResponse({
+      id: 'claude-upstream-response',
+      model: 'glm-5.3-flash',
+      stop_reason: 'tool_use',
+      usage: { input_tokens: 11, output_tokens: 3 },
+      content: [{ type: 'tool_use', name: 'Read', input: {} }]
+    })
+    res.json({
+      id: 'openai-bridge-response',
+      model: 'glm-5.3-flash',
+      choices: [{ finish_reason: 'tool_calls' }],
+      usage: { prompt_tokens: 11, completion_tokens: 3 }
+    })
+    res.emit('finish')
+
+    expect(logger.telemetry.mock.calls[0][0]).toMatchObject({
+      upstream_request_id: 'claude-upstream-response',
+      stop_reason: 'tool_use',
+      tool_use_count: 1,
+      tool_use_names: ['Read'],
+      input_tokens: 11,
+      output_tokens: 3
+    })
   })
 
   it('异常 close 记录客户端断开，之后的 finish 不会产生第二条', () => {
